@@ -13,6 +13,9 @@ tqdm = "*"
 scikit-learn = "*"
 tensorflow = "*"
 ta-lib = "*"
+python-dotenv = "*"
+alpaca-py = "*"
+pretty-errors = "*"
 
 [dev-packages]
 
