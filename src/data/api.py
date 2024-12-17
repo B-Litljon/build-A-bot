@@ -32,23 +32,6 @@ class AlpacaClient:
         self.screener_client = ScreenerClient(alpaca_key, alpaca_secret)
         self.ticker_df = pl.DataFrame({"ticker": []})
 
-    def get_most_active_stocks(self, days_back=35):
-        today = datetime.now(ZoneInfo("America/New_York"))
-        end_date = today - timedelta(days=today.weekday() + 1)
-        start_date = end_date - timedelta(days=days_back)
-        most_actives_request = MostActivesRequest()
-        most_actives_response = self.screener_client.get_most_actives(most_actives_request)
-        #return most_actives_response
-        
-        # Convert list of dictionaries to Polars DataFrame
-        watchlist = pl.DataFrame(most_actives_response.most_actives)
-        
-        # Extract ticker symbols from the 'symbol' column
-        ticker_symbols = watchlist['symbol'].str.slice(1).to_list() 
-        
-        # Create a new DataFrame with the extracted tickers
-        self.ticker_df = pl.DataFrame({'ticker': ticker_symbols}) 
-        return self.ticker_df
 
     def get_stock_bar_data(self, stock_client, timeframe, start_date, end_date):
         # Assuming self.ticker_df is a Polars DataFrame
