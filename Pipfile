@@ -16,6 +16,7 @@ ta-lib = "*"
 python-dotenv = "*"
 alpaca-py = "*"
 pretty-errors = "*"
+polygon-api-client = "*"
 
 [dev-packages]
 
