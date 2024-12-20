@@ -18,6 +18,7 @@ from alpaca.data.timeframe import TimeFrameUnit
 from alpaca.data.requests import MostActivesRequest
 from alpaca.data.historical.option import OptionHistoricalDataClient
 from alpaca.data.historical.screener import ScreenerClient
+import alpaca.common.exceptions
 
 load_dotenv()
 alpaca_key = os.getenv("alpaca_key")
@@ -58,7 +59,13 @@ class AlpacaClient:
 
         return timeframe, start_date, end_date
 
-    def get_most_active_stocks(self, days_back=35):
+    def get_most_active_stocks(self):
+        """
+        Retrieves the most active stocks based on volume.
+
+        Returns:
+            list: A list of ticker symbols for the most active stocks.
+        """
         most_actives_request = MostActivesRequest()
         most_actives_response = self.screener_client.get_most_actives(most_actives_request)
         #return most_actives_response
@@ -74,21 +81,28 @@ class AlpacaClient:
         return self.ticker_df
 
     def get_stock_bar_data(self, stock_client, timeframe, start_date, end_date):
-        
-        ticker_symbols = self.ticker_df['ticker'].to_list()  # the stock_bars_request object expects a list of tickers not a df, so we convert it temporarily, then when we recieve the data we'll append it to the df 
-        
+        ticker_symbols = self.ticker_df["ticker"].to_list()
+
         stock_bars_request = StockBarsRequest(
             symbol_or_symbols=ticker_symbols,
             timeframe=timeframe,
             start=start_date,
-            end=end_date
+            end=end_date,
+            feed='iex'  # Use the IEX data feed
         )
+
+        print("Stock bars request:", stock_bars_request)  # Print the request
+
         try:
             stock_bars = stock_client.get_stock_bars(stock_bars_request)
+            print("API response:", stock_bars)  # Print the response
+            print("Stock bars data:", stock_bars.df)  # Print the DataFrame
             return stock_bars
+        except alpaca.common.exceptions.AlpacaAPIError as e:
+            print(f"Alpaca API Error: {e}")
         except Exception as e:
-            print(f"Error fetching candlestick data: {e}")
-            return None
+            print(f"An unexpected error occurred: {e}")
+        return None
 
     def get_option_chain_data(self, option_client):  # Removed ticker_symbols argument
         option_chain_data = {}
@@ -105,23 +119,3 @@ class AlpacaClient:
                 print(f"Error fetching option chain data for {ticker}: {e}")
         print('Options chain data (raw):\n\n', option_chain_data)
         return option_chain_data
-
-
-Alpaca = AlpacaClient(alpaca_key, alpaca_secret)
-# Define timeframe and date range
-timeframe = TimeFrame(1, TimeFrameUnit.Day)
-today = datetime.now(ZoneInfo("America/New_York"))
-end_date = today - timedelta(days=today.weekday() + 1)
-start_date = end_date - timedelta(days=35)  # Adjust as needed
-# Get most active stocks
-most_actives = Alpaca.get_most_active_stocks(days_back=35)  # Call on the instance
-
-# Get stock bar data
-stock_bars = Alpaca.get_stock_bar_data(
-    Alpaca.stock_client,
-    timeframe,
-    start_date,
-    end_date
-)
-#print(most_actives)
-print(stock_bars)
