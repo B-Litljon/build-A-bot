@@ -1,4 +1,4 @@
-from src.data.api import AlpacaClient
+from data.api_requests import AlpacaClient
 import os
 import pretty_errors
 from dotenv import load_dotenv

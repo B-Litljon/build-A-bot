@@ -28,6 +28,7 @@ class AlpacaClient:
     def __init__(self, alpaca_key, alpaca_secret):
         self.alpaca_key = alpaca_key
         self.alpaca_secret = alpaca_secret
+     
         self.stock_client = StockHistoricalDataClient(alpaca_key, alpaca_secret)
         self.option_client = OptionHistoricalDataClient(alpaca_key, alpaca_secret)
         self.screener_client = ScreenerClient(alpaca_key, alpaca_secret)
@@ -37,10 +38,15 @@ class AlpacaClient:
         """
         Calculates the start and end dates for a given timeframe and lookback window.
 
+        This method is used to determine the appropriate start and end dates for fetching historical
+        stock data. It takes a timeframe unit (e.g., 'Day', 'Hour', 'Minute'), a number of days to
+        look back, and an optional end date. If no end date is provided, it defaults to the current
+        date and time in the America/New_York time zone.
+
         Args:
             timeframe (str): The timeframe unit (e.g., 'Day', 'Hour', 'Minute').
             days_back (int): The number of days to look back from the end date.
-            end_date (str, optional): The end date in 'YYYY-MM-DD' format. 
+            end_date (str, optional): The end date in 'YYYY-MM-DD' format.
                                        Defaults to today if not provided.
 
         Returns:
@@ -63,24 +69,44 @@ class AlpacaClient:
         """
         Retrieves the most active stocks based on volume.
 
+        This method fetches the most active stocks from the Alpaca API using the `MostActivesRequest`.
+        It processes the API response to extract the ticker symbols and stores them in a Polars DataFrame
+        (`self.ticker_df`) for later use in other methods.
+
         Returns:
-            list: A list of ticker symbols for the most active stocks.
+            pl.DataFrame: A Polars DataFrame containing a single column 'ticker' with the list of
+                         ticker symbols for the most active stocks.
         """
         most_actives_request = MostActivesRequest()
         most_actives_response = self.screener_client.get_most_actives(most_actives_request)
-        #return most_actives_response
         
         # Convert list of dictionaries to Polars DataFrame
         watchlist = pl.DataFrame(most_actives_response.most_actives)
         
         # Extract ticker symbols from the 'symbol' column
         ticker_symbols = watchlist['symbol'].str.slice(1).to_list() 
-        
+    
         # Create a new DataFrame with the extracted tickers
         self.ticker_df = pl.DataFrame({'ticker': ticker_symbols}) 
         return self.ticker_df
 
     def get_stock_bar_data(self, stock_client, timeframe, start_date, end_date):
+        """
+        Fetches historical stock bar data for the tickers stored in `self.ticker_df`.
+
+        This method uses the `StockBarsRequest` to retrieve historical bar data for the most active
+        stocks, which are stored in the `self.ticker_df` DataFrame. It retrieves data from the IEX
+        data feed for the specified timeframe and date range.
+
+        Args:
+            stock_client (StockHistoricalDataClient): An instance of the Alpaca StockHistoricalDataClient.
+            timeframe (TimeFrame): The timeframe for the bars (e.g., TimeFrame(1, TimeFrameUnit.Day)).
+            start_date (datetime): The starting date for the historical data.
+            end_date (datetime): The ending date for the historical data.
+
+        Returns:
+            StockBars: A StockBars object containing the historical bar data, or None if an error occurs.
+        """
         ticker_symbols = self.ticker_df["ticker"].to_list()
 
         stock_bars_request = StockBarsRequest(
@@ -105,6 +131,20 @@ class AlpacaClient:
         return None
 
     def get_option_chain_data(self, option_client):  # Removed ticker_symbols argument
+        """
+        Retrieves option chain data for the tickers stored in `self.ticker_df`.
+
+        This method iterates through the ticker symbols in the `self.ticker_df` DataFrame and fetches
+        the option chain data for each ticker using the `OptionChainRequest`. It stores the data in a
+        dictionary where the keys are the ticker symbols and the values are the corresponding
+        option chain objects.
+
+        Args:
+            option_client (OptionHistoricalDataClient): An instance of the Alpaca OptionHistoricalDataClient.
+
+        Returns:
+            dict: A dictionary containing option chain data for each ticker symbol.
+        """
         option_chain_data = {}
         
         # Iterate over tickers in the Polars DataFrame
@@ -112,6 +152,7 @@ class AlpacaClient:
             option_chain_request = OptionChainRequest(
                 underlying_symbol=ticker
             )
+    
             try:
                 option_chain = option_client.get_option_chain(option_chain_request)
                 option_chain_data[ticker] = option_chain
