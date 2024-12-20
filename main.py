@@ -2,6 +2,9 @@ from src.data.api import AlpacaClient
 import os
 import pretty_errors
 from dotenv import load_dotenv
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+import polars as pl  
 
 load_dotenv()
 alpaca_key = os.getenv("alpaca_key")
@@ -22,9 +25,13 @@ def __main__():
 
     # get the historical data for the most active stocks
     stock_bar_data = alpaca_client.get_stock_bar_data(alpaca_client.stock_client, timeframe, start_date, end_date)
-
+    stock_bar_df = stock_bar_data.df
     # Now you can print or process the stock_bar_data as needed
-    print(stock_bar_data)
+    print(stock_bar_df)
+    # now that we have the data in a dataframe ready to be processed, we can sort the data by ticker symbol into individual polars dataframes for each stock to simplify processing later
+    # iterate through each ticker symbol in the index
+
+    # get the data for each ticker and store it in its own dataframe named after the ticker
 
 if __name__ == "__main__":  # Add this block
     __main__()
