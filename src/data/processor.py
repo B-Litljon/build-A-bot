@@ -3,8 +3,38 @@ import polars as pl
 
 class DataProcessor:
     def __init__(self, foreign_df):
-        self.master_df = foreign_df
+        """
+        Initializes the DataProcessor with a Pandas DataFrame that may need formatting.
 
+        Args:
+            foreign_df (pd.DataFrame): The DataFrame from an external source.
+        """
+        self.foreign_df = foreign_df  # Store the original DataFrame
+        self.master_df = self.format_dataframe()  # Format and store the master DataFrame
+
+    def format_dataframe(self):
+        """
+        Formats the DataFrame returned from the Alpaca API.
+
+        Returns:
+            pd.DataFrame: The formatted master DataFrame with a MultiIndex.
+        """
+        df = self.foreign_df.copy()
+
+        # 1. Reset index to make 'symbol' and 'timestamp' regular columns
+        df.reset_index(inplace=True)
+
+        # 2. Convert 'timestamp' to datetime (if it's not already)
+        if not pd.api.types.is_datetime64_any_dtype(df['timestamp']):
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+
+        # 3. Set the MultiIndex ('symbol', 'timestamp')
+        df.set_index(['symbol', 'timestamp'], inplace=True)
+        df.sort_index(inplace=True)
+
+        return df
+
+        return df
     def index_nav(self, level_name, level_value):
         """
         Navigates the multi-index DataFrame to extract data at a specified level.
