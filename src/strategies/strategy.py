@@ -1,7 +1,11 @@
 from abc import ABC, abstractmethod
-from typing import List
+from typing import List, Dict
 from core.signal import Signal
 from utils.order_params import OrderParams
+import talib
+import pandas as pd
+import numpy as np
+import polars as pl 
 
 
 class Strategy(ABC):
