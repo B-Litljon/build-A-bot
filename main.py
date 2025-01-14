@@ -25,6 +25,15 @@ dev log:
         perhaps we can add some machine learning there to determine if the trade is worth it or not
 
     things like that. make what works, work better.
+
+dev log: 01-11-2025:
+    need to define a utility function to calculate the rate of change for any indicator.
+    also need to setup websocket connection for the live data feed, then plug in the strategy and order management logic to test 
+
+dev log: 01-13-2025:
+    need to refactor the strategy file. as of now its one file with the strategy abc, and then I defined the concrete strategy in the same file.
+    but this might get messy as we add more strategies. so I need to refactor it into a folder with the abc in one file and the concrete strategies in another file. 
+    I'll give it some thought while I'm at work and figure out the best way to do it.
 """
 def __main__():
     # define the timeframe and lookback window
