@@ -2,6 +2,7 @@ from typing import List
 from core.signal import Signal
 from strategies.strategy import Strategy
 from alpaca.trading.client import TradingClient
+from alpaca.data import StockDataStream
 from core.order_management import OrderManager
 
 class TradingBot:
