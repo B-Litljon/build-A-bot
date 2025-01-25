@@ -1,4 +1,4 @@
-from typing import List
+from typing import Dict, List, str
 from core.signal import Signal
 from strategies.strategy import Strategy
 from alpaca.trading.client import TradingClient
@@ -15,49 +15,56 @@ class TradingBot:
         trading_client (TradingClient): The trading client for interacting with the exchange.
         order_manager (OrderManager): order manager created from strategy and trading client
     """
-
-    def __init__(self, strategy: Strategy, capital: float, trading_client: TradingClient):
+    def __init__(self, api_key: str, api_secret: str,  strategy: Strategy, capital: float, 
+                 trading_client: TradingClient, live_stock_data: StockDataStream, symbol: str):
         self.strategy = strategy
         self.capital = capital
         self.trading_client = trading_client
         self.order_manager = OrderManager(trading_client, strategy.get_order_params())
+        self.live_stock_data = live_stock_data
+        self.symbol = symbol  # Store the specified symbol
+
+        # Subscribe to bar updates for the specified symbol
+        self.live_stock_data.subscribe_bars(self.handle_bar_update, self.symbol)
+
+    async def handle_bar_update(self, bar): # need to aggregate bars to various timeframes, alpaca only has 1m and 1d
+        """Handles bar updates from the WebSocket stream."""
+        print("Bar Update:, {bar}")
+        # Analyze the data and generate signals
+        signals: List[Signal] = self.strategy.analyze(bar)
+        # Place orders based on signals
+        self.place_orders(signals)
+
+    async def handle_trade_update(self, trade):
+        """Handles trade updates from the WebSocket stream."""
+        print("Trade Update:, {trade}")
+        # Analyze the data and generate signals
+        signals: List[Signal] = self.strategy.analyze(trade)
+        # Place orders based on signals
+        self.place_orders(signals)
+
+    async def handle_quote_update(self, quote):
+        """Handles quote updates from the WebSocket stream."""
+        print("Quote Update:, {quote}")
+        # Analyze the data and generate signals
+        signals: List[Signal] = self.strategy.analyze(quote)
+        # Place orders based on signals
+        self.place_orders(signals)
+
+    def place_orders(self, signals: List[Signal]):
+        """Places orders based on the received signals."""
+        for signal in signals:
+            if signal.type == "BUY":
+                self.order_manager.place_order(signal, self.capital)
 
     def run(self):
         """
         The main trading loop.
         """
         while True:
-            # 1. Fetch Market Data (replace with your DataHandler)
-            market_data = self.fetch_market_data() # get data from alpaca
-
-            # 2. Analyze Data and Generate Signals
-            signals: List[Signal] = self.strategy.analyze(market_data)
-
-            # 3. Place Orders
-            for signal in signals:
-                if signal.type == "BUY":
-                    self.order_manager.place_order(signal, self.capital)
-
-            # 4. Monitor Orders
-            self.order_manager.monitor_orders(market_data)
-
-            # 5. Logging/Tracking (replace with your logging mechanism)
             self.log_status()
-
-            # 6. Sleep (adjust the sleep duration as needed)
-            # time.sleep(60)  # Check every 60 seconds, for example
-
-    def fetch_market_data(self):
-        """
-        Fetches market data. Replace this with your actual data fetching logic.
-        """
-        # You'll likely use a DataHandler component here
-        # For now, let's simulate some data
-        data = {
-            "AAPL": {"close": 155.0},  # Example: Replace with actual data
-            "MSFT": {"close": 280.0}
-        }
-        return data
+            # Do other things here
+            pass        
 
     def log_status(self):
         """

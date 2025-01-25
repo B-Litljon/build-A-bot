@@ -8,7 +8,6 @@ class Signal:
         entry_price (float): The suggested entry price.
         quantity (float, optional): The suggested quantity to trade.
     """
-
     def __init__(self, type: str, symbol: str, entry_price: float, quantity: float = None):
         self.type = type
         self.symbol = symbol

@@ -12,7 +12,6 @@ class OrderParams:
         use_trailing_stop (bool, optional): Whether to use trailing stop-loss. Defaults to False.
         **kwargs: For adding other custom parameters.
     """
-
     def __init__(self, risk_percentage: float, tp_multiplier: float, sl_multiplier: float,
                  sma_short_period: int = None, sma_long_period: int = None,
                  sma_crossover_type: str = None, use_trailing_stop: bool = False, **kwargs):
