@@ -12,7 +12,6 @@ class OrderManager:
         order_params (OrderParams): An OrderParams object.
         active_orders (Dict): A dictionary to track active orders.
     """
-
     def __init__(self, trading_client: TradingClient, order_params: OrderParams):
         self.trading_client = TradingClient
         self.order_params = order_params

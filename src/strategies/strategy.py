@@ -7,7 +7,6 @@ import pandas as pd
 import numpy as np
 import polars as pl 
 
-
 class Strategy(ABC):
     """
     Abstract base class for trading strategies.
@@ -16,7 +15,6 @@ class Strategy(ABC):
         analyze(self, data): Analyzes market data and returns a list of Signals.
         get_order_params(self): Returns default OrderParams for the strategy.
     """
-
     @abstractmethod
     def analyze(self, data) -> List[Signal]:
         """
