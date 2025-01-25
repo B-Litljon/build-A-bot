@@ -1,4 +1,4 @@
-class OrderParams:
+class OrderParams: # V
     """
     Defines parameters for order calculation and risk management.
 
