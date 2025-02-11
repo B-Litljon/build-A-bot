@@ -1,7 +1,7 @@
 from typing import Dict, List
 from core.signal import Signal
 from alpaca.trading.client import TradingClient
-from utils.order_params import OrderParams
+
 
 class OrderParams: # V
     """
