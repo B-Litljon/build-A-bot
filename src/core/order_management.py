@@ -31,6 +31,25 @@ class OrderParams: # V
 
     def __str__(self):
         return f"OrderParams(risk_percentage={self.risk_percentage}, tp_multiplier={self.tp_multiplier}, sl_multiplier={self.sl_multiplier}, use_trailing_stop={self.use_trailing_stop}, ...)"
+    
+class OrderCalculator:
+    def __init__(self, order_params: OrderParams):
+        self.order_params = order_params
+
+    def calculate_quantity(self, entry_price: float, current_capital: float) -> float:
+        """Calculates quantity, handling potential division by zero."""
+        if entry_price == 0:
+            raise ValueError("Entry price cannot be zero.")  # Raise an exception
+        risk_amount = current_capital * self.order_params.risk_percentage
+        return risk_amount / entry_price
+
+    def calculate_stop_loss(self, entry_price: float) -> float:
+        """Calculates stop-loss level."""
+        return entry_price * self.order_params.sl_multiplier
+
+    def calculate_take_profit(self, entry_price: float) -> float:
+        """Calculates take-profit level."""
+        return entry_price * self.order_params.tp_multiplier
 
 
 class OrderManager:
