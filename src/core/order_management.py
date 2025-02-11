@@ -1,4 +1,4 @@
-from typing import Dict, List
+from typing import Dict, List, Optional
 from core.signal import Signal
 from alpaca.trading.client import TradingClient
 
