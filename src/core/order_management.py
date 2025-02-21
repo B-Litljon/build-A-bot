@@ -20,6 +20,7 @@ class OrderParams: # V
     def __init__(self, risk_percentage: float, tp_multiplier: float, sl_multiplier: float,
                  sma_short_period: int = None, sma_long_period: int = None,
                  sma_crossover_type: str = None, use_trailing_stop: bool = False, **kwargs):
+                 
         self.risk_percentage = risk_percentage
         self.tp_multiplier = tp_multiplier
         self.sl_multiplier = sl_multiplier
@@ -33,6 +34,7 @@ class OrderParams: # V
         return f"OrderParams(risk_percentage={self.risk_percentage}, tp_multiplier={self.tp_multiplier}, sl_multiplier={self.sl_multiplier}, use_trailing_stop={self.use_trailing_stop}, ...)"
     
 class OrderCalculator:
+    # can modify the calculate_quantity method to account for fees
     def __init__(self, order_params: OrderParams):
         self.order_params = order_params
 
