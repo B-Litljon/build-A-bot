@@ -19,47 +19,63 @@ stock_stream.subscribe_bars(handle_bar_update, symbol)
 
 # connect to the websocket
 
-class BarAggregator:
-    def __init__(self, interval_minutes):
-        """
-        Initialize the BarAggregator.
-        :param interval_minutes: Number of minutes for aggregation (e.g., 5 for 5m bars).
-        """
-        self.interval_minutes = interval_minutes
-        self.data = pl.DataFrame()  # Initialize an empty Polars DataFrame
+class HierarchicalAggregator:
+    def __init__(self, base_interval=1, target_intervals=[5, 15, 30]):
+        self.base_interval = base_interval
+        self.aggregators = {}
+        
+        # Initialize aggregators for each timeframe
+        for interval in target_intervals:
+            self.aggregators[interval] = {
+                'buffer': pl.DataFrame(),
+                'parent_interval': interval // self._get_parent_interval(interval)
+            }
 
-    def add_bar(self, bar):
-        """
-        Add a new 1-minute bar to the aggregator.
-        :param bar: Dictionary containing 'timestamp', 'open', 'high', 'low', 'close', 'volume'.
-        """
-        new_row = pl.DataFrame([bar])
-        self.data = pl.concat([self.data, new_row])
+    def _get_parent_interval(self, interval):
+        # Determine which lower timeframe to use (e.g., 15m uses 5m bars)
+        for parent in sorted(self.aggregators.keys(), reverse=True):
+            if interval % parent == 0 and parent < interval:
+                return parent
+        return self.base_interval  # Default to 1m
 
-    def aggregate(self):
+    def add_bar(self, bar, interval=1):
         """
-        Aggregate the stored bars into a single higher timeframe bar.
-        :return: Dictionary containing aggregated bar data or None if not enough data.
+        Add a bar to the target interval's buffer and cascade upward.
         """
-        if len(self.data) < self.interval_minutes:
-            return None  # Not enough data to aggregate yet
+        if interval not in self.aggregators:
+            raise ValueError(f"Unsupported interval: {interval}m")
+        
+        # Append to buffer
+        agg = self.aggregators[interval]
+        agg['buffer'] = pl.concat([agg['buffer'], pl.DataFrame([bar])])
+        
+        # Check if ready to aggregate
+        required_bars = agg['parent_interval']
+        if len(agg['buffer']) >= required_bars:
+            # Aggregate
+            new_bar = self._aggregate_bars(agg['buffer'], interval)
+            
+            # Cascade to higher timeframe
+            parent_interval = interval * required_bars
+            if parent_interval in self.aggregators:
+                self.add_bar(new_bar, parent_interval)
+            
+            # Reset buffer
+            agg['buffer'] = pl.DataFrame()
 
-        # Aggregate the data
-        aggregated_bar = {
-            "timestamp": self.data["timestamp"].min(),  # Use the earliest timestamp
-            "open": self.data["open"].first(),          # Use the first open price
-            "high": self.data["high"].max(),            # Use the highest high price
-            "low": self.data["low"].min(),              # Use the lowest low price
-            "close": self.data["close"].last(),         # Use the last close price
-            "volume": self.data["volume"].sum()         # Sum up all volumes
+    def _aggregate_bars(self, df: pl.DataFrame, interval: int):
+        """
+        Aggregate a Polars DataFrame into a higher timeframe bar.
+        """
+        return {
+            "timestamp": df["timestamp"].min(),
+            "open": df["open"].first(),
+            "high": df["high"].max(),
+            "low": df["low"].min(),
+            "close": df["close"].last(),
+            "volume": df["volume"].sum(),
+            "interval": interval
         }
-
-        # Clear the DataFrame for new incoming bars
-        self.data = pl.DataFrame()
-
-        return aggregated_bar
-
-
 
 
 
