@@ -37,6 +37,7 @@ class HierarchicalAggregator:
             if interval % parent == 0 and parent < interval:
                 return parent
         return self.base_interval  # Default to 1m
+        
 
     def add_bar(self, bar, interval=1):
         """
