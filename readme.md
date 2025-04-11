@@ -1,6 +1,8 @@
-# Build-A-Bot: Your Modular Trading Bot Toolkit  INCOMPLETE
+# Build-A-Bot: Your Modular Trading Bot Toolkit  
 
 **Build-A-Bot** empowers you to design, implement, and deploy your own trading strategies with ease. Whether you're a day trader, a scalper, an intraday trader, or a long-term investor, Build-A-Bot provides the building blocks to create a customized trading bot tailored to your needs.
+
+### as of now the bot is not yet ready to run if you know what you're doing, go ahead and finish it. but it is INCOMPLETE for now
 
 ## Project Goals
 
