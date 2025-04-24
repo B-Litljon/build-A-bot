@@ -1,9 +1,9 @@
+from typing import Dict, List, Optional, Any
 import polars as pl
 import numpy as np
 import asyncio
 from alpaca.data import StockDataStream
-from datetime import datetime 
-from typing import Dict, List, Optional, Any
+from datetime import datetime
 
 # connect to the websocket
 
@@ -24,11 +24,17 @@ class BarAggregator:
     newly generated bars being used to create even higher timeframe bars, until all target timeframes
     have been processed.
 
+    Completed bars for the `target_intervals` specified during initialization can be retrieved
+    via the return value of the `add_bar` method.
+
     **Attributes:**
 
         base_interval (int):
             The base interval of the incoming bar data, representing the smallest timeframe that
             the aggregator receives (e.g., 1 for 1-minute bars).
+
+        target_intervals (List[int]):
+            A list of the target intervals (in minutes) that the aggregator is configured to produce.
 
         aggregators (dict):
             A dictionary used to store the aggregation buffers and related information for each
@@ -73,9 +79,10 @@ class BarAggregator:
             raise ValueError("Base interval must be a positive integer.")
 
         self.base_interval = base_interval
+        self.target_intervals = sorted(target_intervals) # Store target intervals
         self.aggregators: Dict[int, Dict[str, Any]] = {}
 
-        for interval in target_intervals:
+        for interval in self.target_intervals:
             if not isinstance(interval, int) or interval <= self.base_interval:
                 raise ValueError(f"Target intervals must be positive integers and greater than the base interval. Invalid interval: {interval}")
             self.aggregators[interval] = {
@@ -110,17 +117,16 @@ class BarAggregator:
         if not isinstance(interval, int) or interval <= 0:
             raise ValueError("Interval must be a positive integer.")
 
-        for parent in sorted(self.aggregators.keys(),
-                           reverse=True):  # Iterate through intervals largest to smallest
-            if interval % parent == 0 and parent < interval:
-                return parent
-        # Determine which lower timeframe to use (e.g., 15m uses 5m bars)
+        # Check if any existing target intervals are parents
         for parent in sorted(self.aggregators.keys(), reverse=True):
-            if interval % parent == 0 and parent < interval:
+             if interval % parent == 0 and parent < interval:
                 return parent
-        return self.base_interval  # Default to 1m
 
-    def add_bar(self, bar: Dict[str, Any], interval: int = 1) -> None:
+        # If not, use the base interval as the parent
+        return self.base_interval
+
+
+    def add_bar(self, bar: Dict[str, Any], interval: int = 1) -> Optional[Dict[str, Any]]:
         """
         Adds a bar to the specified interval's buffer and triggers aggregation if necessary.
 
@@ -129,6 +135,10 @@ class BarAggregator:
         the bar, it checks if the buffer contains enough bars to perform aggregation into the next
         higher timeframe. If so, it aggregates the bars and recursively calls itself to propagate
         the aggregated bar to the parent interval.
+
+        If a completed bar for one of the `target_intervals` is generated during the aggregation
+        process (including recursive calls), that completed bar dictionary is returned.
+        Otherwise, None is returned.
 
         Args:
             bar (dict):
@@ -146,6 +156,11 @@ class BarAggregator:
                 The interval (in minutes) to which the bar should be added.
                 Defaults to 1 (i.e., the base interval). Must be a positive integer.
 
+        Returns:
+            Optional[Dict[str, Any]]:
+                A dictionary representing the completed bar if the aggregation process
+                results in a bar for one of the target intervals. Returns None otherwise.
+
         Raises:
             ValueError:
                 If the specified `interval` is not a valid target interval.
@@ -157,8 +172,9 @@ class BarAggregator:
         if not isinstance(interval, int) or interval <= 0:
             raise ValueError("Interval must be a positive integer.")
 
-        if interval not in self.aggregators:
-            raise ValueError(f"Unsupported interval: {interval}m")
+        if interval not in self.aggregators and interval != self.base_interval:
+             raise ValueError(f"Unsupported interval: {interval}m. Must be base interval or a target interval.")
+
 
         if not isinstance(bar, dict):
             raise TypeError("Bar must be a dictionary.")
@@ -171,44 +187,51 @@ class BarAggregator:
         for key in numeric_keys:
             if not isinstance(bar[key], (int, float)):
                 raise ValueError(f"Value for '{key}' must be numeric.")
-        
-        # Append to buffer
-        agg = self.aggregators[interval]
-        agg['buffer'] = pl.concat([agg['buffer'], pl.DataFrame([bar])])
-        
+
+        # If the incoming bar is the base interval, add it to the buffer for the smallest target interval
+        if interval == self.base_interval:
+            smallest_target_interval = self.target_intervals[0]
+            agg = self.aggregators[smallest_target_interval]
+            agg['buffer'] = pl.concat([agg['buffer'], pl.DataFrame([bar])])
+            current_interval_to_process = smallest_target_interval # Start processing with the smallest target interval
+        elif interval in self.aggregators:
+             # If the incoming bar is already a target interval, add it to its buffer
+            agg = self.aggregators[interval]
+            agg['buffer'] = pl.concat([agg['buffer'], pl.DataFrame([bar])])
+            current_interval_to_process = interval # Continue processing with this target interval
+        else:
+             return None # Should not happen with the checks above, but as a safeguard
+
+
         # Check if ready to aggregate
         required_bars = agg['parent_interval']
         if len(agg['buffer']) >= required_bars:
             # Aggregate
-            new_bar = self._aggregate_bars(agg['buffer'], interval)
-            
-            # Cascade to higher timeframe
-            parent_interval = interval * required_bars
-            if parent_interval in self.aggregators:
-                self.add_bar(new_bar, parent_interval)
-            
+            new_bar = self._aggregate_bars(agg['buffer'], current_interval_to_process)
+
             # Reset buffer
             agg['buffer'] = pl.DataFrame()
-        if interval not in self.aggregators:
-            raise ValueError(f"Unsupported interval: {interval}m")
-        
-        # Append to buffer
-        agg = self.aggregators[interval]
-        agg['buffer'] = pl.concat([agg['buffer'], pl.DataFrame([bar])])
-        
-        # Check if ready to aggregate
-        required_bars = agg['parent_interval']
-        if len(agg['buffer']) >= required_bars:
-            # Aggregate
-            new_bar = self._aggregate_bars(agg['buffer'], interval)
-            
-            # Cascade to higher timeframe
-            parent_interval = interval * required_bars
+
+            # If the aggregated bar is a target interval, return it
+            if current_interval_to_process in self.target_intervals:
+                 # Cascade to higher timeframe
+                parent_interval = current_interval_to_process * required_bars
+                if parent_interval in self.aggregators:
+                    return self.add_bar(new_bar, parent_interval)
+                else:
+                     return new_bar # Return the completed target bar if no higher target interval exists
+
+            # If not a target interval, but successfully aggregated, cascade upwards recursively
+            # The recursive call will handle returning a target interval bar if one is completed
+            parent_interval = current_interval_to_process * required_bars
             if parent_interval in self.aggregators:
-                self.add_bar(new_bar, parent_interval)
-            
-            # Reset buffer
-            agg['buffer'] = pl.DataFrame()
+                 return self.add_bar(new_bar, parent_interval)
+            else:
+                 return None # No higher target interval to cascade to
+
+
+        return None # No bar completed for a target interval
+
 
     def _aggregate_bars(self, df: pl.DataFrame, interval: int) -> Dict[str, Any]:
         """
@@ -260,7 +283,7 @@ class BarAggregator:
 
         if not isinstance(interval, int) or interval <= 0:
             raise ValueError("Interval must be a positive integer.")
-        
+
         return {
             "timestamp": df["timestamp"].min(),
             "open": df["open"].first(),
@@ -270,10 +293,3 @@ class BarAggregator:
             "volume": df["volume"].sum(),
             "interval": interval
         }
-
-
-
-
-# dev notes:
-# the bar aggregator should also handle cases where we request bars from the historical bars first as well to get the bars started. but we'll think about that later when
-# the bar aggregator is working properly #

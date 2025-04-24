@@ -5,6 +5,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.data import StockDataStream
 from core.order_management import OrderManager
 from utils.bar_aggregator import BarAggregator  # Import BarAggregator
+from data.websocket import WebsocketHandler
 import asyncio
 import polars as pl
 
