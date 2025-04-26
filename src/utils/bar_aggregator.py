@@ -50,7 +50,8 @@ class BarAggregator:
                     to create a single bar of the current interval. This is calculated during
                     initialization using the `_get_parent_interval` method.
     """
-
+    # update init to accept timeframe from user instead of hardcoded values
+    # error check and log to the user if their timeframe is not useable
     def __init__(self, base_interval: int = 1, target_intervals: List[int] = [5, 15, 30]) -> None:
         """
         Initializes the BarAggregator with the specified base interval and target intervals.
