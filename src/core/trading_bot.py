@@ -5,8 +5,13 @@ from alpaca.trading.client import TradingClient
 from alpaca.data import StockDataStream
 from core.order_management import OrderManager
 from utils.bar_aggregator import BarAggregator  # Import BarAggregator
-import asyncio
+import asyncio 
+import logging
 import polars as pl
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 
 class TradingBot:
     """
