@@ -20,19 +20,39 @@ class TradingBot:
         bar_aggregator (BarAggregator): Aggregates bar data into different timeframes.
     """
     def __init__(self, api_key: str, api_secret: str, strategy: Strategy, capital: float,
-                 trading_client: TradingClient, live_stock_data: StockDataStream, symbol: str,
-                 target_intervals: List[int] = [5, 15, 30]):  # Added target_intervals
+                 trading_client: TradingClient, live_stock_data: StockDataStream,
+                 symbol: str = "SPY",  # Hardcoded symbol as requested
+                 target_intervals: List[int] = [5, 15]): # Example target intervals
+        """
+        Initializes the TradingBot.
+
+        Args:
+            api_key (str): Alpaca API key.
+            api_secret (str): Alpaca API secret.
+            strategy (Strategy): The trading strategy instance.
+            capital (float): Initial trading capital.
+            trading_client (TradingClient): Initialized Alpaca TradingClient.
+            live_stock_data (StockDataStream): Initialized Alpaca StockDataStream.
+            symbol (str, optional): The stock symbol to trade. Defaults to "SPY".
+            target_intervals (List[int], optional): Target aggregation intervals in minutes. Defaults to [5, 15].
+        """
         self.strategy = strategy
         self.capital = capital
         self.trading_client = trading_client
+        # Assuming OrderManager is correctly initialized elsewhere or within strategy
         self.order_manager = OrderManager(trading_client, strategy.get_order_params())
-        self.live_stock_data = live_stock_data
-        self.symbol = symbol  # Store the specified symbol
+        self.live_stock_data = live_stock_data # Ensure the stream instance is ready
+        self.symbol = symbol # Assign the symbol
+        self.target_intervals = target_intervals
         self.bar_aggregator = BarAggregator(
-            base_interval=1, target_intervals=target_intervals
-        )  # Initialize BarAggregator
+            base_interval=1,  # Assuming incoming bars are 1-minute
+            target_intervals=self.target_intervals
+        )
+        self.completed_agg_bars: Dict[int, List[Dict[str, Any]]] = {interval: [] for interval in target_intervals} # Store completed bars
+
 
         # Subscribe to bar updates for the specified symbol
+        logging.info(f"Subscribing to bar updates for symbol: {self.symbol}")
         self.live_stock_data.subscribe_bars(self.handle_bar_update, self.symbol)
 
     async def handle_bar_update(self, bar):
