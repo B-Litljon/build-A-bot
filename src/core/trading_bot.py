@@ -1,8 +1,8 @@
-from typing import Dict,List, Any
+from typing import Dict,List, Any, Optional
 from core.signal import Signal
 from strategies.strategy import Strategy
 from alpaca.trading.client import TradingClient
-from alpaca.data import StockDataStream
+from alpaca.data import StockDataStream, Bar
 from core.order_management import OrderManager
 from utils.bar_aggregator import BarAggregator  # Import BarAggregator
 import asyncio 
@@ -60,35 +60,82 @@ class TradingBot:
         logging.info(f"Subscribing to bar updates for symbol: {self.symbol}")
         self.live_stock_data.subscribe_bars(self.handle_bar_update, self.symbol)
 
-    async def handle_bar_update(self, bar):
-        """Handles bar updates from the WebSocket stream and aggregates them."""
-        print("Bar Update:", bar)
-        
+    async def handle_bar_update(self, raw_bar: Bar):
+        """
+        Async handler for incoming raw bar updates from the data stream.
+        Formats the bar, feeds it to the BarAggregator, retrieves completed
+        aggregated bars, and stores them.
+
+        Args:
+            raw_bar (Bar): The raw bar object received from the Alpaca stream.
+        """
+        logging.debug(f"Received raw bar for {raw_bar.symbol}: {raw_bar}")
+
         try:
-            # Extract bar data
-            bar_data = {
-                "timestamp": bar.timestamp,
-                "open": bar.open,
-                "high": bar.high,
-                "low": bar.low,
-                "close": bar.close,
-                "volume": bar.volume,
+            # 1. Extract necessary data and format for BarAggregator
+            formatted_bar = {
+                "timestamp": raw_bar.timestamp,
+                "open": raw_bar.open,
+                "high": raw_bar.high,
+                "low": raw_bar.low,
+                "close": raw_bar.close,
+                "volume": raw_bar.volume,
+                # Optional: Add symbol if needed by aggregator or strategy later
+                # "symbol": raw_bar.symbol
             }
-            
-            # Add bar to aggregator (aggregates internally)
-            self.bar_aggregator.add_bar(bar_data, interval=1)  # Assuming incoming bars are 1-minute
 
-            # Placeholder for aggregated data -  **Need to get aggregated bars from BarAggregator if you want to use them directly**
-            # aggregated_bars = self.get_aggregated_bars()  #  You'll need to implement this in BarAggregator if needed
+            # 2. Add the 1-minute bar to the aggregator
+            # The add_bar method handles the aggregation logic internally
+            # and returns a completed bar if one is formed for a target interval.
+            completed_bar: Optional[Dict[str, Any]] = self.bar_aggregator.add_bar(formatted_bar, interval=1)
 
-            # Analyze using strategy -  For now, analyze the incoming bar directly
-            signals: List[Signal] = self.strategy.analyze({self.symbol: pl.DataFrame([bar_data])})  # Analyze with original bar
+            # 3. Check if a completed aggregated bar was returned
+            if completed_bar:
+                agg_interval = completed_bar.get("interval")
+                if agg_interval and agg_interval in self.target_intervals:
+                    logging.info(f"Completed {agg_interval}-minute bar for {self.symbol}: {completed_bar}")
+                    # 4. Store the completed aggregated bar
+                    self.completed_agg_bars[agg_interval].append(completed_bar)
 
-            # Place orders based on signals
-            self.place_orders(signals)
+                    # --- Placeholder for Strategy Analysis ---
+                    # Here you would typically pass the completed bars (or recent history)
+                    # to your strategy's analyze method.
+                    # Example:
+                    # recent_bars_for_strategy = self.get_recent_bars(agg_interval) # Method to get required history
+                    # signals = self.strategy.analyze({self.symbol: recent_bars_for_strategy})
+                    # self.place_orders(signals)
+                    # --- End Placeholder ---
+
+                else:
+                     logging.warning(f"Aggregator returned a bar with unexpected interval: {completed_bar}")
+
+
+            # --- Placeholder: Analyze raw 1-min bar if needed by strategy ---
+            # signals_raw: List[Signal] = self.strategy.analyze({self.symbol: pl.DataFrame([formatted_bar])})
+            # self.place_orders(signals_raw)
+            # --- End Placeholder ---
+
 
         except Exception as e:
-            print(f"Error handling bar update: {e}")
+            logging.error(f"Error handling bar update for {self.symbol}: {e}", exc_info=True)
+
+
+    # --- Placeholder methods (keep or remove based on your needs) ---
+    # async def handle_trade_update(self, trade):
+    #     """Handles trade updates from the WebSocket stream."""
+    #     logging.info(f"Trade Update: {trade}")
+    #     # Analyze the data and generate signals
+    #     # signals: List[Signal] = self.strategy.analyze(trade)
+    #     # Place orders based on signals
+    #     # self.place_orders(signals)
+
+    # async def handle_quote_update(self, quote):
+    #     """Handles quote updates from the WebSocket stream."""
+    #     logging.info(f"Quote Update: {quote}")
+    #     # Analyze the data and generate signals
+    #     # signals: List[Signal] = self.strategy.analyze(quote)
+    #     # Place orders based on signals
+    #     # self.place_orders(signals)
 
     async def handle_trade_update(self, trade):
         """Handles trade updates from the WebSocket stream."""
