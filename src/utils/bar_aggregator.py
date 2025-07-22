@@ -25,7 +25,7 @@ class LiveBarAggregator:
     monitor multiple timeframes (e.g., 5-min and 30-min), you must create a 
     separate instance of this class for each one.
     """
-    def __init__(self, timeframe: int, history_size: int = 240): 
+    def __init__(self, timeframe: float, history_size: int = 240): 
         """
         Initializes the aggregator.
         
@@ -48,7 +48,7 @@ class LiveBarAggregator:
             'close': [],
             'volume': []
         }, schema={
-            'timestamp': pl.Datetime,
+            'timestamp': pl.Datetime(time_unit="us"),
             'open': pl.Float64,
             'high': pl.Float64,
             'low': pl.Float64,
