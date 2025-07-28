@@ -1,9 +1,9 @@
 from ..strategy import Strategy
 from typing import List, Dict
 from core.signal import Signal
-from utils.order_params import OrderParams
+from core.order_management import OrderParams
 import talib
-import pandas as pd
+import polars as pl
 
 class RSIBBands(Strategy):
     def __init__(self, bb_period: int = 20, bb_std_dev: int = 2, rsi_period: int = 14, roc_period: int = 9):
@@ -21,7 +21,7 @@ class RSIBBands(Strategy):
         )
 
     # ... (rest of your RSIBBands methods: analyze, get_order_params, is_bullish_engulfing) ...
-    def analyze(self, data: Dict[str, pd.DataFrame]) -> List[Signal]:
+    def analyze(self, data: Dict[str, pl.DataFrame]) -> List[Signal]:
         signals = []
         for symbol, df in data.items():
             # Calculate indicators using ta-lib
@@ -57,7 +57,7 @@ class RSIBBands(Strategy):
     def get_order_params(self) -> OrderParams:
         return self.order_params
 
-    def is_bullish_engulfing(self, df: pd.DataFrame) -> bool:
+    def is_bullish_engulfing(self, df: pl.DataFrame) -> bool:
         if len(df) < 2:
             return False
         current_candle_open = df['open'].iloc[-1]

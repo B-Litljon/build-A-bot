@@ -4,7 +4,7 @@ from strategies.strategy import Strategy
 from alpaca.trading.client import TradingClient
 from alpaca.data import StockDataStream, Bar
 from core.order_management import OrderManager
-from utils.bar_aggregator import BarAggregator  # Import BarAggregator
+from utils.bar_aggregator import LiveBarAggregator as lba # Import BarAggregator
 import asyncio 
 import logging
 import polars as pl
@@ -49,11 +49,11 @@ class TradingBot:
         self.live_stock_data = live_stock_data # Ensure the stream instance is ready
         self.symbol = symbol # Assign the symbol
         self.target_intervals = target_intervals
-        self.bar_aggregator = BarAggregator(
-            base_interval=1,  # Assuming incoming bars are 1-minute
-            target_intervals=self.target_intervals
+        self.lba = lba(
+            timeframe=5,
+            history_size=240
         )
-        self.completed_agg_bars: Dict[int, List[Dict[str, Any]]] = {interval: [] for interval in target_intervals} # Store completed bars
+        #self.completed_agg_bars: Dict[int, List[Dict[str, Any]]] = {interval: [] for interval in target_intervals} # Store completed bars
 
 
         # Subscribe to bar updates for the specified symbol
@@ -87,38 +87,24 @@ class TradingBot:
             # 2. Add the 1-minute bar to the aggregator
             # The add_bar method handles the aggregation logic internally
             # and returns a completed bar if one is formed for a target interval.
-            completed_bar: Optional[Dict[str, Any]] = self.bar_aggregator.add_bar(formatted_bar, interval=1)
+            is_new_agg_bar = self.lba.add_bar(formatted_bar)
 
             # 3. Check if a completed aggregated bar was returned
-            if completed_bar:
-                agg_interval = completed_bar.get("interval")
-                if agg_interval and agg_interval in self.target_intervals:
-                    logging.info(f"Completed {agg_interval}-minute bar for {self.symbol}: {completed_bar}")
-                    # 4. Store the completed aggregated bar
-                    self.completed_agg_bars[agg_interval].append(completed_bar)
+            if is_new_agg_bar:
+                # A new higher timeframe bar has been created
+                logging.info(f"new aggregated bar created for {self.symbol}")
 
-                    # --- Placeholder for Strategy Analysis ---
-                    # Here you would typically pass the completed bars (or recent history)
-                    # to your strategy's analyze method.
-                    # Example:
-                    # recent_bars_for_strategy = self.get_recent_bars(agg_interval) # Method to get required history
-                    # signals = self.strategy.analyze({self.symbol: recent_bars_for_strategy})
-                    # self.place_orders(signals)
-                    # --- End Placeholder ---
+                # Get the completed aggregated bar data from the aggregator
+                candles = self.lba.candle_df
+                # convert to polars
+                candles = pl.DataFrame(candles)
 
-                else:
-                     logging.warning(f"Aggregator returned a bar with unexpected interval: {completed_bar}")
-
-
-            # --- Placeholder: Analyze raw 1-min bar if needed by strategy ---
-            # signals_raw: List[Signal] = self.strategy.analyze({self.symbol: pl.DataFrame([formatted_bar])})
-            # self.place_orders(signals_raw)
-            # --- End Placeholder ---
-
+                if len(candles) >  self.strategy.rsi_period:
+                    signals = self.strategy.analyze({self.symbol: candles})
+                    self.place_orders(signals)
 
         except Exception as e:
             logging.error(f"Error handling bar update for {self.symbol}: {e}", exc_info=True)
-
 
     # --- Placeholder methods (keep or remove based on your needs) ---
     # async def handle_trade_update(self, trade):
