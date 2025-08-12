@@ -1,7 +1,6 @@
 import polars as pl
 import numpy as np
 import asyncio
-from alpaca.data import StockDataStream
 from datetime import datetime 
 from typing import Dict, List, Optional, Any
 

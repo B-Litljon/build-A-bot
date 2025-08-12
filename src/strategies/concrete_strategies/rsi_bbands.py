@@ -1,5 +1,5 @@
-from ..strategy import Strategy
 from typing import List, Dict
+from strategies.strategy import Strategy
 from core.signal import Signal
 from core.order_management import OrderParams
 import talib
@@ -7,12 +7,13 @@ import polars as pl
 
 class RSIBBands(Strategy):
     def __init__(self, bb_period: int = 20, bb_std_dev: int = 2, rsi_period: int = 14, roc_period: int = 9):
-        super().__init__()  # Add this line to initialize the Strategy ABC
+        super().__init__()  
         self.bb_period = bb_period
         self.bb_std_dev = bb_std_dev
         self.rsi_period = rsi_period
         self.roc_period = roc_period
         self.stage_one_triggered = False
+        self.timeframe = 5
         self.order_params = OrderParams(
             risk_percentage=0.02,
             tp_multiplier=1.5,
@@ -20,11 +21,10 @@ class RSIBBands(Strategy):
             use_trailing_stop=False
         )
 
-    # ... (rest of your RSIBBands methods: analyze, get_order_params, is_bullish_engulfing) ...
     def analyze(self, data: Dict[str, pl.DataFrame]) -> List[Signal]:
         signals = []
         for symbol, df in data.items():
-            # Calculate indicators using ta-lib
+            # Calculate indicators 
             upper, middle, lower = talib.BBANDS(df["close"], timeperiod=self.bb_period, nbdevup=self.bb_std_dev, nbdevdn=self.bb_std_dev, matype=0)
             rsi = talib.RSI(df["close"], timeperiod=self.rsi_period)
             bandwidth = upper - lower

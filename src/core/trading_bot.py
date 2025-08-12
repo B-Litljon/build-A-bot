@@ -2,7 +2,8 @@ from typing import Dict,List, Any, Optional
 from core.signal import Signal
 from strategies.strategy import Strategy
 from alpaca.trading.client import TradingClient
-from alpaca.data import StockDataStream, Bar
+from alpaca.data.live import StockDataStream
+from alpaca.data.models.bars import Bar 
 from core.order_management import OrderManager
 from utils.bar_aggregator import LiveBarAggregator as lba # Import BarAggregator
 import asyncio 
@@ -50,7 +51,7 @@ class TradingBot:
         self.symbol = symbol # Assign the symbol
         self.target_intervals = target_intervals
         self.lba = lba(
-            timeframe=5,
+            timeframe=strategy.timeframe,
             history_size=240
         )
         #self.completed_agg_bars: Dict[int, List[Dict[str, Any]]] = {interval: [] for interval in target_intervals} # Store completed bars
@@ -95,10 +96,8 @@ class TradingBot:
                 logging.info(f"new aggregated bar created for {self.symbol}")
 
                 # Get the completed aggregated bar data from the aggregator
-                candles = self.lba.candle_df
-                # convert to polars
-                candles = pl.DataFrame(candles)
-
+                candles = self.lba.history_df_df
+                
                 if len(candles) >  self.strategy.rsi_period:
                     signals = self.strategy.analyze({self.symbol: candles})
                     self.place_orders(signals)
@@ -147,12 +146,16 @@ class TradingBot:
 
     def run(self):
         """
-        The main trading loop.
+        Starts the trading bot and the data stream.
         """
-        while True:
-            self.log_status()
-            # Do other things here
-            pass
+        logging.info("Starting trading bot...")
+        try:
+            # The run_forever() method will block the main thread and keep the script running
+            self.live_stock_data.run()
+        except KeyboardInterrupt:
+            logging.info("Stopping trading bot.")
+        except Exception as e:
+            logging.error(f"An unexpected error occurred: {e}", exc_info=True)
 
     def log_status(self):
         """
