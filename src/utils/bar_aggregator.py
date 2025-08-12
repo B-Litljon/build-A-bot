@@ -83,13 +83,12 @@ class LiveBarAggregator:
         A private helper method to perform the aggregation and update the state.
         This is called only when the buffer is full.
         """
-        print(f"\n--- Buffer full! Aggregating {self.timeframe} bars... ---")
+        logging.info(f"Buffer full with {len(self.buffer)} bars. Aggregating to a {self.timeframe}-minute bar.")
 
         # 1. Convert the buffer (a list of dicts) into a Polars DataFrame.
-        #    This is a very fast operation.
         chunk_df = pl.DataFrame(self.buffer)
 
-        # 2. Perform the aggregation in a single, expressive command.
+        # 2. Perform the aggregation.
         new_agg_bar_df = chunk_df.select([
             pl.col("timestamp").last(),
             pl.col("open").first(),
@@ -99,18 +98,18 @@ class LiveBarAggregator:
             pl.col("volume").sum()
         ])
         
+        logging.info(f"New aggregated bar: {new_agg_bar_df.to_dicts()[0]}")
+        
         # 3. Append the new aggregated bar to our history DataFrame.
         self.history_df = pl.concat([self.history_df, new_agg_bar_df], how="vertical")
         
         # 4. Trim the history to maintain the fixed size.
-        #    This keeps memory usage stable.
         self.history_df = self.history_df.tail(self.history_size)
         
-        # 5. Clear the buffer to get ready for the next set of bars.
+        # 5. Clear the buffer.
+        logging.debug("Clearing buffer.")
         self.buffer = []
 
-        print("Aggregation complete. History updated.")
-        # In a real bot, you would now pass self.history_df to your strategy.
-
+        logging.info("Aggregation complete. History updated.")
 
     
