@@ -1,5 +1,5 @@
 from typing import Dict, List, Optional
-
+import logging
 from core.signal import Signal
 from alpaca.trading.client import TradingClient
 
@@ -59,16 +59,18 @@ class OrderManager:
     def __init__(self, trading_client: TradingClient, order_params: OrderParams):
         self.trading_client = trading_client
         self.order_params = order_params
-        self.active_orders: Dict[str, Dict] = {}  # {order_id: order_details}
-        self.order_calculator = OrderCalculator(self.order_params)  # Initialize calculator
+        self.active_orders: Dict[str, Dict] = {}
+        self.order_calculator = OrderCalculator(self.order_params)
 
     def place_order(self, signal: Signal, current_capital: float) -> Optional[str]:
-        """Places an order, using OrderCalculator and handling errors."""
         if signal.type == "BUY":
+            logging.info(f"Received BUY signal for {signal.symbol}. Attempting to place order.")
             try:
                 quantity = self.order_calculator.calculate_quantity(signal.entry_price, current_capital)
                 stop_loss = self.order_calculator.calculate_stop_loss(signal.entry_price)
                 take_profit = self.order_calculator.calculate_take_profit(signal.entry_price)
+
+                logging.info(f"Calculated order details for {signal.symbol}: Quantity={quantity}, StopLoss={stop_loss}, TakeProfit={take_profit}")
 
                 order_id = self.trading_client.submit_order(
                     symbol=signal.symbol,
@@ -82,24 +84,25 @@ class OrderManager:
                 )
 
                 if order_id:
+                    logging.info(f"Order {order_id} submitted successfully for {signal.symbol}.")
                     self.active_orders[order_id] = {
                         "symbol": signal.symbol,
                         "entry_price": signal.entry_price,
                         "quantity": quantity,
                         "stop_loss": stop_loss,
                         "take_profit": take_profit,
-                        "entry_time": "current_time",  # Replace with actual time tracking
+                        "entry_time": "current_time",
                     }
                     return order_id
                 else:
-                    print("Order submission failed.")
+                    logging.error("Order submission failed for {signal.symbol}.")
                     return None
 
             except ValueError as e:
-                print(f"Error calculating order: {e}")
+                logging.error(f"Error calculating order for {signal.symbol}: {e}", exc_info=True)
                 return None
             except Exception as e:
-                print(f"An unexpected error occurred: {e}")
+                logging.error(f"An unexpected error occurred while placing order for {signal.symbol}: {e}", exc_info=True)
                 return None
         return None
 
