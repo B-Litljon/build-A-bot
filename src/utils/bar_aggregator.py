@@ -1,6 +1,7 @@
 import polars as pl
 import numpy as np
 import asyncio
+import logging
 from datetime import datetime 
 from typing import Dict, List, Optional, Any
 
@@ -67,6 +68,7 @@ class LiveBarAggregator:
         Returns:
             bool: True if a new aggregated bar was created, False otherwise.
         """
+        logging.debug(f"Adding new 1-minute bar to buffer: {new_bar}")
         self.buffer.append(new_bar)
         
         # Check if the buffer is full and ready for aggregation
