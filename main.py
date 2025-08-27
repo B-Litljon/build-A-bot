@@ -10,16 +10,16 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'src'
 from core.trading_bot import TradingBot
 from strategies.concrete_strategies.rsi_bbands import RSIBBands
 
-async def main():
+def main():
     """
-    The main asynchronous function to run the bot.
+    The main function to set up and run the bot.
     """
     load_dotenv()
     API_KEY = os.getenv("alpaca_key")
     API_SECRET = os.getenv("alpaca_secret")
 
     if not API_KEY or not API_SECRET:
-        print("Error: Make sure your API_KEY and API_SECRET are set in a .env file.")
+        print("Error: Make sure your alpaca_key and alpaca_secret are set in a .env file.")
         return
 
     # 1. Initialize the Strategy
@@ -31,8 +31,6 @@ async def main():
 
     # 3. Create the Trading Bot
     bot = TradingBot(
-        api_key=API_KEY,
-        api_secret=API_SECRET,
         strategy=my_strategy,
         capital=100000,
         trading_client=trading_client,
@@ -40,18 +38,23 @@ async def main():
         symbol="SPY"
     )
 
-    print("Starting bot and data stream...")
+    print("Subscribing bot to data stream...")
 
-    # 4. Create a task for our periodic status logger
-    status_task = asyncio.create_task(bot.log_status_periodically(interval=30))
+    # 4. Subscribe the bot's async handler to the data stream.
+    # The library will correctly schedule this on its event loop.
+    live_stock_data.subscribe_bars(bot.handle_bar_update, bot.symbol)
 
-    # 5. Run the data stream
-    # This will now run concurrently with the status logger
-    await live_stock_data._run_forever()
+    print("Starting data stream... (Press Ctrl+C to stop)")
 
+    # 5. Run the data stream.
+    # This is a blocking call that starts the asyncio event loop
+    # and runs until the program is interrupted.
+    live_stock_data.run()
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        main()
     except KeyboardInterrupt:
         print("\nBot stopped by user.")
+    except Exception as e:
+        print(f"An error occurred: {e}")

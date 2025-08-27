@@ -25,10 +25,12 @@ class TradingBot:
         order_manager (OrderManager): order manager created from strategy and trading client
         bar_aggregator (BarAggregator): Aggregates bar data into different timeframes.
     """
-    def __init__(self, api_key: str, api_secret: str, strategy: Strategy, capital: float,
-                 trading_client: TradingClient, live_stock_data: StockDataStream,
-                 symbol: str = "SPY",
-                 target_intervals: List[int] = [5, 15]):
+    def __init__(self,
+        strategy: Strategy, capital: float,
+        trading_client: TradingClient, live_stock_data: StockDataStream,
+        symbol: str = "SPY",
+        target_intervals: List[int] = [5, 15]
+        ):
         self.strategy = strategy
         self.capital = capital
         self.trading_client = trading_client
@@ -47,8 +49,15 @@ class TradingBot:
         """
         Async handler for incoming raw bar updates from the data stream.
         """
-        logging.debug(f"Received raw bar for {raw_bar.symbol}: {raw_bar}")
-
+        
+        logging.info(
+        f"Received raw bar for {raw_bar.symbol}:\n"
+        f"  Open: {raw_bar.open}\n"
+        f"  High: {raw_bar.high}\n"
+        f"  Low: {raw_bar.low}\n"
+        f"  Close: {raw_bar.close}\n"
+        f"  Volume: {raw_bar.volume}"
+)
         try:
             formatted_bar = {
                 "timestamp": raw_bar.timestamp,
@@ -76,6 +85,13 @@ class TradingBot:
         for signal in signals:
             if signal.type == "BUY":
                 self.order_manager.place_order(signal, self.capital)
+
+    async def run(self):
+        """
+        Subscribes to the symbol and starts the data stream
+        """
+        logging.info(f"Subscribing to bar updates for symbol: {self.symbol}")
+        self.live_stock_data.subscribe_bars(self.handle_bar_update, self.symbol)
 
     async def log_status_periodically(self, interval: int = 30):
         """Logs the bot's status at regular intervals."""
