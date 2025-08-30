@@ -17,47 +17,44 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 class TradingBot:
     """
     The main trading bot class.
-
-    Attributes:
-        strategy (Strategy): The trading strategy to use.
-        capital (float): The initial trading capital.
-        trading_client (TradingClient): The trading client for interacting with the exchange.
-        order_manager (OrderManager): order manager created from strategy and trading client
-        bar_aggregator (BarAggregator): Aggregates bar data into different timeframes.
+    ...
     """
     def __init__(self,
-        strategy: Strategy, capital: float,
-        trading_client: TradingClient, live_stock_data: StockDataStream,
-        symbol: str = "SPY",
-        target_intervals: List[int] = [5, 15]
-        ):
+                 strategy: Strategy,
+                 capital: float,
+                 trading_client: TradingClient,
+                 live_stock_data: StockDataStream,
+                 symbols: List[str],  # Changed from symbol: str
+                 target_intervals: List[int] = [5, 15]):
         self.strategy = strategy
         self.capital = capital
         self.trading_client = trading_client
         self.order_manager = OrderManager(trading_client, strategy.get_order_params())
         self.live_stock_data = live_stock_data
-        self.symbol = symbol
+        self.symbols = symbols
         self.target_intervals = target_intervals
-        self.lba = lba(
-            timeframe=strategy.timeframe,
-            history_size=240
-        )
-        logging.info(f"Subscribing to bar updates for symbol: {self.symbol}")
-        self.live_stock_data.subscribe_bars(self.handle_bar_update, self.symbol)
+        # Use a dictionary to store a bar aggregator for each symbol
+        self.lba_dict = {
+            symbol: lba(timeframe=strategy.timeframe, history_size=240)
+            for symbol in self.symbols
+        }
+        logging.info(f"Subscribing to bar updates for symbols: {self.symbols}")
+        # The '*' unpacks the list of symbols for the subscription
+        self.live_stock_data.subscribe_bars(self.handle_bar_update, *self.symbols)
 
     async def handle_bar_update(self, raw_bar: Bar):
         """
         Async handler for incoming raw bar updates from the data stream.
         """
-        
+        symbol = raw_bar.symbol
         logging.info(
-        f"Received raw bar for {raw_bar.symbol}:\n"
-        f"  Open: {raw_bar.open}\n"
-        f"  High: {raw_bar.high}\n"
-        f"  Low: {raw_bar.low}\n"
-        f"  Close: {raw_bar.close}\n"
-        f"  Volume: {raw_bar.volume}"
-)
+            f"Received raw bar for {symbol}:\n"
+            f"  Open: {raw_bar.open}\n"
+            f"  High: {raw_bar.high}\n"
+            f"  Low: {raw_bar.low}\n"
+            f"  Close: {raw_bar.close}\n"
+            f"  Volume: {raw_bar.volume}"
+        )
         try:
             formatted_bar = {
                 "timestamp": raw_bar.timestamp,
@@ -68,17 +65,23 @@ class TradingBot:
                 "volume": raw_bar.volume,
             }
 
-            is_new_agg_bar = self.lba.add_bar(formatted_bar)
+            # Get the correct bar aggregator for the symbol
+            symbol_lba = self.lba_dict.get(symbol)
+            if not symbol_lba:
+                logging.warning(f"No bar aggregator found for symbol: {symbol}")
+                return
+
+            is_new_agg_bar = symbol_lba.add_bar(formatted_bar)
 
             if is_new_agg_bar:
-                logging.info(f"New aggregated bar created for {self.symbol}")
-                candles = self.lba.history_df
+                logging.info(f"New aggregated bar created for {symbol}")
+                candles = symbol_lba.history_df
                 if len(candles) > self.strategy.rsi_period:
-                    signals = self.strategy.analyze({self.symbol: candles})
+                    signals = self.strategy.analyze({symbol: candles})
                     self.place_orders(signals)
 
         except Exception as e:
-            logging.error(f"Error handling bar update for {self.symbol}: {e}", exc_info=True)
+            logging.error(f"Error handling bar update for {symbol}: {e}", exc_info=True)
 
     def place_orders(self, signals: List[Signal]):
         """Places orders based on the received signals."""
@@ -90,8 +93,8 @@ class TradingBot:
         """
         Subscribes to the symbol and starts the data stream
         """
-        logging.info(f"Subscribing to bar updates for symbol: {self.symbol}")
-        self.live_stock_data.subscribe_bars(self.handle_bar_update, self.symbol)
+        logging.info(f"Subscribing to bar updates for symbols: {self.symbols}")
+        self.live_stock_data.subscribe_bars(self.handle_bar_update, *self.symbols)
 
     async def log_status_periodically(self, interval: int = 30):
         """Logs the bot's status at regular intervals."""
