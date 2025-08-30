@@ -65,6 +65,28 @@ class AlpacaClient:
 
         return timeframe, start_date, end_date
 
+    def get_historical_ohlcv(self, symbol: str, timeframe: TimeFrame, start_date: str, end_date: str) -> pl.DataFrame:
+        """
+        Fetches historical OHLCV data and returns it as a Polars DataFrame.
+        """
+        try:
+            request_params = StockBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=timeframe,
+                start=start_date,
+                end=end_date
+            )
+            bars = self.stock_client.get_stock_bars(request_params)
+            # Convert to Polars DataFrame
+            df = pl.from_pandas(bars.df)
+            return df
+        except alpaca.common.exceptions.AlpacaAPIError as e:
+            print(f"Alpaca API Error: {e}")
+            return pl.DataFrame()
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
+            return pl.DataFrame()
+
     def get_most_active_stocks(self):
         """
         Retrieves the most active stocks based on volume.
