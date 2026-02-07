@@ -5,10 +5,13 @@ class Signal:
     Attributes:
         type (str): "BUY" or "SELL".
         symbol (str): The asset symbol.
+        price (float): The price at which the signal was generated.
     """
-    def __init__(self, type: str, symbol: str):
+
+    def __init__(self, type: str, symbol: str, price: float):
         self.type = type
         self.symbol = symbol
+        self.price = price
 
     def __str__(self):
-        return f"Signal(type={self.type}, symbol={self.symbol})"
+        return f"Signal(type={self.type}, symbol={self.symbol}, price={self.price})"
