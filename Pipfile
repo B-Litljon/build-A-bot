@@ -14,9 +14,9 @@ scikit-learn = "*"
 tensorflow = "*"
 ta-lib = "*"
 python-dotenv = "*"
-alpaca-py = "*"
 pretty-errors = "*"
 polygon-api-client = "*"
+alpaca-py = "*"
 
 [dev-packages]
 
