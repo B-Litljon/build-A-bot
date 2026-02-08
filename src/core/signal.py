@@ -12,6 +12,7 @@ class Signal:
         self.type = type
         self.symbol = symbol
         self.price = price
+        self.entry_price = price
 
     def __str__(self):
         return f"Signal(type={self.type}, symbol={self.symbol}, price={self.price})"

@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../s
 
 from core.trading_bot import TradingBot
 from data.api_requests import AlpacaClient
-from strategies.concrete_strategies.rsi_bbands import RSIBBands
+from strategies.concrete_strategies.sma_crossover import SMACrossover
 from core.ws_stream_simulator import simulate_ws_stream
 
 # Configure logging
@@ -23,9 +23,13 @@ class MockTradingClient:
     def __init__(self):
         self.orders = []
 
-    def submit_order(self, order_request):
-        print(f"\n[MOCK API] ORDER RECEIVED: {order_request.side} {order_request.qty} {order_request.symbol}")
-        self.orders.append(order_request)
+    def submit_order(self, order_request=None, **kwargs):
+        order = order_request if order_request is not None else type("obj", (object,), kwargs)
+        side = getattr(order, "side", kwargs.get("side"))
+        qty = getattr(order, "qty", kwargs.get("qty"))
+        symbol = getattr(order, "symbol", kwargs.get("symbol"))
+        print(f"\n[MOCK API] ORDER RECEIVED: {side} {qty} {symbol}")
+        self.orders.append(order)
         return type("obj", (object,), {"id": "mock_order_id"})
 
 
@@ -70,13 +74,7 @@ async def run_simulation():
     # 3. Initialize Bot
     mock_trade = MockTradingClient()
     mock_stream = MockDataStream()
-    # Initialize with VERY LOOSE parameters to force a trade on stable SPY data
-    strategy = RSIBBands(
-        stage1_rsi_threshold=70,
-        stage2_min_roc=0.0001,
-        stage2_rsi_entry=10,
-        stage2_rsi_exit=90,
-    )
+    strategy = SMACrossover(fast_period=10, slow_period=30)
     if not hasattr(strategy, "timeframe"):
         strategy.timeframe = 5
 
