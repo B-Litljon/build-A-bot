@@ -41,3 +41,11 @@ class Strategy(ABC):
             OrderParams: An OrderParams object.
         """
         pass
+
+    @property
+    @abstractmethod
+    def warmup_period(self) -> int:
+        """
+        Returns the minimum number of candles required before analysis can run.
+        """
+        pass

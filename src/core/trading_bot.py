@@ -76,9 +76,11 @@ class TradingBot:
             if is_new_agg_bar:
                 logging.info(f"New aggregated bar created for {symbol}")
                 candles = symbol_lba.history_df
-                if len(candles) > self.strategy.rsi_period:
+                if len(candles) >= self.strategy.warmup_period:
                     signals = self.strategy.analyze({symbol: candles})
                     self.place_orders(signals)
+                else:
+                    logging.info(f"Warming up... {len(candles)}/{self.strategy.warmup_period} candles")
 
         except Exception as e:
             logging.error(f"Error handling bar update for {symbol}: {e}", exc_info=True)

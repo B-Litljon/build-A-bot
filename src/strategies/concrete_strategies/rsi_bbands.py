@@ -119,6 +119,10 @@ class RSIBBands(Strategy):
 
         return signals
 
+    @property
+    def warmup_period(self) -> int:
+        return max(self.bb_period, self.rsi_period, self.roc_period) + 1
+
     def get_order_params(self) -> OrderParams:
         return self.order_params
 
