@@ -47,6 +47,13 @@ class TradingBot:
         Async handler for incoming raw bar updates from the data stream.
         """
         symbol = raw_bar.symbol
+        current_price = raw_bar.close
+
+        # --- 1. EXIT LOGIC (Check every tick) ---
+        # Create a mini market_data dict for the monitor
+        self.order_manager.monitor_orders({symbol: current_price})
+
+        # --- 2. EXISTING AGGREGATION LOGIC ---
         logging.info(
             f"Received raw bar for {symbol}:\n"
             f"  Open: {raw_bar.open}\n"
