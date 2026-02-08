@@ -1,14 +1,19 @@
-from typing import Dict,List, Any, Optional
+from typing import Dict, List, TYPE_CHECKING
 from core.signal import Signal
 from strategies.strategy import Strategy
 from alpaca.trading.client import TradingClient
 from alpaca.data.live import StockDataStream
-from alpaca.data.models.bars import Bar 
+from alpaca.data.models.bars import Bar
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from core.order_management import OrderManager
-from utils.bar_aggregator import LiveBarAggregator as lba # Import BarAggregator
-import asyncio 
+from utils.bar_aggregator import LiveBarAggregator as lba
+import asyncio
 import logging
-import polars as pl
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+if TYPE_CHECKING:
+    from data.api_requests import AlpacaClient
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -38,9 +43,69 @@ class TradingBot:
             symbol: lba(timeframe=strategy.timeframe, history_size=240)
             for symbol in self.symbols
         }
-        logging.info(f"Subscribing to bar updates for symbols: {self.symbols}")
-        # The '*' unpacks the list of symbols for the subscription
-        self.live_stock_data.subscribe_bars(self.handle_bar_update, *self.symbols)
+        logging.info(f"TradingBot initialized for symbols: {self.symbols}")
+
+    async def warmup(self, data_client: 'AlpacaClient'):
+        """
+        Fetches historical data to pre-fill the bar aggregators.
+        This allows the strategy to run immediately without waiting hours for live data.
+        """
+        logging.info("Starting Rapid Warmup...")
+
+        required_candles = self.strategy.warmup_period
+        agg_timeframe = int(list(self.lba_dict.values())[0].timeframe)
+        lookback_minutes = int(required_candles * agg_timeframe * 1.5)
+
+        logging.info(
+            f"Warmup Requirement: {required_candles} candles ({agg_timeframe}m timeframe). Fetching last {lookback_minutes} minutes."
+        )
+
+        end_time = datetime.now(ZoneInfo("America/New_York"))
+        start_time = end_time - timedelta(minutes=lookback_minutes)
+        start_utc = start_time.astimezone(ZoneInfo("UTC"))
+        end_utc = end_time.astimezone(ZoneInfo("UTC"))
+
+        for symbol in self.symbols:
+            try:
+                logging.info(f"Fetching warmup data for {symbol}...")
+                bars_df = data_client.get_historical_ohlcv(
+                    symbol=symbol,
+                    timeframe=TimeFrame(1, TimeFrameUnit.Minute),
+                    start_date=start_time.isoformat(),
+                    end_date=end_time.isoformat(),
+                )
+
+                if bars_df.is_empty():
+                    logging.warning(f"No warmup data found for {symbol}.")
+                    continue
+
+                count = 0
+                for row in bars_df.iter_rows(named=True):
+                    ts = row["timestamp"]
+                    if hasattr(ts, "to_pydatetime"):
+                        ts = ts.to_pydatetime()
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=ZoneInfo("UTC"))
+
+                    if ts < start_utc or ts > end_utc:
+                        continue
+
+                    bar_data = {
+                        "timestamp": ts,
+                        "open": row["open"],
+                        "high": row["high"],
+                        "low": row["low"],
+                        "close": row["close"],
+                        "volume": row["volume"],
+                    }
+                    self.lba_dict[symbol].add_bar(bar_data)
+                    count += 1
+
+                logging.info(f"Warmed up {symbol} with {count} 1m bars.")
+            except Exception as e:
+                logging.error(f"Failed to warmup {symbol}: {e}")
+
+        logging.info("Warmup Complete. Bot is ready to trade.")
 
     async def handle_bar_update(self, raw_bar: Bar):
         """
@@ -100,10 +165,14 @@ class TradingBot:
 
     async def run(self):
         """
-        Subscribes to the symbol and starts the data stream
+        Starts the trading bot: syncs state and subscribes.
         """
+        logging.info("Syncing internal state with Alpaca positions...")
+        self.order_manager.sync_positions()
+
         logging.info(f"Subscribing to bar updates for symbols: {self.symbols}")
         self.live_stock_data.subscribe_bars(self.handle_bar_update, *self.symbols)
+        logging.info("Bot initialized and waiting for stream start.")
 
     async def log_status_periodically(self, interval: int = 30):
         """Logs the bot's status at regular intervals."""

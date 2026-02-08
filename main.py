@@ -67,9 +67,16 @@ async def main():
         symbols=symbols
     )
 
-    # 5. Run (Blocking)
-    # This will maintain the WebSocket connection indefinitely
+    # 5. Warmup (The Turbo Button)
+    # We reuse the existing AlpacaClient (data_client)
+    await bot.warmup(data_client)
+
+    # 6. Run (Sync State & Subscribe)
     await bot.run()
+
+    # 7. Start Stream
+    print("Starting data stream...")
+    data_stream.run()
 
 
 if __name__ == "__main__":
