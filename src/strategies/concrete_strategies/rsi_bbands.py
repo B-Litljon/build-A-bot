@@ -9,12 +9,28 @@ import numpy as np
 
 
 class RSIBBands(Strategy):
-    def __init__(self, bb_period: int = 20, bb_std_dev: int = 2, rsi_period: int = 14, roc_period: int = 9):
+    def __init__(
+        self,
+        bb_period: int = 20,
+        bb_std_dev: int = 2,
+        rsi_period: int = 14,
+        roc_period: int = 9,
+        stage1_rsi_threshold: int = 25,
+        stage2_rsi_entry: int = 30,
+        stage2_rsi_exit: int = 35,
+        stage2_min_roc: float = 0.15,
+    ):
         super().__init__()
         self.bb_period = bb_period
         self.bb_std_dev = bb_std_dev
         self.rsi_period = rsi_period
         self.roc_period = roc_period
+
+        # Store logic thresholds
+        self.stage1_rsi_threshold = stage1_rsi_threshold
+        self.stage2_rsi_entry = stage2_rsi_entry
+        self.stage2_rsi_exit = stage2_rsi_exit
+        self.stage2_min_roc = stage2_min_roc
 
         # State tracking per symbol (Dict[str, bool]) to prevent cross-contamination
         self.stage_one_triggered = {}
@@ -70,31 +86,32 @@ class RSIBBands(Strategy):
 
             # --- Logic Engine ---
             if not self.stage_one_triggered[symbol]:
-                # Stage 1: Oversold Condition
-                if current_price < lower_band and rsi_value <= 25:
+                # Stage 1: Oversold Condition (configurable)
+                if current_price < lower_band and rsi_value <= self.stage1_rsi_threshold:
                     self.stage_one_triggered[symbol] = True
                     logging.info(
-                        f"Stage 1 TRIGGERED for {symbol}: Price ({current_price:.2f}) < Lower BB & RSI ({rsi_value:.2f}) <= 25"
+                        f"Stage 1 TRIGGERED for {symbol}: Price < Lower BB & RSI {rsi_value:.2f} <= {self.stage1_rsi_threshold}"
                     )
 
             elif self.stage_one_triggered[symbol]:
                 logging.info(f"Checking Stage 2 for {symbol} (Stage 1 active)...")
 
-                # Stage 2: Recovery & Momentum Confirmation
-                # RSI recovers to [30, 35] AND Bandwidth is expanding (ROC > 0.15)
-                if 30 <= rsi_value < 35 and not np.isnan(bandwidth_roc_value) and bandwidth_roc_value > 0.15:
+                # Stage 2: Recovery & Momentum Confirmation (configurable)
+                rsi_in_range = self.stage2_rsi_entry <= rsi_value < self.stage2_rsi_exit
+                roc_valid = (not np.isnan(bandwidth_roc_value)) and (bandwidth_roc_value > self.stage2_min_roc)
+
+                if rsi_in_range and roc_valid:
                     if self.is_bullish_engulfing(df):
                         logging.info(f"BUY SIGNAL GENERATED for {symbol} at {current_price:.2f}")
-                        signals.append(Signal("BUY", symbol, current_price))
+                        signals.append(Signal("BUY", symbol, float(current_price)))
                         self.stage_one_triggered[symbol] = False  # Reset trigger after signal
                     else:
                         logging.warning(
                             f"Stage 2 conditions met for {symbol}, but NO Bullish Engulfing pattern. holding..."
                         )
 
-                # Reset logic: If RSI goes too high without buying, or drops back down?
-                # Optional: Add logic here to reset if RSI > 40 to avoid stale triggers.
-                elif rsi_value > 40:
+                # Reset logic: If RSI goes too high without buying.
+                elif rsi_value > self.stage2_rsi_exit + 5:
                     logging.info(
                         f"Stage 1 Reset for {symbol}: RSI drifted too high ({rsi_value:.2f}) without signal."
                     )

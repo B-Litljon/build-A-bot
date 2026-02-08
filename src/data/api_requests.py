@@ -77,10 +77,14 @@ class AlpacaClient:
                 end=end_date
             )
             bars = self.stock_client.get_stock_bars(request_params)
-            # Convert to Polars DataFrame
-            df = pl.from_pandas(bars.df)
+            # Reset index to preserve 'symbol' and 'timestamp' as columns
+            pandas_df = bars.df.reset_index()
+            try:
+                df = pl.from_pandas(pandas_df)
+            except ImportError:
+                df = pl.DataFrame(pandas_df.to_dict(orient="list"))
             return df
-        except alpaca.common.exceptions.AlpacaAPIError as e:
+        except alpaca.common.exceptions.APIError as e:
             print(f"Alpaca API Error: {e}")
             return pl.DataFrame()
         except Exception as e:
@@ -146,7 +150,7 @@ class AlpacaClient:
             print("API response:", stock_bars)  # Print the response
             print("Stock bars data:", stock_bars.df)  # Print the DataFrame
             return stock_bars
-        except alpaca.common.exceptions.AlpacaAPIError as e:
+        except alpaca.common.exceptions.APIError as e:
             print(f"Alpaca API Error: {e}")
         except Exception as e:
             print(f"An unexpected error occurred: {e}")
