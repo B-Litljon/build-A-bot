@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../s
 
 from core.trading_bot import TradingBot
 from data.api_requests import AlpacaClient
-from strategies.concrete_strategies.sma_crossover import SMACrossover
+from strategies.concrete_strategies.rsi_bbands import RSIBBands
 from core.ws_stream_simulator import simulate_ws_stream
 
 # Configure logging
@@ -74,7 +74,13 @@ async def run_simulation():
     # 3. Initialize Bot
     mock_trade = MockTradingClient()
     mock_stream = MockDataStream()
-    strategy = SMACrossover(fast_period=10, slow_period=30)
+    # Initialize RSIBBands with LOOSE parameters for testing
+    strategy = RSIBBands(
+        stage1_rsi_threshold=70,
+        stage2_min_roc=0.0001,
+        stage2_rsi_entry=10,
+        stage2_rsi_exit=90,
+    )
     if not hasattr(strategy, "timeframe"):
         strategy.timeframe = 5
 

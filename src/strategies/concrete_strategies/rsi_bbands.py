@@ -15,9 +15,10 @@ class RSIBBands(Strategy):
         bb_std_dev: int = 2,
         rsi_period: int = 14,
         roc_period: int = 9,
-        stage1_rsi_threshold: int = 25,
+        # Configurable Logic Thresholds
+        stage1_rsi_threshold: int = 30,
         stage2_rsi_entry: int = 30,
-        stage2_rsi_exit: int = 35,
+        stage2_rsi_exit: int = 40,
         stage2_min_roc: float = 0.15,
     ):
         super().__init__()
@@ -26,13 +27,13 @@ class RSIBBands(Strategy):
         self.rsi_period = rsi_period
         self.roc_period = roc_period
 
-        # Store logic thresholds
+        # Store Logic Thresholds
         self.stage1_rsi_threshold = stage1_rsi_threshold
         self.stage2_rsi_entry = stage2_rsi_entry
         self.stage2_rsi_exit = stage2_rsi_exit
         self.stage2_min_roc = stage2_min_roc
 
-        # State tracking per symbol (Dict[str, bool]) to prevent cross-contamination
+        # State tracking per symbol (Dict[str, bool])
         self.stage_one_triggered = {}
 
         self.order_params = OrderParams(
@@ -42,23 +43,25 @@ class RSIBBands(Strategy):
             use_trailing_stop=False,
         )
 
+    @property
+    def warmup_period(self) -> int:
+        """
+        Returns the minimum number of candles required.
+        Max of all lookback periods + 1 safety buffer.
+        """
+        return max(self.bb_period, self.rsi_period, self.roc_period) + 1
+
     def analyze(self, data: Dict[str, pl.DataFrame]) -> List[Signal]:
         signals = []
         for symbol, df in data.items():
-            # Ensure we have enough data
-            if len(df) < max(self.bb_period, self.rsi_period, self.roc_period) + 1:
-                logging.warning(f"Not enough data for {symbol}. Skipping analysis.")
-                continue
+            # Note: The TradingBot now handles the 'warmup_period' check before calling this.
 
-            # Initialize state for this symbol if not present
             if symbol not in self.stage_one_triggered:
                 self.stage_one_triggered[symbol] = False
 
             logging.info(f"Analyzing data for {symbol}...")
 
-            # --- Technical Analysis (TA-Lib + Polars) ---
-            # TA-Lib expects numpy arrays or Polars Series (which act as arrays)
-            # We convert to numpy explicitly to ensure safety across all TA-Lib versions
+            # --- TA-Lib Calculations (NumPy Conversion) ---
             close_prices = df["close"].to_numpy()
 
             upper, middle, lower = talib.BBANDS(
@@ -70,15 +73,14 @@ class RSIBBands(Strategy):
             )
             rsi = talib.RSI(close_prices, timeperiod=self.rsi_period)
 
-            # Bandwidth Calculation (Numpy Array operations)
             bandwidth = upper - lower
             bandwidth_roc = talib.ROC(bandwidth, timeperiod=self.roc_period)
 
-            # --- Get Latest Values (Polars/Numpy Negative Indexing) ---
-            current_price = df["close"][-1]  # Polars Series scalar access
-            lower_band = lower[-1]  # Numpy array access
-            rsi_value = rsi[-1]  # Numpy array access
-            bandwidth_roc_value = bandwidth_roc[-1]  # Numpy array access
+            # --- Latest Values ---
+            current_price = df["close"][-1]
+            lower_band = lower[-1]
+            rsi_value = rsi[-1]
+            bandwidth_roc_value = bandwidth_roc[-1]
 
             logging.info(
                 f"Symbol: {symbol}, Price: {current_price:.2f}, Lower BB: {lower_band:.2f}, RSI: {rsi_value:.2f}, ROC: {bandwidth_roc_value:.2f}"
@@ -86,7 +88,7 @@ class RSIBBands(Strategy):
 
             # --- Logic Engine ---
             if not self.stage_one_triggered[symbol]:
-                # Stage 1: Oversold Condition (configurable)
+                # Stage 1: Oversold (Configurable)
                 if current_price < lower_band and rsi_value <= self.stage1_rsi_threshold:
                     self.stage_one_triggered[symbol] = True
                     logging.info(
@@ -96,7 +98,7 @@ class RSIBBands(Strategy):
             elif self.stage_one_triggered[symbol]:
                 logging.info(f"Checking Stage 2 for {symbol} (Stage 1 active)...")
 
-                # Stage 2: Recovery & Momentum Confirmation (configurable)
+                # Stage 2: Recovery (Configurable)
                 rsi_in_range = self.stage2_rsi_entry <= rsi_value < self.stage2_rsi_exit
                 roc_valid = (not np.isnan(bandwidth_roc_value)) and (bandwidth_roc_value > self.stage2_min_roc)
 
@@ -104,48 +106,28 @@ class RSIBBands(Strategy):
                     if self.is_bullish_engulfing(df):
                         logging.info(f"BUY SIGNAL GENERATED for {symbol} at {current_price:.2f}")
                         signals.append(Signal("BUY", symbol, float(current_price)))
-                        self.stage_one_triggered[symbol] = False  # Reset trigger after signal
+                        self.stage_one_triggered[symbol] = False
                     else:
-                        logging.warning(
-                            f"Stage 2 conditions met for {symbol}, but NO Bullish Engulfing pattern. holding..."
-                        )
+                        logging.warning(f"Stage 2 met, but NO Bullish Engulfing. Holding...")
 
-                # Reset logic: If RSI goes too high without buying.
+                # Reset if RSI goes too high
                 elif rsi_value > self.stage2_rsi_exit + 5:
-                    logging.info(
-                        f"Stage 1 Reset for {symbol}: RSI drifted too high ({rsi_value:.2f}) without signal."
-                    )
+                    logging.info(f"Stage 1 Reset for {symbol}: RSI drifted too high ({rsi_value:.2f}).")
                     self.stage_one_triggered[symbol] = False
 
         return signals
-
-    @property
-    def warmup_period(self) -> int:
-        return max(self.bb_period, self.rsi_period, self.roc_period) + 1
 
     def get_order_params(self) -> OrderParams:
         return self.order_params
 
     def is_bullish_engulfing(self, df: pl.DataFrame) -> bool:
-        """
-        Checks for bullish engulfing pattern using Polars indexing.
-        """
         if len(df) < 2:
             return False
-
-        # Polars negative indexing: [-1] is current, [-2] is previous
         current_open = df["open"][-1]
         current_close = df["close"][-1]
-
         prev_open = df["open"][-2]
         prev_close = df["close"][-2]
-
-        # Logic:
-        # 1. Previous candle was red (Close < Open)
-        # 2. Current candle is green (Close > Open)
-        # 3. Current Body engulfs Previous Body
         is_prev_red = prev_close < prev_open
         is_curr_green = current_close > current_open
         engulfing = (current_close > prev_open) and (current_open < prev_close)
-
         return is_prev_red and is_curr_green and engulfing
