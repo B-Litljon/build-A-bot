@@ -14,8 +14,6 @@ class SMACrossover(Strategy):
         super().__init__()
         self.fast_period = fast_period
         self.slow_period = slow_period
-        # TradingBot currently gates analysis on `strategy.rsi_period`.
-        self.rsi_period = slow_period
         self.timeframe = 5
         self.order_params = OrderParams(
             risk_percentage=0.02,
@@ -55,3 +53,7 @@ class SMACrossover(Strategy):
 
     def get_order_params(self) -> OrderParams:
         return self.order_params
+
+    @property
+    def warmup_period(self) -> int:
+        return self.slow_period
