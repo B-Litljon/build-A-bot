@@ -60,7 +60,8 @@ class TradingBot:
             f"Warmup Requirement: {required_candles} candles ({agg_timeframe}m timeframe). Fetching last {lookback_minutes} minutes."
         )
 
-        end_time = datetime.now(ZoneInfo("America/New_York"))
+        # Shift back 16 minutes to avoid "subscription does not permit querying recent SIP data" error
+        end_time = datetime.now(ZoneInfo("America/New_York")) - timedelta(minutes=16)
         start_time = end_time - timedelta(minutes=lookback_minutes)
         start_utc = start_time.astimezone(ZoneInfo("UTC"))
         end_utc = end_time.astimezone(ZoneInfo("UTC"))

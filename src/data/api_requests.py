@@ -16,6 +16,7 @@ from alpaca.data import (
 )
 from alpaca.data.timeframe import TimeFrameUnit
 from alpaca.data.requests import MostActivesRequest
+from alpaca.data.enums import MostActivesBy
 from alpaca.data.historical.option import OptionHistoricalDataClient
 from alpaca.data.historical.screener import ScreenerClient
 import alpaca.common.exceptions
@@ -103,7 +104,8 @@ class AlpacaClient:
             pl.DataFrame: A Polars DataFrame containing a single column 'ticker' with the list of
                          ticker symbols for the most active stocks.
         """
-        most_actives_request = MostActivesRequest()
+        # Explicitly use the MostActivesBy Enum to avoid Pydantic warnings
+        most_actives_request = MostActivesRequest(by=MostActivesBy.VOLUME, top=10)
         most_actives_response = self.screener_client.get_most_actives(most_actives_request)
         
         # Convert list of dictionaries to Polars DataFrame
