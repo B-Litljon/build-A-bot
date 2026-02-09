@@ -124,3 +124,40 @@ class OrderManager:
                     del self.active_orders[order_id]
                 except Exception as e:
                     logging.error(f"Failed to exit {symbol}: {e}")
+
+    def sync_positions(self):
+        """
+        Reconciles memory with actual Alpaca positions on startup.
+        """
+        try:
+            positions = self.trading_client.get_all_positions()
+            for pos in positions:
+                # Check if we are already managing this symbol
+                is_managed = False
+                for details in self.active_orders.values():
+                    if details["symbol"] == pos.symbol:
+                        is_managed = True
+                        break
+
+                if not is_managed:
+                    logging.warning(f"⚠️ Found unmanaged position for {pos.symbol} (Qty: {pos.qty}). Adopting it.")
+
+                    # Reconstruct thresholds based on Average Entry Price
+                    avg_entry = float(pos.avg_entry_price)
+                    sl = self.order_calculator.calculate_stop_loss(avg_entry)
+                    tp = self.order_calculator.calculate_take_profit(avg_entry)
+
+                    # Create a synthetic Order ID (prefix 'sync_')
+                    synthetic_id = f"sync_{pos.symbol}_{pos.asset_id}"
+
+                    self.active_orders[synthetic_id] = {
+                        "symbol": pos.symbol,
+                        "entry_price": avg_entry,
+                        "quantity": float(pos.qty),
+                        "stop_loss": sl,
+                        "take_profit": tp
+                    }
+                    logging.info(f"✅ Adopted {pos.symbol}: SL={sl:.2f}, TP={tp:.2f}")
+
+        except Exception as e:
+            logging.error(f"Failed to sync positions: {e}")

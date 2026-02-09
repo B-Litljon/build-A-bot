@@ -9,38 +9,40 @@ import numpy as np
 
 
 class RSIBBands(Strategy):
-    def __init__(
-        self,
-        bb_period: int = 20,
-        bb_std_dev: int = 2,
-        rsi_period: int = 14,
-        roc_period: int = 9,
-        # Configurable Logic Thresholds
-        stage1_rsi_threshold: int = 30,
-        stage2_rsi_entry: int = 30,
-        stage2_rsi_exit: int = 40,
-        stage2_min_roc: float = 0.15,
-    ):
-        super().__init__()
+    def __init__(self, 
+                    bb_period: int = 20, 
+                    bb_std_dev: int = 2, 
+                    rsi_period: int = 14, 
+                    roc_period: int = 9,
+                    # Configurable Logic Thresholds
+                    stage1_rsi_threshold: int = 30, 
+                    stage2_rsi_entry: int = 30,
+                    stage2_rsi_exit: int = 40,
+                    stage2_min_roc: float = 0.15,
+                    # MISSING ATTRIBUTE RESTORED
+                    timeframe: int = 5 
+                    ):
+        super().__init__()  
+        self.timeframe = timeframe  # <--- CRITICAL FIX
         self.bb_period = bb_period
         self.bb_std_dev = bb_std_dev
         self.rsi_period = rsi_period
         self.roc_period = roc_period
-
+        
         # Store Logic Thresholds
         self.stage1_rsi_threshold = stage1_rsi_threshold
         self.stage2_rsi_entry = stage2_rsi_entry
         self.stage2_rsi_exit = stage2_rsi_exit
         self.stage2_min_roc = stage2_min_roc
-
+        
         # State tracking per symbol (Dict[str, bool])
-        self.stage_one_triggered = {}
-
+        self.stage_one_triggered = {} 
+        
         self.order_params = OrderParams(
             risk_percentage=0.02,
             tp_multiplier=1.5,
             sl_multiplier=0.9,
-            use_trailing_stop=False,
+            use_trailing_stop=False
         )
 
     @property
