@@ -30,11 +30,13 @@ class TradingBot:
                  trading_client: TradingClient,
                  live_stock_data: StockDataStream,
                  symbols: List[str],  # Changed from symbol: str
-                 target_intervals: List[int] = [5, 15]):
+                 target_intervals: List[int] = [5, 15],
+                 notification_manager=None):
         self.strategy = strategy
         self.capital = capital
         self.trading_client = trading_client
-        self.order_manager = OrderManager(trading_client, strategy.get_order_params())
+        self.notification_manager = notification_manager
+        self.order_manager = OrderManager(trading_client, strategy.get_order_params(), notification_manager=self.notification_manager)
         self.live_stock_data = live_stock_data
         self.symbols = symbols
         self.target_intervals = target_intervals

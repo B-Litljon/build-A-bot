@@ -44,9 +44,10 @@ class OrderCalculator:
 
 
 class OrderManager:
-    def __init__(self, trading_client: TradingClient, order_params: OrderParams):
+    def __init__(self, trading_client: TradingClient, order_params: OrderParams, notification_manager=None):
         self.trading_client = trading_client
         self.order_params = order_params
+        self.notification_manager = notification_manager
         self.active_orders: Dict[str, Dict] = {}
         self.order_calculator = OrderCalculator(self.order_params)
 
@@ -83,6 +84,8 @@ class OrderManager:
                         "take_profit": take_profit,
                     }
                     logging.info(f"Order {order_id} placed.")
+                    if self.notification_manager:
+                        self.notification_manager.notify_trade("BUY", signal.symbol, signal.price, qty, "Signal Triggered")
                     return str(order_id)
 
             except Exception as e:
@@ -121,6 +124,8 @@ class OrderManager:
                         time_in_force=TimeInForce.GTC,
                     )
                     self.trading_client.submit_order(req)
+                    if self.notification_manager:
+                        self.notification_manager.notify_trade("SELL", symbol, current_price, details["quantity"], reason)
                     del self.active_orders[order_id]
                 except Exception as e:
                     logging.error(f"Failed to exit {symbol}: {e}")

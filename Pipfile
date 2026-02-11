@@ -6,7 +6,6 @@ name = "pypi"
 [packages]
 polars = "*"
 numpy = "*"
-requests = "*"
 typer = "*"
 matplotlib = "*"
 tqdm = "*"
@@ -17,6 +16,7 @@ python-dotenv = "*"
 pretty-errors = "*"
 polygon-api-client = "*"
 alpaca-py = "*"
+requests = "*"
 
 [dev-packages]
 

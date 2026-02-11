@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'src'
 
 from data.api_requests import AlpacaClient
 from core.trading_bot import TradingBot
+from core.notification_manager import NotificationManager
 from strategies.concrete_strategies.rsi_bbands import RSIBBands
 
 # Configure logging
@@ -34,7 +35,9 @@ def main():
     # 1. Initialize Objects (Safe in sync context)
     trading_client = TradingClient(api_key, secret_key, paper=True)
     data_stream = StockDataStream(api_key, secret_key)
-    
+    discord_url = os.getenv("discord_webhook_url")
+    notifier = NotificationManager(discord_url)
+
     # Strategy: Strict (Default)
     strategy = RSIBBands() 
 
@@ -61,8 +64,12 @@ def main():
         capital=100000.0,
         trading_client=trading_client,
         live_stock_data=data_stream,
-        symbols=symbols
+        symbols=symbols,
+        notification_manager=notifier
     )
+
+    # Notify Discord of startup
+    notifier.notify_startup(symbols)
 
     # 4. Async Setup Phase (Warmup & Sync)
     async def setup_phase():
