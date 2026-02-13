@@ -63,6 +63,7 @@ class TradingBot:
         )
 
         # Shift back 16 minutes to avoid "subscription does not permit querying recent SIP data" error
+        # eventually change the source of our data to polygon, use alpaca for executing orders, polygon is supposedly cheaper
         end_time = datetime.now(ZoneInfo("America/New_York")) - timedelta(minutes=16)
         start_time = end_time - timedelta(minutes=lookback_minutes)
         start_utc = start_time.astimezone(ZoneInfo("UTC"))
