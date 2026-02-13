@@ -3,13 +3,11 @@ import asyncio
 import logging
 import sys
 from dotenv import load_dotenv
-from alpaca.trading.client import TradingClient
-from alpaca.data.live import StockDataStream
 
 # Ensure src is in the path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'src')))
 
-from data.api_requests import AlpacaClient
+from data.alpaca_provider import AlpacaProvider
 from core.trading_bot import TradingBot
 from core.notification_manager import NotificationManager
 from strategies.concrete_strategies.rsi_bbands import RSIBBands
@@ -27,32 +25,30 @@ def main():
     secret_key = os.getenv("alpaca_secret")
 
     if not api_key or not secret_key:
-        logging.error("❌ Credentials missing. Check .env file.")
+        logging.error("Credentials missing. Check .env file.")
         return
 
-    logging.info("--- 🚀 Initializing Build-A-Bot (Paper Mode) ---")
+    logging.info("--- Initializing Build-A-Bot (Paper Mode) ---")
 
-    # 1. Initialize Objects (Safe in sync context)
-    trading_client = TradingClient(api_key, secret_key, paper=True)
-    data_stream = StockDataStream(api_key, secret_key)
+    # 1. Initialize the data provider (single object replaces three Alpaca clients)
+    provider = AlpacaProvider(api_key, secret_key, paper=True)
+
     discord_url = os.getenv("discord_webhook_url")
     notifier = NotificationManager(discord_url)
 
     # Strategy: Strict (Default)
-    strategy = RSIBBands() 
+    strategy = RSIBBands()
 
     # 2. Dynamic Symbol Selection
     logging.info("Fetching market data to select active symbols...")
-    data_client = AlpacaClient(api_key, secret_key)
     try:
         # Note: On weekends, this might return low-volume/weird stocks
-        active_stocks_df = data_client.get_most_active_stocks()
-        if active_stocks_df.is_empty():
+        symbols = provider.get_active_symbols(limit=10)[:3]
+        if not symbols:
             logging.error("No active stocks found. Exiting.")
             return
-        
-        symbols = active_stocks_df["ticker"].head(3).to_list()
-        logging.info(f"🎯 Target Symbols: {symbols}")
+
+        logging.info(f"Target Symbols: {symbols}")
 
     except Exception as e:
         logging.error(f"Failed to fetch symbols: {e}")
@@ -62,8 +58,8 @@ def main():
     bot = TradingBot(
         strategy=strategy,
         capital=100000.0,
-        trading_client=trading_client,
-        live_stock_data=data_stream,
+        trading_client=provider.trading_client,
+        data_provider=provider,
         symbols=symbols,
         notification_manager=notifier
     )
@@ -75,13 +71,13 @@ def main():
     async def setup_phase():
         # A. Warmup (Fetch History)
         # Note: On Sundays/Weekends, this will likely find 0 bars. That is OK.
-        await bot.warmup(data_client)
-        
+        await bot.warmup()
+
         # B. Sync & Subscribe (Prepare Logic)
-        await bot.run() 
-    
+        await bot.run()
+
     try:
-        logging.info("⏳ Running Startup Sequence...")
+        logging.info("Running Startup Sequence...")
         asyncio.run(setup_phase())
     except KeyboardInterrupt:
         return
@@ -91,11 +87,11 @@ def main():
 
     # 5. Blocking Stream Execution (Main Thread)
     # We are now outside the asyncio loop, so Alpaca can manage the websocket safely.
-    logging.info("✅ Startup Complete. Starting Data Stream (Ctrl+C to stop)...")
+    logging.info("Startup Complete. Starting Data Stream (Ctrl+C to stop)...")
     try:
-        data_stream.run()
+        provider.run_stream()
     except KeyboardInterrupt:
-        logging.info("🛑 Bot stopped by user.")
+        logging.info("Bot stopped by user.")
     except Exception as e:
         logging.critical(f"Stream Crashed: {e}")
 
