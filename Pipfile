@@ -5,7 +5,7 @@ name = "pypi"
 
 [packages]
 polars = "*"
-numpy = "*"
+numpy = "<2.0"
 typer = "*"
 matplotlib = "*"
 tqdm = "*"
