@@ -5,7 +5,7 @@ import sys
 from dotenv import load_dotenv
 
 # Ensure src is in the path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'src')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "src")))
 
 from data.alpaca_provider import AlpacaProvider
 from core.trading_bot import TradingBot
@@ -13,7 +13,10 @@ from core.notification_manager import NotificationManager
 from strategies.concrete_strategies.rsi_bbands import RSIBBands
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
 
 def main():
     """
@@ -28,10 +31,14 @@ def main():
         logging.error("Credentials missing. Check .env file.")
         return
 
-    logging.info("--- Initializing Build-A-Bot (Paper Mode) ---")
-
     # 1. Initialize the data provider (single object replaces three Alpaca clients)
-    provider = AlpacaProvider(api_key, secret_key, paper=True)
+    # Allow switching modes via env var (Default to True/Paper for safety)
+    is_paper = os.getenv("PAPER_MODE", "True").lower() == "true"
+    logging.info(
+        f"--- Initializing Build-A-Bot (Mode: {'PAPER' if is_paper else 'LIVE'}) ---"
+    )
+
+    provider = AlpacaProvider(api_key, secret_key, paper=is_paper)
 
     discord_url = os.getenv("discord_webhook_url")
     notifier = NotificationManager(discord_url)
@@ -61,7 +68,7 @@ def main():
         trading_client=provider.trading_client,
         data_provider=provider,
         symbols=symbols,
-        notification_manager=notifier
+        notification_manager=notifier,
     )
 
     # Notify Discord of startup
@@ -94,6 +101,7 @@ def main():
         logging.info("Bot stopped by user.")
     except Exception as e:
         logging.critical(f"Stream Crashed: {e}")
+
 
 if __name__ == "__main__":
     main()
