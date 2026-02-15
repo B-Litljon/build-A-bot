@@ -40,5 +40,9 @@ RUN pip install --no-cache-dir pipenv && \
 COPY src/ ./src/
 COPY main.py .
 
+# --- SANITY CHECK ---
+# Verify critical dependencies are importable before runtime
+RUN python -c "import pytz; import polars; import numpy; import talib; print('Dependencies verified.')"
+
 # --- RUNTIME ---
 CMD ["python", "main.py"]
