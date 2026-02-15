@@ -1,0 +1,15 @@
+services:
+  trading-bot:
+    build: .
+    container_name: build-a-bot
+    restart: unless-stopped
+    # Load environment variables from the .env file on your host
+    env_file:
+      - .env
+    environment:
+      # Override specific vars or add new ones here
+      - PAPER_MODE=True
+      - PYTHONUNBUFFERED=1
+    volumes:
+      # Mount the logs directory so you can read them from Fedora without entering the container
+      - ./logs:/app/logs

@@ -1,19 +1,14 @@
-from typing import Dict, List, TYPE_CHECKING
+from typing import Dict, List
 from core.signal import Signal
 from strategies.strategy import Strategy
 from alpaca.trading.client import TradingClient
-from alpaca.data.live import StockDataStream
-from alpaca.data.models.bars import Bar
-from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+from data.market_provider import MarketDataProvider
 from core.order_management import OrderManager
 from utils.bar_aggregator import LiveBarAggregator as lba
 import asyncio
 import logging
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-
-if TYPE_CHECKING:
-    from data.api_requests import AlpacaClient
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -28,16 +23,16 @@ class TradingBot:
                  strategy: Strategy,
                  capital: float,
                  trading_client: TradingClient,
-                 live_stock_data: StockDataStream,
-                 symbols: List[str],  # Changed from symbol: str
+                 data_provider: MarketDataProvider,
+                 symbols: List[str],
                  target_intervals: List[int] = [5, 15],
                  notification_manager=None):
         self.strategy = strategy
         self.capital = capital
         self.trading_client = trading_client
+        self.data_provider = data_provider
         self.notification_manager = notification_manager
         self.order_manager = OrderManager(trading_client, strategy.get_order_params(), notification_manager=self.notification_manager)
-        self.live_stock_data = live_stock_data
         self.symbols = symbols
         self.target_intervals = target_intervals
         # Use a dictionary to store a bar aggregator for each symbol
@@ -47,7 +42,7 @@ class TradingBot:
         }
         logging.info(f"TradingBot initialized for symbols: {self.symbols}")
 
-    async def warmup(self, data_client: 'AlpacaClient'):
+    async def warmup(self):
         """
         Fetches historical data to pre-fill the bar aggregators.
         This allows the strategy to run immediately without waiting hours for live data.
@@ -63,7 +58,6 @@ class TradingBot:
         )
 
         # Shift back 16 minutes to avoid "subscription does not permit querying recent SIP data" error
-        # eventually change the source of our data to polygon, use alpaca for executing orders, polygon is supposedly cheaper
         end_time = datetime.now(ZoneInfo("America/New_York")) - timedelta(minutes=16)
         start_time = end_time - timedelta(minutes=lookback_minutes)
         start_utc = start_time.astimezone(ZoneInfo("UTC"))
@@ -72,11 +66,11 @@ class TradingBot:
         for symbol in self.symbols:
             try:
                 logging.info(f"Fetching warmup data for {symbol}...")
-                bars_df = data_client.get_historical_ohlcv(
+                bars_df = self.data_provider.get_historical_bars(
                     symbol=symbol,
-                    timeframe=TimeFrame(1, TimeFrameUnit.Minute),
-                    start_date=start_time.isoformat(),
-                    end_date=end_time.isoformat(),
+                    timeframe_minutes=1,
+                    start=start_time,
+                    end=end_time,
                 )
 
                 if bars_df.is_empty():
@@ -111,34 +105,39 @@ class TradingBot:
 
         logging.info("Warmup Complete. Bot is ready to trade.")
 
-    async def handle_bar_update(self, raw_bar: Bar):
+    async def handle_bar_update(self, bar: dict):
         """
-        Async handler for incoming raw bar updates from the data stream.
+        Async handler for incoming bar updates from the data provider.
+
+        Parameters
+        ----------
+        bar : dict
+            Provider-agnostic bar with keys:
+            symbol, timestamp, open, high, low, close, volume
         """
-        symbol = raw_bar.symbol
-        current_price = raw_bar.close
+        symbol = bar["symbol"]
+        current_price = bar["close"]
 
         # --- 1. EXIT LOGIC (Check every tick) ---
-        # Create a mini market_data dict for the monitor
         self.order_manager.monitor_orders({symbol: current_price})
 
         # --- 2. EXISTING AGGREGATION LOGIC ---
         logging.info(
             f"Received raw bar for {symbol}:\n"
-            f"  Open: {raw_bar.open}\n"
-            f"  High: {raw_bar.high}\n"
-            f"  Low: {raw_bar.low}\n"
-            f"  Close: {raw_bar.close}\n"
-            f"  Volume: {raw_bar.volume}"
+            f"  Open: {bar['open']}\n"
+            f"  High: {bar['high']}\n"
+            f"  Low: {bar['low']}\n"
+            f"  Close: {bar['close']}\n"
+            f"  Volume: {bar['volume']}"
         )
         try:
             formatted_bar = {
-                "timestamp": raw_bar.timestamp,
-                "open": raw_bar.open,
-                "high": raw_bar.high,
-                "low": raw_bar.low,
-                "close": raw_bar.close,
-                "volume": raw_bar.volume,
+                "timestamp": bar["timestamp"],
+                "open": bar["open"],
+                "high": bar["high"],
+                "low": bar["low"],
+                "close": bar["close"],
+                "volume": bar["volume"],
             }
 
             # Get the correct bar aggregator for the symbol
@@ -175,7 +174,7 @@ class TradingBot:
         self.order_manager.sync_positions()
 
         logging.info(f"Subscribing to bar updates for symbols: {self.symbols}")
-        self.live_stock_data.subscribe_bars(self.handle_bar_update, *self.symbols)
+        self.data_provider.subscribe(self.symbols, self.handle_bar_update)
         logging.info("Bot initialized and waiting for stream start.")
 
     async def log_status_periodically(self, interval: int = 30):
