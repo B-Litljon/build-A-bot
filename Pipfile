@@ -1,0 +1,26 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+polars = "*"
+numpy = "<2.0"
+typer = "*"
+matplotlib = "*"
+tqdm = "*"
+scikit-learn = "*"
+tensorflow = "*"
+ta-lib = "*"
+python-dotenv = "*"
+pretty-errors = "*"
+alpaca-py = "*"
+requests = "*"
+pytz = "*"
+polygon-api-client = "*"
+yfinance = "*"
+
+[dev-packages]
+
+[requires]
+python_version = "3.12"

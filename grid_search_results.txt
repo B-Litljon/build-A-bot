@@ -1,0 +1,7 @@
+Grid Search: 427014 bars (2024 Full Year)
+Threshold: 0.50 (Training Optimized)
+============================================================
+
+🔄 Testing TIGHT: SL=0.997, TP=1.005
+  100k/427k bars, 0 trades
+  200k/427k bars, 1 trades

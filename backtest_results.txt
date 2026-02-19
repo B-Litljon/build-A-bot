@@ -1,0 +1,15 @@
+Full Backtest: 427014 bars (Jan 1 - Dec 31, 2024)
+Running backtest (this will take ~20 minutes)...
+  Progress: 50000/427014 bars (11%), 0 trades
+  Progress: 100000/427014 bars (23%), 0 trades
+  Progress: 150000/427014 bars (35%), 0 trades
+  Progress: 200000/427014 bars (46%), 0 trades
+  Progress: 250000/427014 bars (58%), 0 trades
+  Progress: 300000/427014 bars (70%), 0 trades
+  Progress: 350000/427014 bars (81%), 0 trades
+  Progress: 400000/427014 bars (93%), 0 trades
+
+✅ Done! 427014 bars processed
+
+❌ No trades executed. The threshold (0.70) may be too high.
+   Try lowering the threshold in backtest_ml_strategy.py

@@ -1,0 +1,13 @@
+Threshold 0.60 Test: 427014 bars
+Running...
+  100000/427014 bars, 0 trades
+  200000/427014 bars, 0 trades
+  300000/427014 bars, 9 trades
+  400000/427014 bars, 9 trades
+
+Done! 9 trades
+  Total Trades: 9
+  Win Rate: 22.2%
+  Profit Factor: 0.71
+  Total PnL: $-0.80
+  ❌ PF = 0.71 (need > 1.5)
