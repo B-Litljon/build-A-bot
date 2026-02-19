@@ -45,6 +45,7 @@ _PROCESSED_DIR = _PROJECT_ROOT / "data" / "processed"
 _MODEL_DIR = _SRC_DIR / "ml" / "models"
 
 # Columns that carry no predictive signal or would cause data leakage
+# CRITICAL: Drop absolute price columns to prevent data leakage in universal model
 _DROP_COLS = [
     "timestamp",
     "open",
@@ -54,6 +55,11 @@ _DROP_COLS = [
     "volume",
     "symbol",
     "target",
+    # Also drop any intermediate absolute indicators
+    "bb_upper",
+    "bb_middle",
+    "bb_lower",
+    "sma_50",
 ]
 
 # Temporal split boundary (train on everything before this date)
@@ -331,7 +337,7 @@ class ModelTrainer:
 
         return report
 
-    def save_model(self, filename: str = "rf_model.joblib") -> Path:
+    def save_model(self, filename: str = "universal_rf_model.joblib") -> Path:
         """
         Persist the trained model to disk via ``joblib``.
 
