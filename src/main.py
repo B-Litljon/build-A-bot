@@ -1,16 +1,8 @@
 #!/usr/bin/env python3
 """
-Build-A-Bot: ML Strategy Paper Trading Executive
-
-Live trading loop for the optimized ML Strategy (Threshold 0.48).
-Uses Alpaca Paper Trading with bracket orders for automatic TP/SL.
-
-Environment Variables:
-    ALPACA_API_KEY: Alpaca API key
-    ALPACA_SECRET_KEY: Alpaca API secret
-
-Usage:
-    python src/main.py
+Build-A-Bot: Universal Scalper Executive
+Transitioned from Static Sniper to Universal Hunter (Multi-Ticker).
+Integrates DiscoveryService and Angel/Devil Meta-Labeling.
 """
 
 import os
@@ -18,12 +10,13 @@ import sys
 import time
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Optional, List, Dict
 
 from dotenv import load_dotenv
 
-# Ensure src is in the path
+# Correct pathing: Ensure the 'src' directory is the root for imports
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+
 import polars as pl
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
@@ -33,9 +26,10 @@ from alpaca.trading.requests import (
 )
 from alpaca.trading.enums import OrderSide, TimeInForce
 
+from core.signal import SignalType
 from strategies.concrete_strategies.ml_strategy import MLStrategy
 from data.alpaca_provider import AlpacaProvider
-from core.signal import SignalType
+from data.discovery import DiscoveryService
 
 # Configure logging
 logging.basicConfig(
@@ -46,60 +40,49 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── CONFIGURATION ───────────────────────────────────────────────────────────
-SYMBOL = "SPY"
+MAX_BASKET_SIZE = 10
 TIMEFRAME_MINUTES = 1
 PAPER_MODE = True
 HISTORY_BARS = 100
 
-# Risk Parameters (from optimization)
+# Risk Parameters
 TP_PERCENT = 0.005  # 0.5%
 SL_PERCENT = 0.002  # 0.2%
 
 
 def load_credentials() -> tuple[str, str]:
-    """Load Alpaca API credentials from environment."""
     load_dotenv()
-
     api_key = os.getenv("ALPACA_API_KEY") or os.getenv("alpaca_key")
     secret_key = os.getenv("ALPACA_SECRET_KEY") or os.getenv("alpaca_secret")
-
     if not api_key or not secret_key:
-        raise ValueError(
-            "Alpaca credentials missing. Set ALPACA_API_KEY and ALPACA_SECRET_KEY "
-            "in your .env file or environment."
-        )
-
+        raise ValueError("Alpaca credentials missing.")
     return api_key, secret_key
 
 
 def wait_for_next_minute() -> None:
-    """Wait until the start of the next minute to prevent drift."""
     now = datetime.now(timezone.utc)
     next_minute = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
     sleep_seconds = (next_minute - now).total_seconds()
-
     if sleep_seconds > 0:
-        logger.debug(f"Syncing... waiting {sleep_seconds:.1f}s for next minute")
         time.sleep(sleep_seconds)
 
 
-def get_historical_data(
-    provider: AlpacaProvider, symbol: str, limit: int = 100
-) -> pl.DataFrame:
-    """Fetch recent historical bars for strategy warmup."""
+def get_multi_historical_data(
+    provider: AlpacaProvider, symbols: List[str], limit: int = 100
+) -> Dict[str, pl.DataFrame]:
+    """Fetch recent historical bars for the entire basket."""
     end = datetime.now(timezone.utc)
-    start = end - timedelta(minutes=limit * 2)  # Buffer for weekends/holidays
+    start = end - timedelta(minutes=limit * 2)
 
-    df = provider.get_historical_bars(symbol, TIMEFRAME_MINUTES, start, end)
-
-    if len(df) < 60:
-        logger.warning(f"Only {len(df)} bars retrieved (need 60 for warmup)")
-
-    return df.tail(limit)
+    data_dict = {}
+    for symbol in symbols:
+        df = provider.get_historical_bars(symbol, TIMEFRAME_MINUTES, start, end)
+        if not df.is_empty():
+            data_dict[symbol] = df.tail(limit)
+    return data_dict
 
 
 def check_position(trading_client: TradingClient, symbol: str) -> bool:
-    """Check if we already hold a position in the symbol."""
     try:
         position = trading_client.get_open_position(symbol)
         return position is not None
@@ -110,11 +93,6 @@ def check_position(trading_client: TradingClient, symbol: str) -> bool:
 def submit_bracket_order(
     trading_client: TradingClient, symbol: str, qty: float, entry_price: float
 ) -> Optional[str]:
-    """
-    Submit a bracket order: Market Buy + TP @ +0.5% + SL @ -0.2%
-
-    Returns order ID if successful, None otherwise.
-    """
     try:
         tp_price = round(entry_price * (1 + TP_PERCENT), 2)
         sl_price = round(entry_price * (1 - SL_PERCENT), 2)
@@ -129,128 +107,84 @@ def submit_bracket_order(
         )
 
         order = trading_client.submit_order(order_request)
-        logger.info(f"🚀 SNIPER ENTRY: Bought {symbol} @ ${entry_price:.2f}")
         logger.info(
-            f"   Bracket: TP ${tp_price:.2f} (+{TP_PERCENT * 100:.1f}%) | SL ${sl_price:.2f} (-{SL_PERCENT * 100:.1f}%)"
+            f"🚀 ENTRY: {symbol} @ ${entry_price:.2f} (TP: ${tp_price} | SL: ${sl_price})"
         )
-
         return order.id
-
     except Exception as e:
-        logger.error(f"Failed to submit bracket order: {e}")
+        logger.error(f"Failed to submit order for {symbol}: {e}")
         return None
 
 
 def run_live_loop(
-    strategy: MLStrategy, provider: AlpacaProvider, trading_client: TradingClient
+    strategy: MLStrategy,
+    provider: AlpacaProvider,
+    trading_client: TradingClient,
+    active_basket: List[str],
 ) -> None:
-    """
-    Main trading loop.
-
-    Runs indefinitely until interrupted.
-    """
     logger.info("=" * 60)
-    logger.info("LIVE TRADING LOOP STARTED")
-    logger.info(f"Symbol: {SYMBOL} | Angel/Devil Mode")
-    logger.info(f"Risk: TP {TP_PERCENT * 100:.1f}% / SL {SL_PERCENT * 100:.1f}%")
-    logger.info(f"Mode: {'PAPER' if PAPER_MODE else 'LIVE'}")
+    logger.info("UNIVERSAL HUNTER LOOP STARTED")
+    logger.info(f"Basket: {active_basket}")
+    logger.info(
+        f"Risk: TP {TP_PERCENT * 100:.1f}% / SL {SL_PERCENT * 100:.1f}% | Mode: PAPER"
+    )
     logger.info("=" * 60)
 
     cycle_count = 0
-
     while True:
         try:
             cycle_count += 1
-
-            # Step 1: Sync to next minute
             wait_for_next_minute()
 
-            # Step 2: Fetch historical data
-            df = get_historical_data(provider, SYMBOL, HISTORY_BARS)
+            # 1. Bulk Fetch
+            data_dict = get_multi_historical_data(provider, active_basket, HISTORY_BARS)
 
-            if len(df) < strategy.warmup_period:
-                logger.warning(f"Insufficient data ({len(df)} bars), skipping cycle...")
-                continue
-
-            # Step 3: Generate signal
-            result = strategy.analyze({SYMBOL: df})
-
-            # Handle tuple return (signals, probability) or list return
-            if isinstance(result, tuple):
-                signals, prob = result
-            else:
-                signals = result
-                prob = 0.0
-
-            # Get current price for logging
-            current_price = float(df["close"].tail(1)[0])
-
-            # Step 4: Execute
-            if signals and signals[0].type == SignalType.BUY:
-                logger.info(
-                    f"📊 SIGNAL DETECTED: {SYMBOL} @ ${current_price:.2f} | Prob: {prob:.2f}"
-                )
-
-                # Check if already in position
-                if check_position(trading_client, SYMBOL):
-                    logger.info("   Position already open, skipping...")
+            # 2. Iterate Basket
+            for symbol in active_basket:
+                df = data_dict.get(symbol)
+                if df is None or len(df) < strategy.warmup_period:
                     continue
 
-                # Calculate position size (2% risk)
-                account = trading_client.get_account()
-                buying_power = float(account.buying_power)
-                position_value = buying_power * 0.02  # Risk 2% of buying power
-                qty = round(position_value / current_price, 3)
+                # 3. Analyze (Angel & Devil)
+                result = strategy.analyze({symbol: df})
+                signals, prob = result if isinstance(result, tuple) else (result, 0.0)
+                current_price = float(df["close"].tail(1)[0])
 
-                if qty < 0.001:
-                    logger.warning(f"   Calculated qty too small ({qty}), skipping...")
-                    continue
+                if signals and signals[0].type == SignalType.BUY:
+                    if check_position(trading_client, symbol):
+                        continue
 
-                # Submit bracket order
-                order_id = submit_bracket_order(
-                    trading_client, SYMBOL, qty, current_price
-                )
+                    account = trading_client.get_account()
+                    qty = round((float(account.buying_power) * 0.02) / current_price, 3)
 
-                if order_id:
-                    logger.info(f"   Order submitted: {order_id}")
+                    if qty >= 0.001:
+                        submit_bracket_order(trading_client, symbol, qty, current_price)
 
-            else:
-                # Low verbosity log for HOLD with probability
-                if cycle_count % 10 == 0:  # Log every 10 cycles
+                elif cycle_count % 10 == 0:
                     logger.info(
-                        f"💤 HOLD | Price: ${current_price:.2f} | Prob: {prob:.2f} (Angel: {strategy.angel_threshold}) | Status: Waiting..."
-                    )
-                else:
-                    logger.debug(
-                        f"   Values: Prob {prob:.2f} < {strategy.angel_threshold} | Action: Waiting..."
+                        f"💤 {symbol} | Price: ${current_price:.2f} | Angel Prob: {prob:.2f}"
                     )
 
         except KeyboardInterrupt:
-            logger.info("=" * 60)
-            logger.info("Bot stopped by user (KeyboardInterrupt)")
-            logger.info("=" * 60)
             break
-
         except Exception as e:
-            logger.error(f"Error in main loop: {e}", exc_info=False)
-            logger.info("Retrying in 5 seconds...")
+            logger.error(f"Loop error: {e}")
             time.sleep(5)
 
 
 def main() -> None:
-    """
-    Entry point: Initialize components and start live trading loop.
-    """
-    logger.info("=" * 60)
-    logger.info("Build-A-Bot ML Strategy - Paper Trading")
-    logger.info("=" * 60)
-
+    logger.info("Build-A-Bot Universal Scalper Initialization")
     try:
-        # Load credentials
         api_key, secret_key = load_credentials()
-        logger.info("✓ Credentials loaded")
 
-        # Initialize strategy (Meta-Labeling dual-model architecture)
+        # Discovery Phase
+        discovery = DiscoveryService(api_key, secret_key, paper=PAPER_MODE)
+        active_basket = discovery.get_in_play_tickers(top_n=MAX_BASKET_SIZE)
+        if not active_basket:
+            logger.warning("No tickers found, defaulting to SPY/QQQ")
+            active_basket = ["BTC/USD"]
+
+        # Strategy Init (Angel/Devil)
         strategy = MLStrategy(
             angel_path="src/ml/models/angel_rf_model.joblib",
             devil_path="src/ml/models/devil_rf_model.joblib",
@@ -258,29 +192,14 @@ def main() -> None:
             devil_threshold=0.50,
             warmup_period=60,
         )
-        logger.info(f"✓ Strategy initialized (Angel/Devil Mode)")
 
-        # Initialize data provider
         provider = AlpacaProvider(api_key, secret_key, paper=PAPER_MODE)
-        logger.info(f"✓ Data provider connected (Alpaca)")
-
-        # Initialize trading client
         trading_client = TradingClient(api_key, secret_key, paper=PAPER_MODE)
-        account = trading_client.get_account()
-        logger.info(f"✓ Trading client ready")
-        logger.info(f"   Account: ${float(account.equity):,.2f} equity")
-        logger.info(f"   Buying Power: ${float(account.buying_power):,.2f}")
 
-        # Start live loop
-        run_live_loop(strategy, provider, trading_client)
-
-    except ValueError as e:
-        logger.error(f"Configuration error: {e}")
-        sys.exit(1)
+        run_live_loop(strategy, provider, trading_client, active_basket)
 
     except Exception as e:
-        logger.critical(f"Fatal error: {e}", exc_info=True)
-        sys.exit(1)
+        logger.critical(f"Fatal: {e}", exc_info=True)
 
 
 if __name__ == "__main__":

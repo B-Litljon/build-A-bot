@@ -19,6 +19,7 @@ requests = "*"
 pytz = "*"
 polygon-api-client = "*"
 yfinance = "*"
+pyarrow = "*"
 
 [dev-packages]
 
