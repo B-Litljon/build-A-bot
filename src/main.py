@@ -23,8 +23,7 @@ from typing import Optional
 from dotenv import load_dotenv
 
 # Ensure src is in the path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "src")))
-
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 import polars as pl
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
@@ -36,6 +35,7 @@ from alpaca.trading.enums import OrderSide, TimeInForce
 
 from strategies.concrete_strategies.ml_strategy import MLStrategy
 from data.alpaca_provider import AlpacaProvider
+from core.signal import SignalType
 
 # Configure logging
 logging.basicConfig(
@@ -151,7 +151,7 @@ def run_live_loop(
     """
     logger.info("=" * 60)
     logger.info("LIVE TRADING LOOP STARTED")
-    logger.info(f"Symbol: {SYMBOL} | Threshold: {strategy.threshold}")
+    logger.info(f"Symbol: {SYMBOL} | Angel/Devil Mode")
     logger.info(f"Risk: TP {TP_PERCENT * 100:.1f}% / SL {SL_PERCENT * 100:.1f}%")
     logger.info(f"Mode: {'PAPER' if PAPER_MODE else 'LIVE'}")
     logger.info("=" * 60)
@@ -186,7 +186,7 @@ def run_live_loop(
             current_price = float(df["close"].tail(1)[0])
 
             # Step 4: Execute
-            if signals and signals[0].type == "BUY":
+            if signals and signals[0].type == SignalType.BUY:
                 logger.info(
                     f"📊 SIGNAL DETECTED: {SYMBOL} @ ${current_price:.2f} | Prob: {prob:.2f}"
                 )
@@ -218,11 +218,11 @@ def run_live_loop(
                 # Low verbosity log for HOLD with probability
                 if cycle_count % 10 == 0:  # Log every 10 cycles
                     logger.info(
-                        f"💤 HOLD | Price: ${current_price:.2f} | Prob: {prob:.2f} (Target: {strategy.threshold}) | Status: Waiting..."
+                        f"💤 HOLD | Price: ${current_price:.2f} | Prob: {prob:.2f} (Angel: {strategy.angel_threshold}) | Status: Waiting..."
                     )
                 else:
                     logger.debug(
-                        f"   Values: Prob {prob:.2f} < {strategy.threshold} | Action: Waiting..."
+                        f"   Values: Prob {prob:.2f} < {strategy.angel_threshold} | Action: Waiting..."
                     )
 
         except KeyboardInterrupt:
@@ -250,11 +250,15 @@ def main() -> None:
         api_key, secret_key = load_credentials()
         logger.info("✓ Credentials loaded")
 
-        # Initialize strategy (with optimized threshold 0.48)
+        # Initialize strategy (Meta-Labeling dual-model architecture)
         strategy = MLStrategy(
-            model_path="src/ml/models/rf_model.joblib", threshold=0.48, warmup_period=60
+            angel_path="src/ml/models/angel_rf_model.joblib",
+            devil_path="src/ml/models/devil_rf_model.joblib",
+            angel_threshold=0.40,
+            devil_threshold=0.50,
+            warmup_period=60,
         )
-        logger.info(f"✓ Strategy initialized (Threshold: {strategy.threshold})")
+        logger.info(f"✓ Strategy initialized (Angel/Devil Mode)")
 
         # Initialize data provider
         provider = AlpacaProvider(api_key, secret_key, paper=PAPER_MODE)
