@@ -1,37 +1,27 @@
 """
-Model training pipeline for the Build-A-Bot ML signal classifier.
+Meta-Labeling Model Training Pipeline (Angel & Devil Architecture).
 
-Loads the feature-engineered dataset from
-``data/processed/training_data.parquet``, trains a Random Forest on a
-temporal train/test split, evaluates it with probability threshold tuning,
-and persists the artifact to ``src/ml/models/rf_model.joblib``.
+Implements a two-stage training system:
+1. The Angel (Primary Model): Learns Direction (high recall)
+2. The Devil (Meta Model): Learns Conviction (high precision)
 
-Usage (from ``src/``)::
-
+Usage:
     python -m ml.train_model
-
-The script expects the feature pipeline to have already been run so
-that ``training_data.parquet`` exists.
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, List
 
 import joblib
 import numpy as np
 import polars as pl
+import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import (
-    classification_report,
-    confusion_matrix,
-    f1_score,
-    precision_score,
-    recall_score,
-)
+from sklearn.model_selection import cross_val_predict
+from sklearn.metrics import classification_report, precision_score
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,14 +29,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-_SRC_DIR = Path(__file__).resolve().parent.parent  # src/
-_PROJECT_ROOT = _SRC_DIR.parent  # build-A-bot/
-_PROCESSED_DIR = _PROJECT_ROOT / "data" / "processed"
-_MODEL_DIR = _SRC_DIR / "ml" / "models"
+_PROCESSED_DIR = Path("data/processed")
+_MODEL_DIR = Path("src/ml/models")
 
-# Columns that carry no predictive signal or would cause data leakage
-# CRITICAL: Drop absolute price columns to prevent data leakage in universal model
-_DROP_COLS = [
+# Meta-Labeling Configuration
+ANGEL_THRESHOLD = 0.40
+DEVIL_THRESHOLD = 0.50
+
+# Columns to exclude from features (prevent data leakage)
+EXCLUDE_COLS = [
     "timestamp",
     "open",
     "high",
@@ -55,323 +46,155 @@ _DROP_COLS = [
     "volume",
     "symbol",
     "target",
-    # Also drop any intermediate absolute indicators
     "bb_upper",
     "bb_middle",
     "bb_lower",
     "sma_50",
 ]
 
-# Temporal split boundary (train on everything before this date)
-_SPLIT_DATE = datetime(2024, 1, 1, tzinfo=timezone.utc)
 
-# Threshold tuning configuration
-_THRESHOLD_MIN: float = 0.50
-_THRESHOLD_MAX: float = 0.90
-_THRESHOLD_STEP: float = 0.05
-_PRECISION_TARGET: float = 0.55
+def main():
+    data_path = _PROCESSED_DIR / "training_data.parquet"
+    if not data_path.exists():
+        raise FileNotFoundError(f"Missing {data_path}")
 
+    logger.info(f"Loading training data from {data_path}...")
+    df = pl.read_parquet(data_path)
+    logger.info(f"Loaded {len(df):,} rows, {df.width} columns")
 
-class ModelTrainer:
-    """
-    End-to-end trainer for the RF signal classifier with probability
-    threshold optimization for improved precision.
+    # Get feature columns
+    feature_cols = [c for c in df.columns if c not in EXCLUDE_COLS]
+    logger.info(f"Using {len(feature_cols)} features: {feature_cols}")
 
-    Parameters
-    ----------
-    data_path : Path | str
-        Path to the feature-engineered Parquet file.
-    model_dir : Path | str
-        Directory where the trained model artifact will be saved.
-    split_date : datetime
-        Rows before this date go to train, on or after go to test.
-    """
+    # Convert to pandas for sklearn
+    X = df[feature_cols].to_pandas()
+    y = df["target"].to_pandas()
 
-    def __init__(
-        self,
-        data_path: Path | str = _PROCESSED_DIR / "training_data.parquet",
-        model_dir: Path | str = _MODEL_DIR,
-        split_date: datetime = _SPLIT_DATE,
-    ):
-        self._data_path = Path(data_path)
-        self._model_dir = Path(model_dir)
-        self._split_date = split_date
+    logger.info(f"Label distribution: 0={(y == 0).sum():,}, 1={(y == 1).sum():,}")
 
-        # Populated by train()
-        self._model: RandomForestClassifier | None = None
-        self._feature_names: list[str] = []
-        self._X_test: np.ndarray | None = None
-        self._y_test: np.ndarray | None = None
-        self._y_proba: np.ndarray | None = None
-        self._best_threshold: float = 0.50
+    # ═══════════════════════════════════════════════════════════════════
+    # STAGE 1: TRAIN THE ANGEL (DIRECTION)
+    # ═══════════════════════════════════════════════════════════════════
+    logger.info("\n" + "=" * 70)
+    logger.info("STAGE 1: TRAINING THE ANGEL (DIRECTION - HIGH RECALL)")
+    logger.info("=" * 70)
 
-    # ── public API ────────────────────────────────────────────────────
+    angel_model = RandomForestClassifier(
+        n_estimators=100,
+        max_depth=10,
+        random_state=42,
+        n_jobs=-1,
+    )
+    angel_model.fit(X, y)
+    logger.info("Angel model training complete.")
 
-    def train(self) -> RandomForestClassifier:
-        """
-        Load data, split temporally, fit a Random Forest, and store
-        the test set for evaluation.
+    # Generate Out-Of-Fold probabilities to train the Devil without leakage
+    logger.info(
+        "Generating CV predictions for Meta-Labeling (n_jobs=1 to prevent OOM)..."
+    )
+    # CRITICAL: n_jobs=1 prevents memory duplication across cores during CV
+    angel_cv_probs = cross_val_predict(
+        angel_model, X, y, cv=3, method="predict_proba", n_jobs=1
+    )[:, 1]
 
-        Returns
-        -------
-        RandomForestClassifier
-            The fitted model.
-        """
-        # ── load ──────────────────────────────────────────────────────
-        logger.info("Loading %s ...", self._data_path)
-        df = pl.read_parquet(self._data_path)
-        logger.info("  %d rows, %d columns", len(df), df.width)
+    # Angel triggers a proposed trade at a low threshold (High Recall)
+    angel_cv_preds = (angel_cv_probs >= ANGEL_THRESHOLD).astype(int)
+    n_trades_proposed = angel_cv_preds.sum()
+    logger.info(
+        f"Angel proposed {n_trades_proposed:,} trades at threshold {ANGEL_THRESHOLD}"
+    )
+    logger.info(f"Angel recall on training: {(angel_cv_preds == y).sum() / len(y):.3f}")
 
-        # ── temporal split ────────────────────────────────────────────
-        train_df = df.filter(pl.col("timestamp") < self._split_date)
-        test_df = df.filter(pl.col("timestamp") >= self._split_date)
-        logger.info(
-            "  Time split @ %s  =>  train %d / test %d",
-            self._split_date.date(),
-            len(train_df),
-            len(test_df),
+    # ═══════════════════════════════════════════════════════════════════
+    # STAGE 2: TRAIN THE DEVIL (CONVICTION)
+    # ═══════════════════════════════════════════════════════════════════
+    logger.info("\n" + "=" * 70)
+    logger.info("STAGE 2: TRAINING THE DEVIL (CONVICTION - HIGH PRECISION)")
+    logger.info("=" * 70)
+
+    # Meta-target: 1 if Angel was right (True Positive), 0 if Angel was wrong (False Positive)
+    meta_y = pd.Series((angel_cv_preds == y).astype(int), index=y.index)
+
+    # We only train the Devil on trades the Angel actually suggested taking
+    trade_indices = np.where(angel_cv_preds == 1)[0]
+    logger.info(f"Training Devil on {len(trade_indices):,} Angel-proposed trades...")
+
+    if len(trade_indices) == 0:
+        raise ValueError(
+            "Angel model generated 0 trades. Lower the ANGEL_THRESHOLD or check features."
         )
 
-        # ── feature / target separation ───────────────────────────────
-        self._feature_names = [c for c in df.columns if c not in _DROP_COLS]
-        logger.info(
-            "  Features (%d): %s", len(self._feature_names), self._feature_names
-        )
+    # Build meta-feature set: original features + Angel's probability
+    X_meta = X.iloc[trade_indices].copy()
+    X_meta["angel_prob"] = angel_cv_probs[trade_indices]
+    y_meta = meta_y.iloc[trade_indices]
 
-        X_train = train_df.select(self._feature_names).to_numpy()
-        y_train = train_df["target"].to_numpy().astype(np.int8)
-        self._X_test = test_df.select(self._feature_names).to_numpy()
-        self._y_test = test_df["target"].to_numpy().astype(np.int8)
+    logger.info(
+        f"Meta-label distribution: 0={(y_meta == 0).sum():,}, 1={(y_meta == 1).sum():,}"
+    )
 
-        logger.info(
-            "  Train label distribution: 0=%d  1=%d  (%.1f%% positive)",
-            (y_train == 0).sum(),
-            (y_train == 1).sum(),
-            100.0 * (y_train == 1).sum() / len(y_train),
-        )
-        logger.info(
-            "  Test  label distribution: 0=%d  1=%d  (%.1f%% positive)",
-            (self._y_test == 0).sum(),
-            (self._y_test == 1).sum(),
-            100.0 * (self._y_test == 1).sum() / len(self._y_test),
-        )
+    devil_model = RandomForestClassifier(
+        n_estimators=100,
+        max_depth=8,
+        random_state=42,
+        class_weight="balanced",
+        n_jobs=-1,
+    )
+    devil_model.fit(X_meta, y_meta)
+    logger.info("Devil model training complete.")
 
-        # ── fit ───────────────────────────────────────────────────────
-        logger.info("Training RandomForestClassifier (no class balancing)...")
-        self._model = RandomForestClassifier(
-            n_estimators=100,
-            max_depth=10,
-            n_jobs=-1,
-            random_state=42,
-        )
-        self._model.fit(X_train, y_train)
-        logger.info("  Training complete.")
+    # ═══════════════════════════════════════════════════════════════════
+    # EVALUATION
+    # ═══════════════════════════════════════════════════════════════════
+    logger.info("\n" + "=" * 70)
+    logger.info("EVALUATION: DEVIL'S FILTER PERFORMANCE")
+    logger.info("=" * 70)
 
-        # ── predict probabilities for threshold tuning ─────────────────
-        proba_matrix = self._model.predict_proba(self._X_test)
-        self._y_proba = proba_matrix[:, 1]
-        logger.info("  Generated probability scores for test set")
+    # In-sample Devil evaluation on the Angel's proposed trades
+    devil_preds = devil_model.predict(X_meta)
+    devil_proba = devil_model.predict_proba(X_meta)[:, 1]
 
-        # ── feature importance (quick diagnostic) ─────────────────────
-        importances = sorted(
-            zip(self._feature_names, self._model.feature_importances_),
-            key=lambda x: x[1],
-            reverse=True,
-        )
-        logger.info("  Feature importance (top → bottom):")
-        for name, imp in importances:
-            logger.info("    %-22s  %.4f", name, imp)
+    print("\nDevil Classification Report (In-Sample on Angel's Trades):")
+    print(classification_report(y_meta, devil_preds, target_names=["Wrong", "Right"]))
 
-        return self._model
+    devil_precision = precision_score(y_meta, devil_preds)
+    logger.info(f"Devil Precision: {devil_precision:.3f}")
 
-    def find_optimal_threshold(self) -> Tuple[float, dict]:
-        """
-        Test probability thresholds from 0.50 to 0.90 and select the
-        optimal one based on precision/recall trade-off.
+    # Calculate combined system metrics
+    final_predictions = np.zeros(len(y), dtype=int)
+    final_predictions[trade_indices] = devil_preds
 
-        Selection Rule:
-        1. Find all thresholds where Precision >= 0.55
-        2. If found, select the lowest such threshold (most recall)
-        3. If none achieve 0.55 precision, select threshold with highest F1
+    # Only count as final BUY if both Angel and Devil agree
+    final_buys = np.where((angel_cv_preds == 1) & (final_predictions == 1))[0]
+    logger.info(f"Final system would emit {len(final_buys):,} BUY signals")
+    logger.info(f"Signal rate: {len(final_buys) / len(y) * 100:.3f}%")
 
-        Returns
-        -------
-        tuple[float, dict]
-            (best_threshold, metrics_at_best_threshold)
-        """
-        if self._y_proba is None or self._y_test is None:
-            raise RuntimeError("Call train() before find_optimal_threshold().")
+    # Calculate what precision we'd get on those final signals
+    if len(final_buys) > 0:
+        final_precision = y.iloc[final_buys].mean()
+        logger.info(f"Estimated Final System Precision: {final_precision:.3f}")
 
-        logger.info(
-            "Testing probability thresholds %.2f to %.2f (step %.2f)...",
-            _THRESHOLD_MIN,
-            _THRESHOLD_MAX,
-            _THRESHOLD_STEP,
-        )
-        logger.info("-" * 70)
-        logger.info(f"{'Threshold':>10} {'Precision':>12} {'Recall':>10} {'F1':>10}")
-        logger.info("-" * 70)
+    # ═══════════════════════════════════════════════════════════════════
+    # EXPORT MODELS
+    # ═══════════════════════════════════════════════════════════════════
+    logger.info("\n" + "=" * 70)
+    logger.info("EXPORTING MODELS")
+    logger.info("=" * 70)
 
-        thresholds = np.arange(
-            _THRESHOLD_MIN, _THRESHOLD_MAX + _THRESHOLD_STEP, _THRESHOLD_STEP
-        )
-        results: list[dict] = []
-        best_f1 = 0.0
-        best_f1_threshold = _THRESHOLD_MIN
+    _MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-        for threshold in thresholds:
-            # Apply threshold to get binary predictions
-            y_pred = (self._y_proba >= threshold).astype(np.int8)
+    angel_path = _MODEL_DIR / "angel_rf_model.joblib"
+    devil_path = _MODEL_DIR / "devil_rf_model.joblib"
 
-            # Calculate metrics
-            precision = precision_score(self._y_test, y_pred)
-            recall = recall_score(self._y_test, y_pred)
-            f1 = f1_score(self._y_test, y_pred)
+    joblib.dump(angel_model, angel_path)
+    joblib.dump(devil_model, devil_path)
 
-            result = {
-                "threshold": round(threshold, 2),
-                "precision": precision,
-                "recall": recall,
-                "f1": f1,
-            }
-            results.append(result)
+    angel_size = angel_path.stat().st_size / (1024 * 1024)
+    devil_size = devil_path.stat().st_size / (1024 * 1024)
 
-            logger.info(
-                f"{threshold:>10.2f} {precision:>12.4f} {recall:>10.4f} {f1:>10.4f}"
-            )
-
-            # Track best F1 for fallback
-            if f1 > best_f1:
-                best_f1 = f1
-                best_f1_threshold = threshold
-
-        logger.info("-" * 70)
-
-        # Selection Logic: find lowest threshold with precision >= 0.55
-        qualifying = [r for r in results if r["precision"] >= _PRECISION_TARGET]
-
-        if qualifying:
-            # Select lowest threshold (most recall) that meets precision target
-            best_result = min(qualifying, key=lambda x: x["threshold"])
-            self._best_threshold = best_result["threshold"]
-            logger.info(
-                "SELECTED: Threshold %.2f (Precision=%.4f, Recall=%.4f, F1=%.4f) - "
-                "Meets precision target",
-                self._best_threshold,
-                best_result["precision"],
-                best_result["recall"],
-                best_result["f1"],
-            )
-        else:
-            # No threshold meets precision target, use highest F1
-            self._best_threshold = best_f1_threshold
-            best_result = next(
-                r for r in results if r["threshold"] == best_f1_threshold
-            )
-            logger.info(
-                "SELECTED: Threshold %.2f (Precision=%.4f, Recall=%.4f, F1=%.4f) - "
-                "Best F1 (no threshold met precision target)",
-                self._best_threshold,
-                best_result["precision"],
-                best_result["recall"],
-                best_result["f1"],
-            )
-
-        return self._best_threshold, best_result
-
-    def evaluate(self, threshold: float | None = None) -> str:
-        """
-        Print precision / recall / F1 on the held-out test set using
-        the optimal or specified probability threshold.
-
-        Parameters
-        ----------
-        threshold : float | None
-            Probability threshold to use. If None, uses the threshold
-            found by find_optimal_threshold().
-
-        Returns
-        -------
-        str
-            The full ``classification_report`` text.
-        """
-        if self._model is None or self._y_proba is None or self._y_test is None:
-            raise RuntimeError("Call train() before evaluate().")
-
-        if threshold is None:
-            threshold = self._best_threshold
-
-        # Generate predictions using threshold
-        y_pred = (self._y_proba >= threshold).astype(np.int8)
-
-        logger.info("\n" + "=" * 70)
-        logger.info("FINAL EVALUATION AT THRESHOLD = %.2f", threshold)
-        logger.info("=" * 70)
-
-        report = classification_report(
-            self._y_test,
-            y_pred,
-            target_names=["no_trade (0)", "trade (1)"],
-            digits=4,
-        )
-        assert isinstance(report, str), (
-            "classification_report should return str when output_dict=False"
-        )
-        logger.info("Classification Report:\n%s", report)
-
-        cm = confusion_matrix(self._y_test, y_pred)
-        logger.info(
-            "Confusion Matrix:\n"
-            "                 Predicted 0    Predicted 1\n"
-            "  Actual 0       %10d    %10d\n"
-            "  Actual 1       %10d    %10d",
-            cm[0][0],
-            cm[0][1],
-            cm[1][0],
-            cm[1][1],
-        )
-
-        # Log signal rate
-        signal_rate = y_pred.sum() / len(y_pred) * 100
-        logger.info("Signal Rate: %.2f%% of bars trigger trade signal", signal_rate)
-
-        return report
-
-    def save_model(self, filename: str = "universal_rf_model.joblib") -> Path:
-        """
-        Persist the trained model to disk via ``joblib``.
-
-        Parameters
-        ----------
-        filename : str
-            Name of the output file inside the model directory.
-
-        Returns
-        -------
-        Path
-            Absolute path to the saved artifact.
-        """
-        if self._model is None:
-            raise RuntimeError("Call train() before save_model().")
-
-        self._model_dir.mkdir(parents=True, exist_ok=True)
-        out_path = self._model_dir / filename
-        joblib.dump(self._model, out_path)
-
-        size_mb = out_path.stat().st_size / (1024 * 1024)
-        logger.info("Model saved to %s (%.1f MB)", out_path, size_mb)
-        return out_path
-
-
-# ─────────────────────────────────────────────────────────────────────
-# CLI entry point
-# ─────────────────────────────────────────────────────────────────────
-def main() -> None:
-    trainer = ModelTrainer()
-    trainer.train()
-    trainer.find_optimal_threshold()
-    trainer.evaluate()
-    trainer.save_model()
+    logger.info(f"Angel model saved to {angel_path} ({angel_size:.1f} MB)")
+    logger.info(f"Devil model saved to {devil_path} ({devil_size:.1f} MB)")
+    logger.info("\nMeta-Labeling training pipeline complete!")
 
 
 if __name__ == "__main__":
