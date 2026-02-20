@@ -1,7 +1,7 @@
 """
 Meta-Labeling Machine Learning Trading Strategy (Angel & Devil Architecture).
 
-Implements a two-stage inference system:
+Implements a two-stage inference system with hot-reloading:
 1. The Angel (Primary Model): Learns Direction (high recall, threshold 0.40)
 2. The Devil (Meta Model): Learns Conviction (high precision, threshold 0.50)
 
@@ -9,8 +9,8 @@ Usage:
     from strategies.concrete_strategies.ml_strategy import MLStrategy
 
     strategy = MLStrategy(
-        angel_path="src/ml/models/angel_rf_model.joblib",
-        devil_path="src/ml/models/devil_rf_model.joblib",
+        angel_path="models/angel_latest.pkl",
+        devil_path="models/devil_latest.pkl",
         angel_threshold=0.40,
         devil_threshold=0.50,
         warmup_period=60
@@ -18,6 +18,7 @@ Usage:
 """
 
 import logging
+import os
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
@@ -28,6 +29,7 @@ import pandas as pd
 
 from core.order_management import OrderParams
 from core.signal import Signal, SignalType
+from core.notification_manager import NotificationManager
 from strategies.strategy import Strategy
 
 # CRITICAL: Import FeatureEngineer to prevent training/inference skew
@@ -84,13 +86,27 @@ class MLStrategy(Strategy):
             project_root = Path(__file__).resolve().parent.parent.parent.parent
             devil_file = project_root / devil_path
 
+        # Store model paths for hot-reloading
+        self.angel_path = angel_file
+        self.devil_path = devil_file
+
+        # Load models and track modification times
         logger.info(f"Loading Angel model from {angel_file}")
         self.angel_model = joblib.load(angel_file)
-        logger.info(f"Angel model loaded: {type(self.angel_model).__name__}")
+        self.angel_mtime = os.path.getmtime(angel_file)
+        logger.info(
+            f"Angel model loaded: {type(self.angel_model).__name__} (mtime: {self.angel_mtime})"
+        )
 
         logger.info(f"Loading Devil model from {devil_file}")
         self.devil_model = joblib.load(devil_file)
-        logger.info(f"Devil model loaded: {type(self.devil_model).__name__}")
+        self.devil_mtime = os.path.getmtime(devil_file)
+        logger.info(
+            f"Devil model loaded: {type(self.devil_model).__name__} (mtime: {self.devil_mtime})"
+        )
+
+        # Initialize notification manager for hot-reload alerts
+        self.notification_manager = NotificationManager()
 
         # Initialize feature engineer (imported, not duplicated!)
         self.feature_engineer = FeatureEngineer()
@@ -121,6 +137,65 @@ class MLStrategy(Strategy):
         """Returns minimum candles required for indicators to warm up."""
         return self.warmup
 
+    def _check_model_updates(self) -> bool:
+        """
+        Check for model file updates and hot-reload if necessary.
+
+        Monitors the modification times of model files and reloads
+        models in memory if they have been updated on disk.
+
+        Returns:
+            bool: True if any model was reloaded, False otherwise.
+        """
+        reloaded = False
+
+        try:
+            # Check Angel model
+            if self.angel_path.exists():
+                current_angel_mtime = os.path.getmtime(self.angel_path)
+                if current_angel_mtime > self.angel_mtime:
+                    logger.info(
+                        f"[HOT-RELOAD] Detected new Angel model: {self.angel_path}"
+                    )
+                    try:
+                        new_angel_model = joblib.load(self.angel_path)
+                        self.angel_model = new_angel_model
+                        self.angel_mtime = current_angel_mtime
+                        logger.info(f"[HOT-RELOAD] Angel model updated successfully")
+                        reloaded = True
+                    except Exception as e:
+                        logger.error(f"[HOT-RELOAD] Failed to reload Angel model: {e}")
+
+            # Check Devil model
+            if self.devil_path.exists():
+                current_devil_mtime = os.path.getmtime(self.devil_path)
+                if current_devil_mtime > self.devil_mtime:
+                    logger.info(
+                        f"[HOT-RELOAD] Detected new Devil model: {self.devil_path}"
+                    )
+                    try:
+                        new_devil_model = joblib.load(self.devil_path)
+                        self.devil_model = new_devil_model
+                        self.devil_mtime = current_devil_mtime
+                        logger.info(f"[HOT-RELOAD] Devil model updated successfully")
+                        reloaded = True
+                    except Exception as e:
+                        logger.error(f"[HOT-RELOAD] Failed to reload Devil model: {e}")
+
+            # Send notification if any model was reloaded
+            if reloaded:
+                alert_message = (
+                    "🔄 [HOT-RELOAD] New model weights ingested from disk. "
+                    f"Angel: {self.angel_path.name}, Devil: {self.devil_path.name}"
+                )
+                logger.critical(alert_message)
+                self.notification_manager.send_system_message(alert_message)
+
+        except Exception as e:
+            logger.error(f"[HOT-RELOAD] Error checking for model updates: {e}")
+
+        return reloaded
+
     def analyze(self, data: Dict[str, pl.DataFrame]) -> Tuple[List[Signal], float]:
         """
         Analyze market data using two-stage Meta-Labeling.
@@ -134,6 +209,9 @@ class MLStrategy(Strategy):
         Returns:
             Tuple of (List of BUY signals where both Angel & Devil agree, highest Angel probability).
         """
+        # Check for model updates at the start of each bar processing cycle
+        self._check_model_updates()
+
         signals = []
         highest_angel_prob = 0.0
 
