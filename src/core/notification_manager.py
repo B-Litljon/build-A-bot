@@ -65,3 +65,48 @@ class NotificationManager:
             requests.post(self.webhook_url, json=payload, timeout=5)
         except Exception as e:
             logger.error(f"Failed to send Discord system message: {e}")
+
+    def send_drift_alert(self, metrics: dict):
+        """Sends a critical drift alert to Discord for The Accountant."""
+        if not self.webhook_url:
+            return
+
+        # Determine alert severity
+        brier = metrics.get("brier_score", 0)
+        ev = metrics.get("expected_value", 0)
+
+        if brier > 0.30 or ev < -0.001:
+            severity = "🔴 CRITICAL"
+            color = 0xFF0000
+        else:
+            severity = "⚠️ WARNING"
+            color = 0xFFA500
+
+        # Build description
+        description = (
+            f"**Model Performance Degradation Detected**\n\n"
+            f"📊 **Win Rate:** {metrics.get('win_rate', 0):.2%}\n"
+            f"💰 **Expected Value:** {metrics.get('expected_value', 0):.4f} ({metrics.get('expected_value', 0) * 100:.2f}%)\n"
+            f"🎯 **Brier Score:** {metrics.get('brier_score', 0):.4f}\n"
+            f"📉 **Log Loss:** {metrics.get('log_loss', 0):.4f}\n\n"
+            f"⚡ **Recommendation:** Review model retraining pipeline"
+        )
+
+        payload = {
+            "username": "The Accountant",
+            "embeds": [
+                {
+                    "title": f"{severity}: DEVIL MODEL DRIFT",
+                    "description": description,
+                    "color": color,
+                    "footer": {"text": f"Alert Time: {datetime.now().isoformat()}"},
+                }
+            ],
+        }
+
+        try:
+            response = requests.post(self.webhook_url, json=payload, timeout=5)
+            response.raise_for_status()
+            logger.info(f"Drift alert sent to Discord")
+        except Exception as e:
+            logger.error(f"Failed to send drift alert: {e}")
