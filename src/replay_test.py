@@ -394,6 +394,21 @@ class ReplayHarness:
         # Convert list of dicts to Polars DataFrame (single batch operation)
         ledger_df = pl.DataFrame(self.signal_ledger)
 
+        # Sanitize nested data types for CSV serialization
+        # Identify columns with nested types (List, Struct, Array, Object)
+        nested_columns = [
+            col
+            for col, dtype in ledger_df.schema.items()
+            if dtype.is_nested() or dtype == pl.Object
+        ]
+
+        # Cast nested columns to string representation
+        if nested_columns:
+            logger.debug(f"Converting nested columns to string: {nested_columns}")
+            ledger_df = ledger_df.with_columns(
+                [pl.col(col).cast(pl.String) for col in nested_columns]
+            )
+
         # Ensure output directory exists
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
