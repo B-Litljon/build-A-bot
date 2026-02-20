@@ -1,37 +1,33 @@
 """
-Machine Learning-based trading strategy using the trained Random Forest model.
+Meta-Labeling Machine Learning Trading Strategy (Angel & Devil Architecture).
 
-This strategy imports FeatureEngineer from ml.feature_pipeline to ensure
-identical feature computation between training and inference, preventing
-training/inference skew.
-
-Optimization (Feb 2026):
-    - Threshold: 0.48 (previously 0.50)
-    - Profit Factor: 1.68
-    - Win Rate: 40.3%
-    - Trades: 713/year
-    - Risk Profile: TP 0.5% / SL 0.2%
+Implements a two-stage inference system:
+1. The Angel (Primary Model): Learns Direction (high recall, threshold 0.40)
+2. The Devil (Meta Model): Learns Conviction (high precision, threshold 0.50)
 
 Usage:
     from strategies.concrete_strategies.ml_strategy import MLStrategy
 
     strategy = MLStrategy(
-        model_path="src/ml/models/rf_model.joblib",
-        threshold=0.48,  # Optimized threshold from grid search
-        warmup_period=60  # Must accommodate all indicator windows
+        angel_path="src/ml/models/angel_rf_model.joblib",
+        devil_path="src/ml/models/devil_rf_model.joblib",
+        angel_threshold=0.40,
+        devil_threshold=0.50,
+        warmup_period=60
     )
 """
 
 import logging
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple, Optional
 
 import joblib
 import numpy as np
 import polars as pl
+import pandas as pd
 
 from core.order_management import OrderParams
-from core.signal import Signal
+from core.signal import Signal, SignalType
 from strategies.strategy import Strategy
 
 # CRITICAL: Import FeatureEngineer to prevent training/inference skew
@@ -42,78 +38,81 @@ logger = logging.getLogger(__name__)
 
 class MLStrategy(Strategy):
     """
-    ML-powered strategy using trained Random Forest with probability threshold.
+    Meta-Labeling ML strategy using two-stage Angel/Devil architecture.
 
-    Prevents training/inference skew by importing FeatureEngineer from the
-    training pipeline rather than duplicating feature logic.
-
-    Optimization Results (Feb 2026):
-        Threshold 0.48 selected from grid search:
-        - Profit Factor: 1.68
-        - Win Rate: 40.3%
-        - Total Trades: 713/year
-        - Risk: TP 0.5% / SL 0.2%
+    The Angel (primary model) proposes trades with high recall.
+    The Devil (meta model) filters false positives with high precision.
 
     Parameters
     ----------
-    model_path : str | Path
-        Path to the trained model joblib file.
-    threshold : float
-        Probability threshold for trade signals (default: 0.48).
-        Optimization shows 0.48 delivers PF=1.68 vs 1.46 at 0.50.
+    angel_path : str | Path
+        Path to the Angel (primary) model joblib file.
+    devil_path : str | Path
+        Path to the Devil (meta) model joblib file.
+    angel_threshold : float
+        Probability threshold for Angel to propose a trade (default: 0.40).
+    devil_threshold : float
+        Probability threshold for Devil to approve a trade (default: 0.50).
     warmup_period : int
         Minimum candles required before trading (default: 60).
     """
 
     def __init__(
         self,
-        model_path: str | Path = "src/ml/models/rf_model.joblib",
-        threshold: float = 0.48,
+        angel_path: str | Path = "src/ml/models/angel_rf_model.joblib",
+        devil_path: str | Path = "src/ml/models/devil_rf_model.joblib",
+        angel_threshold: float = 0.40,
+        devil_threshold: float = 0.50,
         warmup_period: int = 60,
     ):
         super().__init__()
 
         self.timeframe = 1  # 1-minute bars
         self.warmup = warmup_period
-        self.threshold = threshold
+        self.angel_threshold = angel_threshold
+        self.devil_threshold = devil_threshold
 
-        # Load trained model
-        model_file = Path(model_path)
-        if not model_file.exists():
-            # Try relative to project root
+        # Load both models
+        angel_file = Path(angel_path)
+        devil_file = Path(devil_path)
+
+        if not angel_file.exists():
             project_root = Path(__file__).resolve().parent.parent.parent.parent
-            model_file = project_root / model_path
+            angel_file = project_root / angel_path
 
-        logger.info(f"Loading ML model from {model_file}")
-        self.model = joblib.load(model_file)
-        logger.info(f"Model loaded: {type(self.model).__name__}")
+        if not devil_file.exists():
+            project_root = Path(__file__).resolve().parent.parent.parent.parent
+            devil_file = project_root / devil_path
+
+        logger.info(f"Loading Angel model from {angel_file}")
+        self.angel_model = joblib.load(angel_file)
+        logger.info(f"Angel model loaded: {type(self.angel_model).__name__}")
+
+        logger.info(f"Loading Devil model from {devil_file}")
+        self.devil_model = joblib.load(devil_file)
+        logger.info(f"Devil model loaded: {type(self.devil_model).__name__}")
 
         # Initialize feature engineer (imported, not duplicated!)
         self.feature_engineer = FeatureEngineer()
 
-        # Store expected feature order from model training
-        # These are the features the model was trained on (from _DROP_COLS inverse)
+        # Feature columns (excluding absolute price columns to prevent leakage)
         self.feature_names = [
             "rsi_14",
-            "macd",
-            "macd_signal",
-            "macd_hist",
-            "bb_upper",
-            "bb_lower",
-            "sma_50",
-            "atr_14",
+            "ppo",
+            "natr_14",
             "bb_pct_b",
+            "bb_width_pct",
             "price_sma50_ratio",
             "log_return",
             "hour_of_day",
-            "vol_rel",
             "dist_sma50",
+            "vol_rel",
         ]
 
         self.order_params = OrderParams(
             risk_percentage=0.02,
-            tp_multiplier=1.005,  # 0.5% take profit (based on 0.3% min gain + buffer)
-            sl_multiplier=0.998,  # 0.2% stop loss (based on label criteria)
+            tp_multiplier=1.005,  # 0.5% take profit
+            sl_multiplier=0.998,  # 0.2% stop loss
             use_trailing_stop=False,
         )
 
@@ -122,18 +121,21 @@ class MLStrategy(Strategy):
         """Returns minimum candles required for indicators to warm up."""
         return self.warmup
 
-    def analyze(self, data: Dict[str, pl.DataFrame]) -> tuple[List[Signal], float]:
+    def analyze(self, data: Dict[str, pl.DataFrame]) -> Tuple[List[Signal], float]:
         """
-        Analyze market data and generate ML-based trading signals.
+        Analyze market data using two-stage Meta-Labeling.
+
+        Stage 1: Angel proposes trades (high recall, low threshold).
+        Stage 2: Devil filters false positives (high precision).
 
         Args:
             data: Dict mapping symbol -> Polars DataFrame with OHLCV data.
 
         Returns:
-            Tuple of (List of BUY signals where model probability >= threshold, probability).
+            Tuple of (List of BUY signals where both Angel & Devil agree, highest Angel probability).
         """
         signals = []
-        last_proba = 0.0
+        highest_angel_prob = 0.0
 
         for symbol, df in data.items():
             if len(df) < self.warmup_period:
@@ -144,43 +146,81 @@ class MLStrategy(Strategy):
 
             try:
                 # Generate features using imported FeatureEngineer
-                # This ensures identical feature computation as training!
                 features_df = self._generate_features(df)
 
                 if features_df is None or len(features_df) == 0:
                     continue
 
                 # Get latest bar's features for prediction
-                latest_features = features_df[self.feature_names].tail(1).to_numpy()
-
-                # Predict probability of Class 1 (trade signal)
-                proba = self.model.predict_proba(latest_features)[0, 1]
-                last_proba = proba
+                latest_features_df = features_df[self.feature_names].tail(1)
+                latest_features = latest_features_df.to_numpy()
 
                 # Get current price for signal
                 current_price = float(df["close"].tail(1)[0])
 
-                # Generate signal if probability exceeds threshold
-                if proba >= self.threshold:
-                    logger.info(
-                        f"{symbol}: ML Signal Generated | "
-                        f"Price={current_price:.2f} | "
-                        f"Probability={proba:.4f} | "
-                        f"Threshold={self.threshold}"
-                    )
-                    signals.append(Signal("BUY", symbol, current_price))
-                else:
+                # ═══════════════════════════════════════════════════════════
+                # STAGE 1: THE ANGEL (DIRECTION)
+                # ═══════════════════════════════════════════════════════════
+                angel_prob = self.angel_model.predict_proba(latest_features)[0, 1]
+                highest_angel_prob = max(highest_angel_prob, angel_prob)
+
+                if angel_prob < self.angel_threshold:
                     logger.debug(
-                        f"{symbol}: No signal | Probability={proba:.4f} < {self.threshold}"
+                        f"[{symbol}] Angel rejected | Prob: {angel_prob:.4f} < {self.angel_threshold}"
                     )
+                    continue
+
+                logger.debug(
+                    f"[{symbol}] Angel proposed trade | Prob: {angel_prob:.4f}"
+                )
+
+                # ═══════════════════════════════════════════════════════════
+                # STAGE 2: THE DEVIL (CONVICTION)
+                # ═══════════════════════════════════════════════════════════
+                # Build meta-feature set: original features + Angel's probability
+                import pandas as pd
+
+                meta_features = pd.DataFrame(
+                    latest_features_df.to_numpy(), columns=self.feature_names
+                )
+                meta_features["angel_prob"] = angel_prob
+
+                devil_prob = self.devil_model.predict_proba(meta_features)[0, 1]
+
+                if devil_prob < self.devil_threshold:
+                    logger.debug(
+                        f"[{symbol}] Devil veto | Angel: {angel_prob:.2f}, Devil: {devil_prob:.2f} < {self.devil_threshold}"
+                    )
+                    continue
+
+                # Both Angel and Devil agree - emit BUY signal
+                logger.info(
+                    f"[{symbol}] ANGEL & DEVIL AGREEMENT | "
+                    f"Price={current_price:.2f} | "
+                    f"Angel Prob: {angel_prob:.2f} | "
+                    f"Devil Prob: {devil_prob:.2f}"
+                )
+
+                signal = Signal(
+                    symbol=symbol,
+                    type=SignalType.BUY,
+                    price=current_price,
+                    confidence=devil_prob,
+                    timestamp=df["timestamp"].tail(1)[0],
+                    metadata={
+                        "angel_prob": float(angel_prob),
+                        "devil_prob": float(devil_prob),
+                    },
+                )
+                signals.append(signal)
 
             except Exception as e:
-                logger.error(f"{symbol}: Error in ML analysis: {e}", exc_info=True)
+                logger.error(f"[{symbol}] Error in ML analysis: {e}", exc_info=True)
                 continue
 
-        return signals, last_proba
+        return signals, highest_angel_prob
 
-    def _generate_features(self, df: pl.DataFrame) -> pl.DataFrame | None:
+    def _generate_features(self, df: pl.DataFrame) -> Optional[pl.DataFrame]:
         """
         Generate ML features using imported FeatureEngineer.
 
@@ -195,11 +235,9 @@ class MLStrategy(Strategy):
         """
         try:
             # Use imported FeatureEngineer.compute_indicators()
-            # This is the SAME method used during training!
             features_df = self.feature_engineer.compute_indicators(df)
 
             # Handle NaN values that may exist in warmup period
-            # Drop rows with any NaN in feature columns
             feature_cols = [c for c in features_df.columns if c in self.feature_names]
             features_df = features_df.drop_nulls(subset=feature_cols)
 

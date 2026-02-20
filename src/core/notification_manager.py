@@ -1,82 +1,67 @@
+import os
 import logging
 import requests
-import json
 from datetime import datetime
 from typing import Optional
+from core.signal import Signal, SignalType
+
+logger = logging.getLogger(__name__)
 
 
 class NotificationManager:
-    def __init__(self, webhook_url: Optional[str]):
-        self.webhook_url = webhook_url
+    def __init__(self, webhook_url: Optional[str] = None):
+        self.webhook_url = webhook_url or os.getenv("DISCORD_WEBHOOK_URL")
         if not self.webhook_url:
-            logging.warning("⚠️ No Discord Webhook URL provided. Notifications disabled.")
+            logger.warning("DISCORD_WEBHOOK_URL not set. Notifications disabled.")
 
-    def send_message(self, title: str, description: str, color: str = "blue"):
-        """
-        Sends a rich embed message to Discord.
-        Colors: 'green' (Buy), 'red' (Sell), 'blue' (Info), 'yellow' (Warning), 'grey' (Crash)
-        """
+    def send_trade_alert(self, signal: Signal, action: str = "ENTRY"):
+        """Sends a formatted Meta-Labeling trade alert to Discord."""
         if not self.webhook_url:
             return
 
-        # Map colors to decimal integers for Discord Embeds
-        color_map = {
-            "green": 5763719,   # Success
-            "red": 15548997,    # Error/Sell
-            "blue": 3447003,    # Info
-            "yellow": 16776960, # Warning
-            "grey": 9807270     # Neutral
-        }
+        if action == "ENTRY":
+            title = f"🎯 UNIVERSAL SCALPER: {signal.type.value} {signal.symbol}"
+            color = 0x00FF00 if signal.type == SignalType.BUY else 0xFF0000
+        else:
+            title = f"🏁 TRADE CLOSED: {signal.symbol}"
+            color = 0x00A2FF
 
-        decimal_color = color_map.get(color, 3447003)
+        description = f"💵 **Price:** ${signal.price:.2f}\n"
+
+        # Check for Meta-Labeling data
+        if "angel_prob" in signal.metadata and "devil_prob" in signal.metadata:
+            angel_pct = signal.metadata["angel_prob"] * 100
+            devil_pct = signal.metadata["devil_prob"] * 100
+            description += f"👼 **Angel (Direction):** {angel_pct:.1f}%\n"
+            description += f"😈 **Devil (Conviction):** {devil_pct:.1f}%\n"
+        else:
+            description += f"📊 **Confidence:** {signal.confidence * 100:.1f}%\n"
 
         payload = {
+            "username": "Build-A-Bot Executive",
             "embeds": [
                 {
                     "title": title,
                     "description": description,
-                    "color": decimal_color,
-                    "footer": {
-                        "text": f"Build-A-Bot • {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                    }
+                    "color": color,
+                    "footer": {"text": f"Timestamp: {signal.timestamp}"},
                 }
-            ]
+            ],
         }
 
         try:
-            response = requests.post(
-                self.webhook_url,
-                data=json.dumps(payload),
-                headers={"Content-Type": "application/json"}
-            )
-            if response.status_code != 204:
-                logging.error(f"Failed to send Discord notification: {response.status_code}")
+            response = requests.post(self.webhook_url, json=payload, timeout=5)
+            response.raise_for_status()
         except Exception as e:
-            logging.error(f"Notification Error: {e}")
+            logger.error(f"Failed to send Discord notification: {e}")
 
-    def notify_startup(self, symbols: list):
-        self.send_message(
-            "🚀 Bot Started",
-            f"Trading Engine is Live.\n**Mode:** Paper Trading\n**Targets:** {', '.join(symbols)}",
-            "blue"
-        )
+    def send_system_message(self, message: str):
+        """Sends generic system status updates."""
+        if not self.webhook_url:
+            return
 
-    def notify_trade(self, action: str, symbol: str, price: float, quantity: float, reason: str):
-        color = "green" if action == "BUY" else "red"
-        emoji = "🟢" if action == "BUY" else "🔴"
-
-        desc = (
-            f"**Symbol:** {symbol}\n"
-            f"**Price:** ${price:.2f}\n"
-            f"**Qty:** {quantity:.4f}\n"
-            f"**Total:** ${price * quantity:.2f}\n"
-            f"**Reason:** {reason}"
-        )
-        self.send_message(f"{emoji} {action} EXECUTED", desc, color)
-
-    def notify_error(self, context: str, error: str):
-        self.send_message(
-            "💀 Critical Error",
-            f"**Context:** {context}\n**Error:** {str(error)}",
-            "grey"
-        )
+        payload = {"content": f"🤖 **System Update:** {message}"}
+        try:
+            requests.post(self.webhook_url, json=payload, timeout=5)
+        except Exception as e:
+            logger.error(f"Failed to send Discord system message: {e}")
