@@ -143,6 +143,11 @@ def run_live_loop(
             for symbol in active_basket:
                 df = data_dict.get(symbol)
                 if df is None or len(df) < strategy.warmup_period:
+                    if cycle_count % 10 == 0:
+                        bar_count = len(df) if df is not None else 0
+                        logger.warning(
+                            f"[{symbol}] Insufficient data: {bar_count}/{strategy.warmup_period} bars. Skipping."
+                        )
                     continue
 
                 # 3. Analyze (Angel & Devil)
@@ -195,6 +200,12 @@ def main() -> None:
 
         provider = AlpacaProvider(api_key, secret_key, paper=PAPER_MODE)
         trading_client = TradingClient(api_key, secret_key, paper=PAPER_MODE)
+
+        # TEMPORARY OVERRIDE: Force Crypto to verify live execution after-hours
+        logger.info(
+            "Override active: Switching basket to Crypto for 24/7 data verification."
+        )
+        active_basket = ["BTC/USD", "ETH/USD"]
 
         run_live_loop(strategy, provider, trading_client, active_basket)
 
