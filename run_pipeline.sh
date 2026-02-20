@@ -152,6 +152,7 @@ run_resolver() {
 }
 
 # Phase 4: Drift Evaluation
+# Exit codes: 0 = Healthy, 1 = Error, 2 = Critical Drift (triggers retraining)
 run_feedback() {
     print_section "PHASE 4: Drift Evaluation"
     echo "Evaluating model performance metrics..."
@@ -159,20 +160,40 @@ run_feedback() {
     echo "Thresholds: Brier <= 0.25, EV >= 0.0005 (0.05%)"
     echo ""
     
+    # Temporarily disable exit-on-error to capture feedback_loop exit code
+    set +e
     python -m src.core.feedback_loop
+    FEEDBACK_STATUS=$?
+    set -e
     
-    # Note: feedback_loop returns non-zero exit code if drift detected
-    # set -e handles this, but we want to distinguish between errors and drift alerts
+    return $FEEDBACK_STATUS
 }
 
-# Handle pipeline completion
+# Phase 5: Model Retraining (The Cure)
+run_retrainer() {
+    print_section "PHASE 5: THE CURE - Model Retraining"
+    echo "Critical drift detected. Initiating automated retraining..."
+    echo "Fetching 60 days of fresh training data..."
+    echo "Applying time-decay weighting to prevent catastrophic forgetting..."
+    echo ""
+    
+    python -m src.core.retrainer
+    
+    print_success "Model retraining complete"
+    echo "Updated models:"
+    echo "  - models/angel_latest.pkl"
+    echo "  - models/devil_latest.pkl"
+}
+
+# Handle pipeline completion based on feedback status
 handle_completion() {
-    local exit_code=$?
+    local feedback_status=$1
     
     echo ""
     echo -e "${CYAN}$(printf '=%.0s' {1..70})${NC}"
     
-    if [[ $exit_code -eq 0 ]]; then
+    if [[ $feedback_status -eq 0 ]]; then
+        # Healthy - normal completion
         print_success "OOS PIPELINE COMPLETED SUCCESSFULLY"
         echo ""
         echo "Generated files:"
@@ -181,14 +202,22 @@ handle_completion() {
         echo "  - data/resolved_ledger.csv (resolved outcomes)"
         echo ""
         print_success "Model health: WITHIN PARAMETERS"
-    elif [[ $exit_code -eq 1 ]]; then
-        # This could be an error or drift detection
-        # The feedback_loop should have printed appropriate messages
-        print_warning "Pipeline completed with warnings or drift detected"
-        print_warning "Check logs above for details"
+        
+    elif [[ $feedback_status -eq 2 ]]; then
+        # Critical drift detected - retraining was triggered
+        print_warning "⚠️  CRITICAL DRIFT DETECTED - RETRAINING EXECUTED"
+        echo ""
+        echo "The system has been automatically cured:"
+        echo "  - Fresh models trained on 60 days of data"
+        echo "  - Time-decay weighting applied"
+        echo "  - Models ready for next market open"
+        echo ""
+        print_success "AUTONOMOUS RECOVERY COMPLETE"
+        
     else
-        print_error "Pipeline failed with exit code $exit_code"
-        exit $exit_code
+        # Error in execution
+        print_error "Pipeline failed with exit code $feedback_status"
+        exit 1
     fi
     
     echo -e "${CYAN}$(printf '=%.0s' {1..70})${NC}"
@@ -200,6 +229,7 @@ trap 'print_error "Pipeline interrupted by user"; exit 130' INT TERM
 # Main execution
 main() {
     local start_time=$(date +%s)
+    local feedback_status=0
     
     print_header
     
@@ -207,11 +237,28 @@ main() {
     check_environment
     check_python
     
-    # Run pipeline phases
+    # Run pipeline phases 1-3 (these must succeed)
     run_harvester
     run_replay
     run_resolver
+    
+    # Phase 4: Drift evaluation (handles its own exit codes)
     run_feedback
+    feedback_status=$?
+    
+    # Route based on feedback status
+    if [[ $feedback_status -eq 2 ]]; then
+        # Critical drift detected - trigger retraining
+        echo ""
+        echo -e "${RED}╔══════════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${RED}║              🚨 CRITICAL DRIFT ALERT 🚨                          ║${NC}"
+        echo -e "${RED}╚══════════════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+        echo "[+] INITIATING THE CURE..."
+        echo ""
+        
+        run_retrainer
+    fi
     
     # Calculate execution time
     local end_time=$(date +%s)
@@ -222,7 +269,8 @@ main() {
     echo ""
     print_success "Total execution time: ${minutes}m ${seconds}s"
     
-    handle_completion
+    # Handle completion based on feedback status
+    handle_completion $feedback_status
 }
 
 # Run main function

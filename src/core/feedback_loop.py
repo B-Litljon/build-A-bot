@@ -327,7 +327,10 @@ class DriftEvaluator:
         Execute the full drift evaluation pipeline.
 
         Returns:
-            Exit code (0 = success, 1 = drift detected)
+            Exit code:
+                0 = Healthy (model within parameters)
+                1 = Error (execution failure)
+                2 = Critical drift detected (triggers retraining)
         """
         try:
             # Calculate metrics
@@ -344,16 +347,16 @@ class DriftEvaluator:
                 logger.info("=" * 70)
                 logger.info("STATUS: 🔴 CRITICAL - Model drift detected")
                 logger.info("=" * 70)
-                return 1
+                return 2  # Critical drift - triggers retraining
             else:
                 logger.info("=" * 70)
                 logger.info("STATUS: ✅ HEALTHY - Model within parameters")
                 logger.info("=" * 70)
-                return 0
+                return 0  # Healthy - pipeline complete
 
         except Exception as e:
             logger.error(f"Evaluation failed: {e}", exc_info=True)
-            return 1
+            return 1  # Error in execution
 
 
 def main():
