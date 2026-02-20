@@ -25,6 +25,7 @@ from typing import List, Optional, Tuple
 import joblib
 import numpy as np
 import polars as pl
+import talib
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
@@ -150,16 +151,21 @@ def fetch_training_data(
 
 def engineer_features_and_labels(df: pl.DataFrame) -> Tuple[pl.DataFrame, List[str]]:
     """
-    Placeholder for feature engineering and label generation.
+    Engineer technical features and generate target labels using TA-Lib + Polars.
 
-    In production, this would:
-    - Compute technical indicators (RSI, PPO, Bollinger Bands, etc.)
-    - Generate Angel Target (momentum direction)
-    - Generate Devil Target (+0.5% TP hit)
-    - Clean and validate data
+    Features:
+        - rsi_14: 14-period RSI
+        - macd: MACD line
+        - macd_signal: MACD signal line
+        - bb_upper: Bollinger Bands upper band
+        - bb_lower: Bollinger Bands lower band
+
+    Targets:
+        - angel_target: 1 if close 3 bars ahead > current close + 0.1%
+        - devil_target: 1 if +0.5% TP hit before -0.2% SL in next 15 bars
 
     Args:
-        df: Raw OHLCV DataFrame
+        df: Raw OHLCV DataFrame with columns: open, high, low, close, volume, symbol, timestamp
 
     Returns:
         Tuple of (features DataFrame, feature column names)
@@ -167,48 +173,110 @@ def engineer_features_and_labels(df: pl.DataFrame) -> Tuple[pl.DataFrame, List[s
     logger.info("=" * 70)
     logger.info("ENGINEERING FEATURES & LABELS")
     logger.info("=" * 70)
-    logger.info("Using placeholder feature engineering...")
-    logger.info("NOTE: Replace this with actual feature pipeline in production")
 
-    # Placeholder: Simple returns and volume features
+    # Convert Polars columns to numpy for talib (native compatibility)
+    close = df["close"].to_numpy()
+    high = df["high"].to_numpy()
+    low = df["low"].to_numpy()
+
+    # ═══════════════════════════════════════════════════════════════════
+    # TECHNICAL INDICATORS (TA-Lib)
+    # ═══════════════════════════════════════════════════════════════════
+
+    # RSI (14-period)
+    rsi = talib.RSI(close, timeperiod=14)
+
+    # MACD (12, 26, 9)
+    macd, macd_signal, macd_hist = talib.MACD(
+        close, fastperiod=12, slowperiod=26, signalperiod=9
+    )
+
+    # Bollinger Bands (20-period, 2 std dev)
+    bb_upper, bb_middle, bb_lower = talib.BBANDS(
+        close, timeperiod=20, nbdevup=2, nbdevdn=2, matype=talib.MA_Type.SMA
+    )
+
+    # Add features to DataFrame
     df = df.with_columns(
         [
-            (pl.col("close") / pl.col("close").shift(1) - 1).alias("returns"),
-            pl.col("volume").log().alias("log_volume"),
-            (pl.col("high") - pl.col("low")).alias("range"),
-            (pl.col("close") - pl.col("open")).alias("body"),
+            pl.Series("rsi_14", rsi),
+            pl.Series("macd", macd),
+            pl.Series("macd_signal", macd_signal),
+            pl.Series("bb_upper", bb_upper),
+            pl.Series("bb_lower", bb_lower),
         ]
     )
 
-    # Fill NaN values
-    df = df.fill_null(strategy="forward").fill_null(0)
+    logger.info("Applied TA-Lib indicators: RSI, MACD, BBANDS")
 
-    # Placeholder labels
-    # Angel target: Price goes up next bar (momentum)
+    # ═══════════════════════════════════════════════════════════════════
+    # TARGET GENERATION (Lookahead Logic)
+    # ═══════════════════════════════════════════════════════════════════
+
+    # Angel Target: Momentum shift (close 3 bars ahead > current + 0.1%)
     df = df.with_columns(
         [
-            (pl.col("close").shift(-1) > pl.col("close"))
+            (pl.col("close").shift(-3) > pl.col("close") * 1.001)
             .cast(pl.Int8)
-            .alias("angel_target"),
-            # Devil target: Achieves +0.5% within next 15 bars
+            .alias("angel_target")
+        ]
+    )
+
+    # Devil Target: Bracket resolution (TP +0.5% hit before SL -0.2%)
+    # Lookahead window: 15 bars
+    lookahead = 15
+
+    df = df.with_columns(
+        [
+            # Calculate forward rolling max (highest high in next N bars)
+            pl.col("high")
+            .rolling_max(window_size=lookahead, min_periods=1)
+            .shift(-lookahead)
+            .alias("forward_high_max"),
+            # Calculate forward rolling min (lowest low in next N bars)
+            pl.col("low")
+            .rolling_min(window_size=lookahead, min_periods=1)
+            .shift(-lookahead)
+            .alias("forward_low_min"),
+        ]
+    )
+
+    # Devil target: TP hit (+0.5%) AND SL not hit (-0.2%)
+    df = df.with_columns(
+        [
             (
-                pl.col("high").rolling_max(window_size=15).shift(-15)
-                > pl.col("close") * 1.005
+                (pl.col("forward_high_max") >= pl.col("close") * 1.005)
+                & (pl.col("forward_low_min") > pl.col("close") * 0.998)
             )
             .cast(pl.Int8)
-            .alias("devil_target"),
+            .alias("devil_target")
         ]
     )
 
-    # Drop rows with null targets (end of series)
-    df = df.drop_nulls(subset=["angel_target", "devil_target"])
+    # Drop intermediate columns
+    df = df.drop(["forward_high_max", "forward_low_min"])
 
-    # Define feature columns
-    feature_cols = ["returns", "log_volume", "range", "body"]
+    logger.info(
+        f"Generated targets: angel_target (3-bar), devil_target ({lookahead}-bar bracket)"
+    )
 
-    logger.info(f"Engineered {len(feature_cols)} features")
-    logger.info(f"Feature columns: {feature_cols}")
+    # ═══════════════════════════════════════════════════════════════════
+    # CLEANUP: Remove rows with nulls
+    # ═══════════════════════════════════════════════════════════════════
+
+    initial_count = len(df)
+    df = df.drop_nulls()
+    dropped_count = initial_count - len(df)
+
+    logger.info(
+        f"Dropped {dropped_count:,} rows with nulls ({dropped_count / initial_count:.1%})"
+    )
     logger.info(f"Final dataset: {len(df):,} rows")
+
+    # Define feature columns for model training
+    feature_cols = ["rsi_14", "macd", "macd_signal", "bb_upper", "bb_lower"]
+
+    logger.info(f"Feature columns: {feature_cols}")
 
     return df, feature_cols
 
