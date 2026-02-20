@@ -372,28 +372,69 @@ def save_models(
     devil_model: RandomForestClassifier,
 ) -> None:
     """
-    Serialize models to disk using joblib.
+    Serialize models to disk using joblib with POSIX atomic writes.
+
+    Uses temporary files and os.replace() to ensure zero-downtime atomic swaps,
+    preventing the live hot-reloader from reading partially written files.
 
     Args:
         angel_model: Trained Angel model
         devil_model: Trained Devil model
     """
     logger.info("=" * 70)
-    logger.info("SERIALIZING MODELS")
+    logger.info("SERIALIZING MODELS (ATOMIC)")
     logger.info("=" * 70)
 
     # Ensure model directory exists
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Save Angel model
-    joblib.dump(angel_model, ANGEL_PATH)
-    angel_size = ANGEL_PATH.stat().st_size / (1024 * 1024)
-    logger.info(f"Angel model saved: {ANGEL_PATH} ({angel_size:.1f} MB)")
+    # Define temp and final paths
+    angel_temp = MODEL_DIR / "angel_temp.pkl"
+    devil_temp = MODEL_DIR / "devil_temp.pkl"
 
-    # Save Devil model
-    joblib.dump(devil_model, DEVIL_PATH)
-    devil_size = DEVIL_PATH.stat().st_size / (1024 * 1024)
-    logger.info(f"Devil model saved: {DEVIL_PATH} ({devil_size:.1f} MB)")
+    # ═══════════════════════════════════════════════════════════════════
+    # ATOMIC WRITE: Angel Model
+    # ═══════════════════════════════════════════════════════════════════
+    try:
+        # Write to temp file first
+        joblib.dump(angel_model, angel_temp)
+        angel_size = angel_temp.stat().st_size / (1024 * 1024)
+
+        # Atomic swap: instant replacement at OS level
+        os.replace(angel_temp, ANGEL_PATH)
+
+        logger.info(f"[ATOMIC] Angel model saved: {ANGEL_PATH} ({angel_size:.1f} MB)")
+
+    except Exception as e:
+        logger.error(f"[ATOMIC] Failed to save Angel model: {e}")
+        # Clean up temp file if it exists
+        if angel_temp.exists():
+            angel_temp.unlink()
+        raise
+
+    # ═══════════════════════════════════════════════════════════════════
+    # ATOMIC WRITE: Devil Model
+    # ═══════════════════════════════════════════════════════════════════
+    try:
+        # Write to temp file first
+        joblib.dump(devil_model, devil_temp)
+        devil_size = devil_temp.stat().st_size / (1024 * 1024)
+
+        # Atomic swap: instant replacement at OS level
+        os.replace(devil_temp, DEVIL_PATH)
+
+        logger.info(f"[ATOMIC] Devil model saved: {DEVIL_PATH} ({devil_size:.1f} MB)")
+
+    except Exception as e:
+        logger.error(f"[ATOMIC] Failed to save Devil model: {e}")
+        # Clean up temp file if it exists
+        if devil_temp.exists():
+            devil_temp.unlink()
+        raise
+
+    logger.info(
+        "[ATOMIC] Model serialization complete - Live bot can hot-reload safely"
+    )
 
 
 def main():
