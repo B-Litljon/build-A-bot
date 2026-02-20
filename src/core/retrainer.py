@@ -312,27 +312,33 @@ def generate_time_decay_weights(
 def refit_models(
     df: pl.DataFrame,
     feature_cols: List[str],
-) -> Tuple[RandomForestClassifier, RandomForestClassifier]:
+) -> Tuple[RandomForestClassifier, RandomForestClassifier, List[str], List[str]]:
     """
     Refit Angel and Devil models with time-decay weighting.
+
+    Implements proper Meta-Labeling architecture:
+    1. Train Angel on base features
+    2. Generate Angel's probabilities as meta-features
+    3. Train Devil on base features + angel_prob
 
     Args:
         df: Feature-engineered DataFrame
         feature_cols: List of feature column names
 
     Returns:
-        Tuple of (Angel model, Devil model)
+        Tuple of (Angel model, Devil model, angel_features, devil_features)
     """
     logger.info("=" * 70)
-    logger.info("REFITTING MODELS")
+    logger.info("REFITTING MODELS (META-LABELING)")
     logger.info("=" * 70)
 
-    # Extract features and targets
-    X = df[feature_cols].to_numpy()
+    # Extract base features and targets
+    X_base = df[feature_cols].to_numpy()
     y_angel = df["angel_target"].to_numpy()
     y_devil = df["devil_target"].to_numpy()
 
-    logger.info(f"Training samples: {len(X):,}")
+    logger.info(f"Training samples: {len(X_base):,}")
+    logger.info(f"Base features: {feature_cols}")
     logger.info(
         f"Angel target distribution: 0={np.sum(y_angel == 0)}, 1={np.sum(y_angel == 1)}"
     )
@@ -341,30 +347,73 @@ def refit_models(
     )
 
     # Generate time-decay weights
-    sample_weights = generate_time_decay_weights(len(X))
+    sample_weights = generate_time_decay_weights(len(X_base))
     logger.info(
         f"Time-decay weights: min={sample_weights.min():.3f}, max={sample_weights.max():.3f}"
     )
 
-    # Train Angel model (Direction)
-    logger.info("\nTraining Angel model (Direction)...")
+    # ═══════════════════════════════════════════════════════════════════
+    # STEP 1: Train the Angel (Primary Model - Direction)
+    # ═══════════════════════════════════════════════════════════════════
+    logger.info("\n[Step 1/4] Training Angel model (Direction)...")
     angel_model = RandomForestClassifier(**ANGEL_PARAMS)
-    angel_model.fit(X, y_angel, sample_weight=sample_weights)
-    logger.info("Angel model trained successfully")
+    angel_model.fit(X_base, y_angel, sample_weight=sample_weights)
+    logger.info(f"✓ Angel model trained on {len(feature_cols)} features")
 
-    # Train Devil model (Conviction)
-    logger.info("\nTraining Devil model (Conviction)...")
+    # ═══════════════════════════════════════════════════════════════════
+    # STEP 2: Generate Meta-Features (Angel's Probabilities)
+    # ═══════════════════════════════════════════════════════════════════
+    logger.info("\n[Step 2/4] Generating meta-features (Angel's probabilities)...")
+
+    # Get Angel's prediction probabilities on training data
+    # Suppress sklearn warning about feature names during training inference
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+        angel_probs_train = angel_model.predict_proba(X_base)[:, 1]
+
+    # Add angel_prob as a new column to the DataFrame
+    df = df.with_columns(pl.Series("angel_prob", angel_probs_train))
+    logger.info(f"✓ Generated {len(angel_probs_train):,} Angel probabilities")
+    logger.info(
+        f"  Angel prob range: [{angel_probs_train.min():.3f}, {angel_probs_train.max():.3f}]"
+    )
+
+    # ═══════════════════════════════════════════════════════════════════
+    # STEP 3: Train the Devil (Meta Model - Conviction)
+    # ═══════════════════════════════════════════════════════════════════
+    logger.info("\n[Step 3/4] Training Devil model (Conviction with meta-features)...")
+
+    # Devil sees base features + Angel's probability
+    devil_features = feature_cols + ["angel_prob"]
+    X_devil = df[devil_features].to_numpy()
+
+    logger.info(f"Devil feature space: {devil_features}")
+
     devil_model = RandomForestClassifier(**DEVIL_PARAMS)
-    devil_model.fit(X, y_devil, sample_weight=sample_weights)
-    logger.info("Devil model trained successfully")
+    devil_model.fit(X_devil, y_devil, sample_weight=sample_weights)
+    logger.info(f"✓ Devil model trained on {len(devil_features)} features")
+
+    # ═══════════════════════════════════════════════════════════════════
+    # STEP 4: Validation & Summary
+    # ═══════════════════════════════════════════════════════════════════
+    logger.info("\n[Step 4/4] Model validation...")
 
     # Quick validation
-    angel_acc = angel_model.score(X, y_angel, sample_weight=sample_weights)
-    devil_acc = devil_model.score(X, y_devil, sample_weight=sample_weights)
-    logger.info(f"\nAngel training accuracy: {angel_acc:.3f}")
-    logger.info(f"Devil training accuracy: {devil_acc:.3f}")
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+        angel_acc = angel_model.score(X_base, y_angel, sample_weight=sample_weights)
+        devil_acc = devil_model.score(X_devil, y_devil, sample_weight=sample_weights)
 
-    return angel_model, devil_model
+    logger.info(f"\n{'=' * 70}")
+    logger.info("META-LABELING TRAINING COMPLETE")
+    logger.info(f"{'=' * 70}")
+    logger.info(f"Angel training accuracy: {angel_acc:.3f} (recall-focused)")
+    logger.info(f"Devil training accuracy: {devil_acc:.3f} (precision-focused)")
+    logger.info(f"Devil can now veto Angel when angel_prob is misleading")
+
+    return angel_model, devil_model, feature_cols, devil_features
 
 
 def save_models(
@@ -461,7 +510,9 @@ def main():
         features_df, feature_cols = engineer_features_and_labels(raw_data)
 
         # Refit models with time-decay weighting
-        angel_model, devil_model = refit_models(features_df, feature_cols)
+        angel_model, devil_model, angel_features, devil_features = refit_models(
+            features_df, feature_cols
+        )
 
         # Save models
         save_models(angel_model, devil_model)

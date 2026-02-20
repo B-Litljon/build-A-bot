@@ -181,6 +181,21 @@ class ReplayHarness:
         logger.info("Loading Devil model...")
         self.devil_model = joblib.load(devil_model_path)
 
+        # ═══════════════════════════════════════════════════════════════════
+        # IRONCLAD ALIGNMENT: Capture official feature order from models
+        # This ensures NumPy arrays match the exact column order from training
+        # ═══════════════════════════════════════════════════════════════════
+        self.angel_features = list(self.angel_model.feature_names_in_)
+        self.devil_features = list(self.devil_model.feature_names_in_)
+        logger.info(f"Angel expects features: {self.angel_features}")
+        logger.info(f"Devil expects features: {self.devil_features}")
+
+        # Verify Devil's last feature is angel_prob (meta-labeling check)
+        if self.devil_features[-1] != "angel_prob":
+            logger.warning(
+                "⚠️  Devil's last feature is not 'angel_prob' - meta-labeling may be misconfigured"
+            )
+
         # Track historical data per symbol for feature calculation
         self.symbol_history: Dict[str, pl.DataFrame] = {}
 
@@ -232,19 +247,31 @@ class ReplayHarness:
         """
         Run Angel/Devil inference on current symbol state.
 
+        Uses IRONCLAD ALIGNMENT: Features are selected by name in exact training order
+        before NumPy conversion to prevent misalignment errors.
+
         Returns:
             Signal dict if both models agree, None otherwise.
         """
+        import warnings
+
         features_df = self._generate_features(symbol)
 
         if features_df is None or len(features_df) == 0:
             return None
 
-        # Get latest features
-        latest_features = features_df[FEATURE_NAMES].tail(1).to_numpy()
+        # ═══════════════════════════════════════════════════════════════════
+        # STAGE 1: THE ANGEL (DIRECTION)
+        # ═══════════════════════════════════════════════════════════════════
 
-        # Stage 1: Angel (Direction)
-        angel_prob = self.angel_model.predict_proba(latest_features)[0, 1]
+        # IRONCLAD ALIGNMENT: Select features in exact order Angel expects
+        # This prevents column misalignment even if DataFrame columns are shuffled
+        angel_input = features_df.select(self.angel_features).tail(1).to_numpy()
+
+        # Suppress sklearn warning after alignment is guaranteed
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+            angel_prob = self.angel_model.predict_proba(angel_input)[0, 1]
 
         if angel_prob < ANGEL_THRESHOLD:
             return {
@@ -256,13 +283,29 @@ class ReplayHarness:
                 "action": "REJECT_ANGEL",
             }
 
-        # Stage 2: Devil (Conviction)
-        import pandas as pd
+        # ═══════════════════════════════════════════════════════════════════
+        # STAGE 2: THE DEVIL (CONVICTION)
+        # ═══════════════════════════════════════════════════════════════════
 
-        meta_features = pd.DataFrame(latest_features, columns=FEATURE_NAMES)
-        meta_features["angel_prob"] = angel_prob
+        # IRONCLAD ALIGNMENT: Build Devil input with meta-feature
+        # Devil expects: [base_features..., angel_prob]
+        devil_input = features_df.select(self.angel_features).tail(1).to_numpy()
 
-        devil_prob = self.devil_model.predict_proba(meta_features)[0, 1]
+        # CRITICAL: Append angel_prob as the final column (meta-labeling requirement)
+        devil_input = np.column_stack([devil_input, np.array([[angel_prob]])])
+
+        # Verify input shape matches Devil's expectations
+        if devil_input.shape[1] != len(self.devil_features):
+            logger.error(
+                f"Feature count mismatch: Devil expects {len(self.devil_features)} "
+                f"features, got {devil_input.shape[1]}"
+            )
+            return None
+
+        # Suppress sklearn warning after alignment is guaranteed
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+            devil_prob = self.devil_model.predict_proba(devil_input)[0, 1]
 
         if devil_prob < DEVIL_THRESHOLD:
             return {
