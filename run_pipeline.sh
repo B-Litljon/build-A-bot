@@ -142,10 +142,10 @@ run_replay() {
 run_resolver() {
     print_section "PHASE 3: Trade Resolution"
     echo "Resolving bracket orders (+0.5% TP, -0.2% SL)..."
-    echo "Conservative execution: Stop Loss checked before Take Profit"
+    echo "Dynamic ATR-based TP/SL evaluation with conservative execution"
     echo ""
     
-    python -m src.core.resolver
+    python -m src.evaluate_performance
     
     print_success "Trade resolution complete"
     echo "Output: data/resolved_ledger.csv"

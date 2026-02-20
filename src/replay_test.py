@@ -274,14 +274,7 @@ class ReplayHarness:
             angel_prob = self.angel_model.predict_proba(angel_input)[0, 1]
 
         if angel_prob < ANGEL_THRESHOLD:
-            return {
-                "timestamp": timestamp,
-                "symbol": symbol,
-                "close_price": close_price,
-                "angel_prob": float(angel_prob),
-                "devil_prob": None,
-                "action": "REJECT_ANGEL",
-            }
+            return None  # Rejection - not appended to ledger
 
         # ═══════════════════════════════════════════════════════════════════
         # STAGE 2: THE DEVIL (CONVICTION)
@@ -308,14 +301,7 @@ class ReplayHarness:
             devil_prob = self.devil_model.predict_proba(devil_input)[0, 1]
 
         if devil_prob < DEVIL_THRESHOLD:
-            return {
-                "timestamp": timestamp,
-                "symbol": symbol,
-                "close_price": close_price,
-                "angel_prob": float(angel_prob),
-                "devil_prob": float(devil_prob),
-                "action": "REJECT_DEVIL",
-            }
+            return None  # Rejection - not appended to ledger
 
         # Both agree - BUY signal
         self.signals_generated += 1
@@ -359,11 +345,12 @@ class ReplayHarness:
                 # Run inference
                 signal = self._run_inference(
                     symbol=symbol,
-                    close_price=row["close"],
+                    close_price=float(row["close"]),
                     timestamp=timestamp,
                 )
 
-                if signal:
+                # Only append valid BUY signals to ledger (rejections are discarded)
+                if signal and signal.get("action") == "BUY":
                     self.signal_ledger.append(signal)
 
             # Progress logging every 1000 bars
@@ -391,28 +378,11 @@ class ReplayHarness:
 
         logger.info(f"Saving {len(self.signal_ledger):,} signals to {output_path}...")
 
-        # Convert list of dicts to Polars DataFrame (single batch operation)
+        # Build DataFrame directly - all data is already clean native Python scalars
         ledger_df = pl.DataFrame(self.signal_ledger)
 
-        # Sanitize nested data types for CSV serialization
-        # Identify columns with nested types (List, Struct, Array, Object)
-        nested_columns = [
-            col
-            for col, dtype in ledger_df.schema.items()
-            if dtype.is_nested() or dtype == pl.Object
-        ]
-
-        # Cast nested columns to string representation
-        if nested_columns:
-            logger.debug(f"Converting nested columns to string: {nested_columns}")
-            ledger_df = ledger_df.with_columns(
-                [pl.col(col).cast(pl.String) for col in nested_columns]
-            )
-
-        # Ensure output directory exists
+        # Write to disk
         output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Single batch write to CSV
         ledger_df.write_csv(output_path)
 
         file_size = output_path.stat().st_size / 1024  # KB
@@ -421,12 +391,6 @@ class ReplayHarness:
         # Summary statistics
         buy_signals = ledger_df.filter(pl.col("action") == "BUY")
         logger.info(f"BUY signals: {len(buy_signals):,}")
-        logger.info(
-            f"Angel rejections: {len(ledger_df.filter(pl.col('action') == 'REJECT_ANGEL')):,}"
-        )
-        logger.info(
-            f"Devil rejections: {len(ledger_df.filter(pl.col('action') == 'REJECT_DEVIL')):,}"
-        )
 
 
 def main():
