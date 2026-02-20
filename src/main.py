@@ -12,6 +12,10 @@ import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict
 
+import warnings
+
+warnings.filterwarnings("ignore", category=UserWarning)
+
 from dotenv import load_dotenv
 
 # Correct pathing: Ensure the 'src' directory is the root for imports
@@ -165,7 +169,7 @@ def run_live_loop(
                     if qty >= 0.001:
                         submit_bracket_order(trading_client, symbol, qty, current_price)
 
-                elif cycle_count % 10 == 0:
+                elif cycle_count % 1 == 0:
                     logger.info(
                         f"💤 {symbol} | Price: ${current_price:.2f} | Angel Prob: {prob:.2f}"
                     )
