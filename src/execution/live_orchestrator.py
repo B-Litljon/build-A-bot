@@ -50,8 +50,11 @@ from dotenv import load_dotenv
 # ---------------------------------------------------------------------------
 # Alpaca imports — live streams + REST
 # ---------------------------------------------------------------------------
-from alpaca.data.enums import DataFeed
+from alpaca.data.enums import DataFeed, Adjustment
+from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.live import StockDataStream
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, OrderType, TimeInForce
 from alpaca.trading.requests import (
@@ -255,6 +258,11 @@ class LiveOrchestrator:
 
         # Verify market clock once before subscribing
         await self._refresh_market_clock()
+
+        # Pre-load historical bars so SMA-50 and all indicators are ready
+        # at market open.  Must run after credentials are validated and
+        # before WebSocket subscriptions are registered.
+        await self._warmup_aggregator()
 
         # Build WebSocket clients
         self._data_stream = StockDataStream(
@@ -823,6 +831,155 @@ class LiveOrchestrator:
                     logger.info("[%s] Cooling complete — State → FLAT.", ctx.symbol)
         except asyncio.CancelledError:
             logger.debug("[%s] Cooling timer cancelled.", ctx.symbol)
+
+    # -----------------------------------------------------------------------
+    # REST API warm-up — pre-fills aggregator rolling windows on boot
+    # -----------------------------------------------------------------------
+
+    async def _warmup_aggregator(self) -> None:
+        """
+        Pre-loads each symbol's LiveBarAggregator with the last 60 one-minute
+        bars from the Alpaca REST API so that the SMA-50 (and all other
+        indicators) are ready the moment the first live WebSocket bar arrives.
+
+        On weekends / outside market hours Alpaca returns the most recent
+        available data (typically Friday's session), which is exactly what we
+        want for warming the rolling window.
+
+        Design notes
+        ------------
+        * Uses StockHistoricalDataClient (separate credential path from
+          TradingClient; paper flag does not apply to market data).
+        * Requests limit=60 bars per symbol to guarantee SMA-50 coverage plus
+          a 10-bar safety margin.
+        * The pandas MultiIndex DataFrame returned by the SDK is converted to a
+          strict Polars DataFrame matching _SCHEMA before injection, ensuring
+          zero type ambiguity downstream.
+        * Bars are fed one-by-one through add_bar() so the aggregator's own
+          window-sealing and gap-filling logic runs exactly as it would on live
+          data.  Each new bar seals the previous window, so after 60 injections
+          the history_df will contain ~59 closed candles — sufficient for all
+          TA-Lib indicators.
+        """
+        logger.info("Starting aggregator warm-up via REST API for %s …", self._symbols)
+
+        # Initialise a historical data client (not paper-specific)
+        hist_client = StockHistoricalDataClient(
+            api_key=self._api_key,
+            secret_key=self._secret_key,
+        )
+
+        end_time = datetime.now(timezone.utc)
+
+        request = StockBarsRequest(
+            symbol_or_symbols=self._symbols,
+            timeframe=TimeFrame.Minute,
+            limit=60,
+            end=end_time,
+            adjustment=Adjustment.RAW,
+        )
+
+        try:
+            bar_set = await asyncio.to_thread(hist_client.get_stock_bars, request)
+        except Exception as exc:
+            logger.warning(
+                "Aggregator warm-up REST request failed — bot will start cold: %s",
+                exc,
+            )
+            return
+
+        # bar_set.df is a pandas DataFrame with a (symbol, timestamp) MultiIndex.
+        # We iterate per symbol so each aggregator receives its own bars in order.
+        try:
+            raw_pd = bar_set.df
+        except Exception as exc:
+            logger.warning("Could not extract DataFrame from bar_set: %s", exc)
+            return
+
+        if raw_pd is None or raw_pd.empty:
+            logger.warning("Warm-up returned no data — bot will start cold.")
+            return
+
+        for symbol in self._symbols:
+            ctx = self._contexts[symbol]
+
+            # Slice this symbol's rows out of the MultiIndex
+            try:
+                sym_pd = raw_pd.loc[symbol].copy()
+            except KeyError:
+                logger.warning("[%s] No warm-up data returned — skipping.", symbol)
+                continue
+
+            if sym_pd.empty:
+                logger.warning("[%s] Empty warm-up slice — skipping.", symbol)
+                continue
+
+            # Reset index so 'timestamp' becomes a plain column
+            sym_pd = sym_pd.reset_index()
+
+            # ------------------------------------------------------------------
+            # Strict Polars conversion — matches LiveBarAggregator._SCHEMA:
+            #   timestamp  → Datetime(time_unit="us", time_zone="UTC")
+            #   open/high/low/close/volume → Float64
+            # ------------------------------------------------------------------
+            try:
+                pl_schema = {
+                    "timestamp": pl.Datetime(time_unit="us", time_zone="UTC"),
+                    "open": pl.Float64,
+                    "high": pl.Float64,
+                    "low": pl.Float64,
+                    "close": pl.Float64,
+                    "volume": pl.Float64,
+                }
+
+                # Select only the columns we need (drop vwap, trade_count, etc.)
+                cols_needed = list(pl_schema.keys())
+                sym_pd = sym_pd[cols_needed]
+
+                pl_df = pl.from_pandas(sym_pd).cast(
+                    {
+                        "timestamp": pl.Datetime(time_unit="us", time_zone="UTC"),
+                        "open": pl.Float64,
+                        "high": pl.Float64,
+                        "low": pl.Float64,
+                        "close": pl.Float64,
+                        "volume": pl.Float64,
+                    }
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Polars conversion failed during warm-up — skipping: %s",
+                    symbol,
+                    exc,
+                )
+                continue
+
+            # ------------------------------------------------------------------
+            # Inject bars one-by-one so the aggregator's window logic fires
+            # correctly for each transition (each new bar seals the prior window)
+            # ------------------------------------------------------------------
+            bars_injected = 0
+            for row in pl_df.iter_rows(named=True):
+                bar_dict = {
+                    "timestamp": row["timestamp"],
+                    "open": row["open"],
+                    "high": row["high"],
+                    "low": row["low"],
+                    "close": row["close"],
+                    "volume": row["volume"],
+                }
+                ctx.aggregator.add_bar(bar_dict)
+                bars_injected += 1
+
+            history_len = len(ctx.aggregator.history_df)
+            logger.info(
+                "[+] Warmed up %s with %d historical bars → %d candles in history.",
+                symbol,
+                bars_injected,
+                history_len,
+            )
+
+        logger.info("Aggregator warm-up complete.")
 
     # -----------------------------------------------------------------------
     # Market hours
