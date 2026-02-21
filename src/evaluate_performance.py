@@ -37,8 +37,8 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 BARS_PATH = Path("data/oos_bars.parquet")
-LEDGER_PATH = Path("data/signal_ledger.csv")
-OUTPUT_PATH = Path("data/evaluation_results.csv")
+LEDGER_PATH = Path("data/signal_ledger.parquet")
+OUTPUT_PATH = Path("data/evaluation_results.parquet")
 
 # Exit Parameters
 SL_MULTIPLIER = 1.5
@@ -62,7 +62,7 @@ class PerformanceMetrics:
     avg_loser: float
 
 
-def load_data() -> tuple[pl.DataFrame, pl.DataFrame]:
+def load_data() -> tuple[pl.DataFrame, pl.DataFrame, str]:
     """Load price bars and signal ledger."""
     logger.info("=" * 70)
     logger.info("PHASE 3: PERFORMANCE EVALUATION")
@@ -104,11 +104,11 @@ def load_data() -> tuple[pl.DataFrame, pl.DataFrame]:
     logger.info(f"Using ATR column: {atr_col}")
     logger.info(f"Loaded {len(bars_df):,} bars")
 
-    # Load signals (only select needed columns to avoid nested data issues)
+    # Load signals from Parquet (strict schema preservation)
     logger.info(f"Loading signals from {LEDGER_PATH}...")
-    signals_df = pl.read_csv(LEDGER_PATH)
+    signals_df = pl.read_parquet(LEDGER_PATH)
 
-    # Only keep essential columns to avoid nested data issues
+    # Only keep essential columns
     essential_cols = [
         "timestamp",
         "symbol",
@@ -120,10 +120,9 @@ def load_data() -> tuple[pl.DataFrame, pl.DataFrame]:
     available_cols = [c for c in essential_cols if c in signals_df.columns]
     signals_df = signals_df.select(available_cols)
 
-    # Convert timestamp to datetime
-    signals_df = signals_df.with_columns(
-        [pl.col("timestamp").str.strptime(pl.Datetime, "%Y-%m-%d %H:%M:%S%.f")]
-    )
+    # STRICT SCHEMA: Timestamps already datetime[μs, UTC] from Parquet
+    # No string parsing required - schema matches oos_bars.parquet exactly
+    logger.debug(f"Signals schema: {signals_df.schema}")
 
     # Filter to BUY signals only
     if "action" in signals_df.columns:
@@ -269,13 +268,21 @@ def vectorized_backtest(
         exit_types.append(exit_type)
 
     # Add exit information to results
+    # Step 1: Attach raw exit data as new columns
     all_results = all_results.with_columns(
         [
             pl.Series("exit_bar", exit_bars),
             pl.Series("exit_price", exit_prices),
             pl.Series("exit_type", exit_types),
-            (pl.Series("exit_price") - pl.col("entry_price")).alias("pnl"),
-            ((pl.Series("exit_price") - pl.col("entry_price")) / pl.col("atr")).alias(
+        ]
+    )
+
+    # Step 2: Compute derived P&L columns using pl.col() references
+    # (exit_price must exist as a column before it can be referenced)
+    all_results = all_results.with_columns(
+        [
+            (pl.col("exit_price") - pl.col("entry_price")).alias("pnl"),
+            ((pl.col("exit_price") - pl.col("entry_price")) / pl.col("atr")).alias(
                 "pnl_r"
             ),
         ]
@@ -413,8 +420,8 @@ def main() -> int:
         # Print summary
         print_summary(metrics, trades_df)
 
-        # Save detailed results
-        trades_df.write_csv(OUTPUT_PATH)
+        # Save detailed results to Parquet (preserves schema for downstream analysis)
+        trades_df.write_parquet(OUTPUT_PATH)
         logger.info(f"Detailed results saved to {OUTPUT_PATH}")
 
         logger.info("=" * 70)

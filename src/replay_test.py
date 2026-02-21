@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 DATA_PATH = Path("data/oos_bars.parquet")
-LEDGER_PATH = Path("data/signal_ledger.csv")
+LEDGER_PATH = Path("data/signal_ledger.parquet")
 ANGEL_MODEL_PATH = Path("src/ml/models/angel_rf_model.joblib")
 DEVIL_MODEL_PATH = Path("src/ml/models/devil_rf_model.joblib")
 
@@ -305,6 +305,8 @@ class ReplayHarness:
 
         # Both agree - BUY signal
         self.signals_generated += 1
+        # STRICT SCHEMA: Preserve native datetime[μs, UTC] from source data
+        # timestamp is already timezone-aware datetime from row["timestamp"]
         return {
             "timestamp": timestamp,
             "symbol": symbol,
@@ -346,7 +348,8 @@ class ReplayHarness:
                 signal = self._run_inference(
                     symbol=symbol,
                     close_price=float(row["close"]),
-                    timestamp=timestamp,
+                    # FIX: Extract native Python datetime from row to avoid Polars grouping key artifacts
+                    timestamp=row["timestamp"],
                 )
 
                 # Only append valid BUY signals to ledger (rejections are discarded)
@@ -365,12 +368,13 @@ class ReplayHarness:
 
     def save_ledger(self, output_path: Path) -> None:
         """
-        Save the signal ledger to CSV.
+        Save the signal ledger to Parquet with strict schema preservation.
 
-        Performs single batch write after accumulation (no row-by-row disk I/O).
-
-        Args:
-            output_path: Path to save the ledger CSV.
+        Logic Ledger:
+        - Input: List of signal dictionaries with timezone-aware datetime objects
+        - Process: Construct Polars DataFrame (schema inferred from native types)
+        - Output: Parquet file with datetime[μs, UTC] for timestamp column
+        - Strict type matching ensures seamless join with oos_bars.parquet
         """
         if not self.signal_ledger:
             logger.warning("No signals to save")
@@ -378,12 +382,25 @@ class ReplayHarness:
 
         logger.info(f"Saving {len(self.signal_ledger):,} signals to {output_path}...")
 
-        # Build DataFrame directly - all data is already clean native Python scalars
+        # STRICT SCHEMA: Build DataFrame preserving native Python types
+        # Polars will infer datetime[μs, UTC] from timezone-aware datetime objects
         ledger_df = pl.DataFrame(self.signal_ledger)
 
-        # Write to disk
+        # Defensive cast: guarantee timestamp matches oos_bars schema (μs, UTC)
+        # Prevents silent join failures if upstream ever changes resolution (ns vs μs)
+        if "timestamp" in ledger_df.columns:
+            ledger_df = ledger_df.with_columns(
+                pl.col("timestamp").cast(pl.Datetime("us", "UTC"))
+            )
+
+        # Schema verification for debugging
+        logger.debug(f"Ledger schema: {ledger_df.schema}")
+
+        # Ensure output directory exists
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        ledger_df.write_csv(output_path)
+
+        # Write to Parquet - preserves full type information including timezone
+        ledger_df.write_parquet(output_path)
 
         file_size = output_path.stat().st_size / 1024  # KB
         logger.info(f"Ledger saved: {file_size:.2f} KB")
