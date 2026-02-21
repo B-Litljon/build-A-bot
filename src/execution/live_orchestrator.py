@@ -1,10 +1,13 @@
 """
-Universal Scalper V3.1 — Live Forward-Testing Orchestrator (Phase 5)
-=====================================================================
+Universal Scalper V3.1 — Live Forward-Testing Orchestrator (Phase 5 — Crypto Stress-Test)
+==========================================================================================
+
+TEMPORARY BUILD — 1-hour crypto stress-test targeting BTC/USD and ETH/USD.
+Discard after validation; revert to equity version for production.
 
 Architecture: asyncio.to_thread concurrency model
 --------------------------------------------------
-  StockDataStream (async WebSocket)
+  CryptoDataStream (async WebSocket)
        │ raw bar events per symbol
        ▼
   LiveBarAggregator.add_bar(tick)          ← in-event-loop, microseconds
@@ -50,10 +53,10 @@ from dotenv import load_dotenv
 # ---------------------------------------------------------------------------
 # Alpaca imports — live streams + REST
 # ---------------------------------------------------------------------------
-from alpaca.data.enums import DataFeed, Adjustment
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.live import StockDataStream
-from alpaca.data.requests import StockBarsRequest
+from alpaca.data.enums import Adjustment
+from alpaca.data.historical.crypto import CryptoHistoricalDataClient
+from alpaca.data.live.crypto import CryptoDataStream
+from alpaca.data.requests import CryptoBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, OrderType, TimeInForce
@@ -87,9 +90,12 @@ logger = logging.getLogger(__name__)
 # src/analysis/reinforcement_voter.py on fresh OOS data.
 ATR_KILL_SWITCH_THRESHOLD: float = 0.5204  # natr_14 percentage units
 
-# Angel/Devil classification thresholds (matching training configuration)
+# Angel/Devil classification thresholds.
+# Devil raised to 0.75 for the crypto stress-test: higher volatility regime
+# demands stronger conviction before committing capital.
+# Revert DEVIL_THRESHOLD to 0.50 for the production equity build.
 ANGEL_THRESHOLD: float = 0.40
-DEVIL_THRESHOLD: float = 0.50
+DEVIL_THRESHOLD: float = 0.75
 
 # Bracket ATR multipliers (matching OOS backtest that produced +39.03R)
 SL_ATR_MULTIPLIER: float = 1.5
@@ -216,7 +222,7 @@ class LiveOrchestrator:
         }
 
         # -- Alpaca WebSocket clients (created fresh per run()) call) --
-        self._data_stream: Optional[StockDataStream] = None
+        self._data_stream: Optional[CryptoDataStream] = None
         self._trade_stream: Optional[TradingStream] = None
 
         # -- Market hours cache --
@@ -264,10 +270,8 @@ class LiveOrchestrator:
         # before WebSocket subscriptions are registered.
         await self._warmup_aggregator()
 
-        # Build WebSocket clients
-        self._data_stream = StockDataStream(
-            self._api_key, self._secret_key, feed=DataFeed.IEX
-        )
+        # Build WebSocket clients — CryptoDataStream has no feed argument
+        self._data_stream = CryptoDataStream(self._api_key, self._secret_key)
         self._trade_stream = TradingStream(
             self._api_key, self._secret_key, paper=self._paper
         )
@@ -302,13 +306,13 @@ class LiveOrchestrator:
     # -----------------------------------------------------------------------
 
     async def _run_data_stream(self) -> None:
-        """Runs StockDataStream until shutdown is requested."""
+        """Runs CryptoDataStream until shutdown is requested."""
         try:
             await self._data_stream._run_forever()  # type: ignore[attr-defined]
         except asyncio.CancelledError:
             pass
         except Exception as exc:
-            logger.error("StockDataStream error: %s", exc, exc_info=True)
+            logger.error("CryptoDataStream error: %s", exc, exc_info=True)
             self._request_shutdown()
 
     async def _run_trade_stream(self) -> None:
@@ -333,7 +337,7 @@ class LiveOrchestrator:
                 pass  # Normal — loop again
 
     # -----------------------------------------------------------------------
-    # Primary bar handler (called by StockDataStream in the event loop)
+    # Primary bar handler (called by CryptoDataStream in the event loop)
     # -----------------------------------------------------------------------
 
     async def _on_bar(self, bar) -> None:
@@ -848,8 +852,8 @@ class LiveOrchestrator:
 
         Design notes
         ------------
-        * Uses StockHistoricalDataClient (separate credential path from
-          TradingClient; paper flag does not apply to market data).
+        * Uses CryptoHistoricalDataClient (no paper flag — crypto data
+          endpoints are identical for paper and live accounts).
         * Requests limit=60 bars per symbol to guarantee SMA-50 coverage plus
           a 10-bar safety margin.
         * The pandas MultiIndex DataFrame returned by the SDK is converted to a
@@ -861,26 +865,30 @@ class LiveOrchestrator:
           the history_df will contain ~59 closed candles — sufficient for all
           TA-Lib indicators.
         """
-        logger.info("Starting aggregator warm-up via REST API for %s …", self._symbols)
+        logger.info(
+            "Starting aggregator warm-up via Crypto REST API for %s …", self._symbols
+        )
 
-        # Initialise a historical data client (not paper-specific)
-        hist_client = StockHistoricalDataClient(
+        # CryptoHistoricalDataClient does not take a paper flag — crypto data
+        # endpoints are the same for paper and live accounts.
+        hist_client = CryptoHistoricalDataClient(
             api_key=self._api_key,
             secret_key=self._secret_key,
         )
 
         end_time = datetime.now(timezone.utc)
 
-        request = StockBarsRequest(
+        # CryptoBarsRequest does not accept an `adjustment` parameter (no
+        # corporate actions on crypto); omit it entirely.
+        request = CryptoBarsRequest(
             symbol_or_symbols=self._symbols,
             timeframe=TimeFrame.Minute,
             limit=60,
             end=end_time,
-            adjustment=Adjustment.RAW,
         )
 
         try:
-            bar_set = await asyncio.to_thread(hist_client.get_stock_bars, request)
+            bar_set = await asyncio.to_thread(hist_client.get_crypto_bars, request)
         except Exception as exc:
             logger.warning(
                 "Aggregator warm-up REST request failed — bot will start cold: %s",
@@ -987,27 +995,18 @@ class LiveOrchestrator:
 
     async def _refresh_market_clock(self) -> None:
         """
-        Updates self._market_open by querying the Alpaca market clock.
-        The REST call is offloaded to avoid blocking the event loop.
-        Result is cached for CLOCK_CACHE_TTL seconds.
-        """
-        now = asyncio.get_event_loop().time()
-        if now - self._clock_last_checked < CLOCK_CACHE_TTL:
-            return  # Cache still valid
+        Crypto stress-test override: crypto markets are 24/7 so the equity
+        market clock is irrelevant.  We hard-code ``_market_open = True`` and
+        skip the REST call entirely to avoid false closes and unnecessary API
+        overhead during the stress-test window.
 
-        try:
-            clock = await asyncio.to_thread(self._trading_client.get_clock)
-            self._market_open = bool(clock.is_open)
-            self._clock_last_checked = now
+        REVERT this method when switching back to the equity orchestrator.
+        """
+        if not self._market_open:
+            self._market_open = True
             logger.info(
-                "Market clock refreshed | is_open=%s | next_open=%s | next_close=%s",
-                self._market_open,
-                getattr(clock, "next_open", "N/A"),
-                getattr(clock, "next_close", "N/A"),
+                "Market clock bypassed — crypto is 24/7 | _market_open forced True."
             )
-        except Exception as exc:
-            logger.warning("Failed to refresh market clock: %s", exc)
-            # On failure, retain prior cached state — do not flip to closed
 
     # -----------------------------------------------------------------------
     # Graceful shutdown
@@ -1042,7 +1041,7 @@ class LiveOrchestrator:
 
         # 3. Close streams
         for stream, name in [
-            (self._data_stream, "StockDataStream"),
+            (self._data_stream, "CryptoDataStream"),
             (self._trade_stream, "TradingStream"),
         ]:
             if stream is not None:
@@ -1076,7 +1075,9 @@ class LiveOrchestrator:
 # Default paper-trading basket — matches OOS evaluation symbols.
 # Importable by the root launcher (run_live.py) for env-var override.
 # ---------------------------------------------------------------------------
-DEFAULT_SYMBOLS: List[str] = ["TSLA", "NVDA", "MARA", "COIN", "SMCI"]
+# Crypto stress-test basket — 24/7 liquid pairs.
+# Revert to equity basket after the 1-hour stress-test.
+DEFAULT_SYMBOLS: List[str] = ["BTC/USD", "ETH/USD"]
 
 
 # ---------------------------------------------------------------------------
