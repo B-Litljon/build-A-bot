@@ -144,7 +144,7 @@ def calculate_atr_regimes(df: pl.DataFrame) -> pl.DataFrame:
     )
 
     # Log regime distribution
-    regime_counts = df.group_by("atr_regime").agg(pl.count().alias("count"))
+    regime_counts = df.group_by("atr_regime").agg(pl.len().alias("count"))
     for row in regime_counts.iter_rows(named=True):
         logger.info(f"  {row['atr_regime']} volatility: {row['count']:,} trades")
 
@@ -180,7 +180,7 @@ def analyze_regime_drift(df: pl.DataFrame) -> List[RegimeMetrics]:
         df.group_by("atr_regime")
         .agg(
             [
-                pl.count().alias("trade_count"),
+                pl.len().alias("trade_count"),
                 pl.mean("is_win").alias("actual_win_rate"),
                 pl.mean("devil_prob").alias("mean_devil_conviction"),
             ]

@@ -20,6 +20,7 @@ Exit Logic:
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 from dataclasses import dataclass
@@ -39,11 +40,16 @@ logger = logging.getLogger(__name__)
 BARS_PATH = Path("data/oos_bars.parquet")
 LEDGER_PATH = Path("data/signal_ledger.parquet")
 OUTPUT_PATH = Path("data/evaluation_results.parquet")
+DRIFT_REPORT_PATH = Path("data/drift_report.json")
 
 # Exit Parameters
 SL_MULTIPLIER = 1.5
 TP_MULTIPLIER = 3.0
 MAX_HOLD_BARS = 15
+
+# Dynamic Thresholding Parameters
+BASE_THRESHOLD = 0.50  # Normal regime conviction requirement
+HIGH_VOLATILITY_THRESHOLD = 0.75  # High ATR regime conviction requirement
 
 
 @dataclass
@@ -170,6 +176,44 @@ def vectorized_backtest(
             (pl.col("entry_price") + (TP_MULTIPLIER * pl.col("atr"))).alias("tp_price"),
         ]
     )
+
+    # VOLATILITY KILL SWITCH: Apply dynamic thresholding based on drift analysis
+    # Load drift report to extract High ATR threshold (p67)
+    high_atr_threshold = None
+    if DRIFT_REPORT_PATH.exists():
+        logger.info("Loading drift report for dynamic thresholding...")
+        with open(DRIFT_REPORT_PATH, "r") as f:
+            drift_data = json.load(f)
+
+        # Extract High ATR threshold from evaluation_results (p67)
+        # We need to recalculate since drift_report doesn't store the threshold
+        all_atr = entries.select(pl.col("atr"))
+        high_atr_threshold = all_atr.select(pl.col("atr").quantile(0.67)).item()
+
+        logger.info(f"High volatility threshold (p67): {high_atr_threshold:.4f}")
+        logger.info(f"Applying dynamic conviction thresholds:")
+        logger.info(
+            f"  Low/Normal regime (ATR < {high_atr_threshold:.4f}): devil_prob >= {BASE_THRESHOLD:.2f}"
+        )
+        logger.info(
+            f"  High regime (ATR >= {high_atr_threshold:.4f}): devil_prob >= {HIGH_VOLATILITY_THRESHOLD:.2f}"
+        )
+
+        # Apply dynamic filter
+        pre_filter_count = len(entries)
+        entries = entries.filter(
+            pl.when(pl.col("atr") >= high_atr_threshold)
+            .then(pl.col("devil_prob") >= HIGH_VOLATILITY_THRESHOLD)
+            .otherwise(pl.col("devil_prob") >= BASE_THRESHOLD)
+        )
+        filtered_count = pre_filter_count - len(entries)
+        logger.info(
+            f"Filtered out {filtered_count:,} trades ({filtered_count / pre_filter_count:.1%}) via dynamic thresholding"
+        )
+    else:
+        logger.warning(f"Drift report not found at {DRIFT_REPORT_PATH}")
+        logger.warning("Skipping dynamic thresholding - using base threshold only")
+        entries = entries.filter(pl.col("devil_prob") >= BASE_THRESHOLD)
 
     logger.info(f"Processing {len(entries):,} entries with ATR-based exits...")
 
@@ -385,7 +429,7 @@ def print_summary(metrics: PerformanceMetrics, trades_df: pl.DataFrame) -> None:
 
         exit_breakdown = (
             trades_df.group_by("exit_type")
-            .agg(pl.count().alias("count"), pl.mean("pnl_r").alias("avg_pnl_r"))
+            .agg(pl.len().alias("count"), pl.mean("pnl_r").alias("avg_pnl_r"))
             .sort("count", descending=True)
         )
 
