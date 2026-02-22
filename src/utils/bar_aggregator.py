@@ -89,9 +89,7 @@ class LiveBarAggregator:
         if self.current_window_start is None:
             self.current_window_start = bar_window
             self.buffer.append(new_bar)
-            logging.debug(
-                f"First bar received. Window initialised to {bar_window}."
-            )
+            logging.debug(f"First bar received. Window initialised to {bar_window}.")
             return False
 
         # --- Bar belongs to the current open window ---
@@ -118,9 +116,7 @@ class LiveBarAggregator:
             self.current_window_start = bar_window
             self.buffer = [new_bar]
 
-            logging.debug(
-                f"Window advanced to {bar_window}.  New buffer started."
-            )
+            logging.debug(f"Window advanced to {bar_window}.  New buffer started.")
             return True
 
         # --- Bar is older than current window (late / out-of-order) ---
@@ -147,7 +143,7 @@ class LiveBarAggregator:
             logging.warning("_aggregate_and_update called with empty buffer.")
             return
 
-        logging.info(
+        logging.debug(
             f"Closing window {window_timestamp}: aggregating "
             f"{len(self.buffer)} bar(s) into a {self.timeframe}-minute candle."
         )
@@ -155,9 +151,9 @@ class LiveBarAggregator:
         chunk_df = pl.DataFrame(self.buffer)
 
         new_candle_df = chunk_df.select(
-            pl.lit(window_timestamp).alias("timestamp").cast(
-                pl.Datetime(time_unit="us", time_zone="UTC")
-            ),
+            pl.lit(window_timestamp)
+            .alias("timestamp")
+            .cast(pl.Datetime(time_unit="us", time_zone="UTC")),
             pl.col("open").first().cast(pl.Float64),
             pl.col("high").max().cast(pl.Float64),
             pl.col("low").min().cast(pl.Float64),
@@ -167,9 +163,7 @@ class LiveBarAggregator:
 
         self._append_to_history(new_candle_df)
 
-        logging.info(
-            f"Aggregated candle: {new_candle_df.to_dicts()[0]}"
-        )
+        logging.debug(f"Aggregated candle: {new_candle_df.to_dicts()[0]}")
 
     def _forward_fill_gaps(
         self,
@@ -218,7 +212,7 @@ class LiveBarAggregator:
             cursor += step
 
         if synthetic_rows:
-            logging.info(
+            logging.debug(
                 f"Forward-filling {len(synthetic_rows)} missing "
                 f"{self.timeframe}-minute candle(s) between "
                 f"{gap_start} and {new_window}."
@@ -228,9 +222,9 @@ class LiveBarAggregator:
 
     def _append_to_history(self, df: pl.DataFrame) -> None:
         """Append rows to ``history_df`` and trim to ``history_size``."""
-        self.history_df = pl.concat(
-            [self.history_df, df], how="vertical"
-        ).tail(self.history_size)
+        self.history_df = pl.concat([self.history_df, df], how="vertical").tail(
+            self.history_size
+        )
 
         logging.debug(
             f"history_df now has {len(self.history_df)} row(s) "
