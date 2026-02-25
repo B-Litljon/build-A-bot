@@ -266,7 +266,15 @@ class LiveOrchestrator:
         paper: bool = True,
         angel_model_path: str = "src/ml/models/angel_rf_model.joblib",
         devil_model_path: str = "src/ml/models/devil_rf_model.joblib",
+        daemon_mode: bool = False,
     ) -> None:
+        # Configure logging before anything else so the very first logger call
+        # uses the correct handler (Rich vs plain StreamHandler).
+        # logging.basicConfig is a no-op if handlers are already attached, so
+        # calling this here is safe even when an entry-point also calls it.
+        self._daemon_mode: bool = daemon_mode
+        setup_logging(daemon_mode=daemon_mode)
+
         load_dotenv()
 
         self._api_key: str = api_key or os.environ["ALPACA_API_KEY"]
@@ -314,7 +322,9 @@ class LiveOrchestrator:
         self._shutdown_event: asyncio.Event = asyncio.Event()
 
         # -- Dashboard state --
-        self._console = Console()
+        # In daemon mode we never write to a Rich Console; create it only for
+        # interactive runs so no ANSI/VT sequences leak into journald.
+        self._console: Optional[Console] = None if daemon_mode else Console()
         self._activity_log: deque = deque(maxlen=MAX_ACTIVITY_LOG)
         self._start_time: datetime = datetime.now(timezone.utc)
         self._dashboard_running: bool = False
@@ -569,7 +579,42 @@ class LiveOrchestrator:
             await self._shutdown()
 
     async def _dashboard_update_loop(self) -> None:
-        """Update the dashboard display every second."""
+        """
+        Drive the live display or, in daemon mode, simply idle until shutdown.
+
+        Interactive mode:
+            Renders the Rich Live dashboard, refreshing once per second.
+
+        Daemon mode:
+            Skips every Rich UI call — no ANSI sequences, no alternate screen
+            buffer.  Periodically logs a heartbeat at DEBUG level so operators
+            can confirm the loop is alive without flooding journald.
+        """
+        if self._daemon_mode:
+            # Headless: hold the coroutine alive until shutdown is signalled,
+            # emitting an occasional heartbeat so the task is never invisible.
+            heartbeat_interval: float = 60.0  # once per minute at DEBUG level
+            elapsed: float = 0.0
+            while self._dashboard_running and not self._shutdown_event.is_set():
+                try:
+                    await asyncio.wait_for(
+                        self._shutdown_event.wait(),
+                        timeout=DASHBOARD_REFRESH_INTERVAL,
+                    )
+                except asyncio.TimeoutError:
+                    elapsed += DASHBOARD_REFRESH_INTERVAL
+                    if elapsed >= heartbeat_interval:
+                        logger.debug(
+                            "Daemon heartbeat | uptime=%.0fs | symbols=%d",
+                            (
+                                datetime.now(timezone.utc) - self._start_time
+                            ).total_seconds(),
+                            len(self._symbols),
+                        )
+                        elapsed = 0.0
+            return
+
+        # Interactive mode — Rich Live dashboard
         with Live(
             self._generate_dashboard(),
             console=self._console,
@@ -1188,6 +1233,11 @@ class LiveOrchestrator:
         Uses CryptoHistoricalDataClient for crypto symbols and
         StockHistoricalDataClient for equity symbols.  Both result sets are
         cast to the identical Polars schema before injection.
+
+        Daemon mode:
+            Bypasses the Rich Progress context entirely.  Progress is reported
+            via logger.info() — one log line per symbol completion — so journald
+            receives clean, parseable text without ANSI escape sequences.
         """
         logger.info(
             "Starting aggregator warm-up | stocks=%s | crypto=%s",
@@ -1197,6 +1247,92 @@ class LiveOrchestrator:
 
         end_time = datetime.now(timezone.utc)
 
+        if self._daemon_mode:
+            # ------------------------------------------------------------------
+            # Headless path — no Rich Progress; raw logger.info() for status.
+            # ------------------------------------------------------------------
+            crypto_pd = None
+            if self._crypto_symbols:
+                logger.info(
+                    "Warm-up: fetching crypto history (%d symbols)...",
+                    len(self._crypto_symbols),
+                )
+                crypto_pd = await self._fetch_crypto_history(end_time, progress=None)
+
+            stock_pd = None
+            if self._stock_symbols:
+                logger.info(
+                    "Warm-up: fetching stock history (%d symbols)...",
+                    len(self._stock_symbols),
+                )
+                stock_pd = await self._fetch_stock_history(end_time, progress=None)
+
+            for idx, symbol in enumerate(self._symbols, start=1):
+                ctx = self._contexts[symbol]
+                raw_pd = crypto_pd if ctx.is_crypto else stock_pd
+
+                if raw_pd is None or raw_pd.empty:
+                    logger.warning("[%s] No warm-up data available — skipping.", symbol)
+                    continue
+
+                try:
+                    sym_pd = raw_pd.loc[symbol].copy()
+                except KeyError:
+                    logger.warning("[%s] No warm-up data returned — skipping.", symbol)
+                    continue
+
+                if sym_pd.empty:
+                    logger.warning("[%s] Empty warm-up slice — skipping.", symbol)
+                    continue
+
+                sym_pd = sym_pd.reset_index()
+
+                try:
+                    pl_cast_schema = {
+                        "timestamp": pl.Datetime(time_unit="us", time_zone="UTC"),
+                        "open": pl.Float64,
+                        "high": pl.Float64,
+                        "low": pl.Float64,
+                        "close": pl.Float64,
+                        "volume": pl.Float64,
+                    }
+                    sym_pd = sym_pd[list(pl_cast_schema.keys())]
+                    pl_df = pl.from_pandas(sym_pd).cast(pl_cast_schema)
+                except Exception as exc:
+                    logger.warning(
+                        "[%s] Polars conversion failed — skipping: %s", symbol, exc
+                    )
+                    continue
+
+                bars_injected = 0
+                for row in pl_df.iter_rows(named=True):
+                    bar_dict = {
+                        "timestamp": row["timestamp"],
+                        "open": row["open"],
+                        "high": row["high"],
+                        "low": row["low"],
+                        "close": row["close"],
+                        "volume": row["volume"],
+                    }
+                    ctx.aggregator.add_bar(bar_dict)
+                    bars_injected += 1
+
+                history_len = len(ctx.aggregator.history_df)
+                logger.info(
+                    "[+] Warmed %s (%d/%d) | %d bars injected -> %d candles ready.",
+                    symbol,
+                    idx,
+                    len(self._symbols),
+                    bars_injected,
+                    history_len,
+                )
+
+            logger.info("Aggregator warm-up complete.")
+            return
+
+        # ----------------------------------------------------------------------
+        # Interactive path — Rich Progress bar display
+        # ----------------------------------------------------------------------
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -1319,7 +1455,9 @@ class LiveOrchestrator:
 
         logger.info("Aggregator warm-up complete.")
 
-    async def _fetch_crypto_history(self, end_time, progress) -> object:
+    async def _fetch_crypto_history(
+        self, end_time, progress: Optional[Progress] = None
+    ) -> object:
         """Fetch historical 1-min bars for all crypto symbols."""
         hist_client = CryptoHistoricalDataClient(
             api_key=self._api_key,
@@ -1345,7 +1483,9 @@ class LiveOrchestrator:
             logger.warning("Crypto warm-up REST failed — crypto starts cold: %s", exc)
             return None
 
-    async def _fetch_stock_history(self, end_time, progress) -> object:
+    async def _fetch_stock_history(
+        self, end_time, progress: Optional[Progress] = None
+    ) -> object:
         """Fetch historical 1-min bars for all stock symbols."""
         hist_client = StockHistoricalDataClient(
             api_key=self._api_key,
@@ -1503,14 +1643,38 @@ DEFAULT_SYMBOLS: List[str] = [
 # ---------------------------------------------------------------------------
 
 
-def setup_logging():
-    """Configure Rich logging handler for beautiful console output."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(message)s",
-        datefmt="[%X]",
-        handlers=[RichHandler(rich_tracebacks=True, markup=True)],
-    )
+def setup_logging(daemon_mode: bool = False) -> None:
+    """
+    Configure logging for the orchestrator.
+
+    daemon_mode=False (default / interactive):
+        Uses RichHandler for a colourised, formatted terminal display.
+
+    daemon_mode=True (systemd / headless):
+        Uses a plain StreamHandler(sys.stdout) with a timestamped format
+        that journald can parse cleanly.  Rich escape sequences and the
+        alternate-screen buffer are never touched so journalctl -f is
+        always human-readable.
+    """
+    if daemon_mode:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(
+            logging.Formatter(
+                fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+                datefmt="%Y-%m-%dT%H:%M:%S",
+            )
+        )
+        logging.basicConfig(
+            level=logging.INFO,
+            handlers=[handler],
+        )
+    else:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(message)s",
+            datefmt="[%X]",
+            handlers=[RichHandler(rich_tracebacks=True, markup=True)],
+        )
 
 
 logger = logging.getLogger(__name__)
