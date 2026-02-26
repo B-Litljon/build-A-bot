@@ -794,8 +794,10 @@ class LiveOrchestrator:
                 "vol_rel",
             ]
 
-            # Drop any rows that still have NaN (warmup artefacts from TA-Lib)
-            features_df = features_df.drop_nulls(subset=ml_feature_names)
+            # Drop any rows containing Nulls, NaNs, or Infinities to prevent model crashes
+            features_df = features_df.filter(
+                pl.all_horizontal(pl.col(ml_feature_names).is_finite())
+            )
 
             if len(features_df) == 0:
                 logger.debug("[%s] All rows null after feature drop — skip.", symbol)
