@@ -37,6 +37,15 @@ class NotificationManager:
         else:
             description += f"📊 **Confidence:** {signal.confidence * 100:.1f}%\n"
 
+        # Append Stop Loss and Take Profit for Entry alerts
+        if (
+            action == "ENTRY"
+            and "sl_price" in signal.metadata
+            and "tp_price" in signal.metadata
+        ):
+            description += f"\n🛑 **Stop Loss:** ${signal.metadata['sl_price']:.4f}\n"
+            description += f"🚀 **Take Profit:** ${signal.metadata['tp_price']:.4f}\n"
+
         payload = {
             "username": "Build-A-Bot Executive",
             "embeds": [
