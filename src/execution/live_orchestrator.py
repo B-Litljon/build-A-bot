@@ -27,12 +27,17 @@ Architecture: asyncio.to_thread concurrency + Rich Dashboard
   [SymbolState guard — asyncio.Lock]       ← FLAT required; → PENDING
        │
        ▼
-  asyncio.to_thread(_submit_bracket)       ← REST call offloaded to thread pool
-       │
-  TradingStream (async WebSocket)
-       │ fill / cancel / closed events
-       ▼
-  _on_trade_update → SymbolState machine   ← PENDING→IN_TRADE→COOLING(5m)→FLAT
+   asyncio.to_thread(_submit_entry_order)    ← REST call offloaded to thread pool
+        │                                     Crypto: plain market buy (no bracket)
+        │                                     Equity: full bracket (OTO TP + SL)
+        ▼
+   [Crypto Watchdog Loop]                    ← 1s poll; monitors SL/TP for crypto
+        │ breach detected → _submit_manual_exit
+        ▼
+   TradingStream (async WebSocket)
+        │ fill / cancel / closed events
+        ▼
+   _on_trade_update → SymbolState machine   ← PENDING→IN_TRADE→PENDING_EXIT→COOLING(5m)→FLAT
 
 Dashboard Features:
   - Live Header with Bot Name, Environment, and Clock
@@ -171,6 +176,7 @@ class SymbolState(Enum):
     FLAT = auto()  # No position; eligible for new signals
     PENDING = auto()  # Order submitted; awaiting fill confirmation
     IN_TRADE = auto()  # Position filled; bracket orders active
+    PENDING_EXIT = auto()  # Watchdog triggered exit; awaiting sell fill
     COOLING = auto()  # Bracket resolved; cooling-off timer running
 
 
@@ -204,6 +210,12 @@ class SymbolContext:
         # Filled entry price used for bracket SL/TP calculation
         self.entry_price: Optional[float] = None
         self.entry_qty: Optional[float] = None
+
+        # Watchdog exit targets — set at signal time, consumed by
+        # _crypto_watchdog_loop for crypto symbols (equities use native
+        # Alpaca bracket legs).
+        self.sl_price: Optional[float] = None
+        self.tp_price: Optional[float] = None
 
         # Handle to the cooling timer so we can cancel it on shutdown
         self._cooling_task: Optional[asyncio.Task] = None
@@ -435,6 +447,7 @@ class LiveOrchestrator:
                 SymbolState.FLAT: "dim",
                 SymbolState.PENDING: "yellow",
                 SymbolState.IN_TRADE: "green",
+                SymbolState.PENDING_EXIT: "bright_magenta",
                 SymbolState.COOLING: "red",
             }
             state_style = state_colors.get(ctx.state, "white")
@@ -544,12 +557,17 @@ class LiveOrchestrator:
         # Always run the clock refresh loop
         stream_tasks.append(self._clock_refresh_loop())
 
+        # Crypto watchdog — software SL/TP polling for crypto positions
+        if self._crypto_symbols:
+            stream_tasks.append(self._crypto_watchdog_loop())
+
         logger.info(
             "WebSocket subscriptions registered | "
-            "streams=%d (crypto=%s, stock=%s, trade=1) — starting.",
+            "streams=%d (crypto=%s, stock=%s, trade=1, watchdog=%s) — starting.",
             len(stream_tasks),
             bool(self._crypto_symbols),
             bool(self._stock_symbols),
+            bool(self._crypto_symbols),
         )
 
         # Start dashboard
@@ -703,6 +721,12 @@ class LiveOrchestrator:
             return
 
         ctx = self._contexts[symbol]
+
+        # -- Freshest tick for the watchdog ---------------------------------
+        # Always update last_price so _crypto_watchdog_loop has a recent
+        # quote even when inference isn't triggered (warming up, clock-gated,
+        # or bar not yet sealed).
+        ctx.last_price = float(bar.close)
 
         # -- Smart Clock Gate -----------------------------------------------
         # Crypto: always proceed (24/7).
@@ -961,8 +985,13 @@ class LiveOrchestrator:
             ctx.state = SymbolState.PENDING
             ctx.last_client_order_id = client_order_id
 
-        # Lock released — submit the bracket order off-thread
-        logger.info("[%s] State -> PENDING | submitting bracket order.", symbol)
+            # Persist bracket targets so the crypto watchdog can monitor
+            # exits independently of Alpaca's (equity-only) bracket legs.
+            ctx.sl_price = sig.metadata["sl_price"]
+            ctx.tp_price = sig.metadata["tp_price"]
+
+        # Lock released — submit the entry order off-thread
+        logger.info("[%s] State -> PENDING | submitting entry order.", symbol)
         self._log_activity(
             symbol,
             f"Signal detected (conviction: {sig.confidence:.4f})",
@@ -970,7 +999,7 @@ class LiveOrchestrator:
         )
 
         success = await asyncio.to_thread(
-            self._submit_bracket_order,
+            self._submit_entry_order,
             sig,
             client_order_id,
         )
@@ -980,27 +1009,58 @@ class LiveOrchestrator:
             async with ctx.lock:
                 ctx.state = SymbolState.FLAT
                 ctx.last_client_order_id = None
-            logger.warning("[%s] Bracket submission failed — state -> FLAT.", symbol)
-            self._log_activity(symbol, "Bracket submission failed", "error")
+                ctx.sl_price = None
+                ctx.tp_price = None
+            logger.warning("[%s] Entry submission failed — state -> FLAT.", symbol)
+            self._log_activity(symbol, "Entry submission failed", "error")
 
     # -----------------------------------------------------------------------
     # Order submission (runs in thread pool)
     # -----------------------------------------------------------------------
 
-    def _submit_bracket_order(self, sig: Signal, client_order_id: str) -> bool:
+    def _submit_entry_order(self, sig: Signal, client_order_id: str) -> bool:
         """
-        Submit a bracket (market entry + OTO take-profit + stop-loss) order
-        to Alpaca.
+        Submit an entry order to Alpaca.
+
+        - **Equities:** Full bracket (market entry + OTO take-profit + stop-loss).
+        - **Crypto:** Plain market buy (no ``order_class``).  SL/TP are managed
+          by ``_crypto_watchdog_loop`` because Alpaca rejects advanced order
+          classes for crypto assets.
 
         Called via asyncio.to_thread; must NOT call any asyncio primitives.
 
-        Returns True on success, False on any exception.
+        Returns True on success, False on any exception (including the
+        slippage-inversion guard).
         """
         symbol = sig.symbol
         sl_price: float = sig.metadata["sl_price"]
         tp_price: float = sig.metadata["tp_price"]
 
         try:
+            # ----------------------------------------------------------------
+            # Slippage / Inversion Guard
+            # ----------------------------------------------------------------
+            # After high slippage the fill price can move so close to one of
+            # the bracket legs that the TP is effectively <= entry or the SL
+            # is effectively >= entry.  Reject the trade early.
+            if tp_price <= sig.price * 1.001:
+                logger.warning(
+                    "[%s] Slippage guard: TP=%.4f <= entry*1.001=%.4f — aborting.",
+                    symbol,
+                    tp_price,
+                    sig.price * 1.001,
+                )
+                return False
+
+            if sl_price >= sig.price * 0.999:
+                logger.warning(
+                    "[%s] Slippage guard: SL=%.4f >= entry*0.999=%.4f — aborting.",
+                    symbol,
+                    sl_price,
+                    sig.price * 0.999,
+                )
+                return False
+
             # ----------------------------------------------------------------
             # Position sizing: 2% of account equity at risk
             # ----------------------------------------------------------------
@@ -1020,9 +1080,13 @@ class LiveOrchestrator:
             qty: float = risk_dollars / risk_per_share
             qty = max(round(qty, 4), 0.0001)  # Alpaca fractional floor
 
+            is_crypto = self._is_crypto(symbol)
+            tif = TimeInForce.GTC if is_crypto else TimeInForce.DAY
+
             logger.info(
-                "[%s] Bracket order | equity=%.2f | risk=$%.2f | "
-                "qty=%.4f | entry~%.2f | SL=%.4f | TP=%.4f | id=%s",
+                "[%s] Entry order | equity=%.2f | risk=$%.2f | "
+                "qty=%.4f | entry~%.2f | SL=%.4f | TP=%.4f | id=%s | "
+                "mode=%s",
                 symbol,
                 equity,
                 risk_dollars,
@@ -1031,38 +1095,49 @@ class LiveOrchestrator:
                 sl_price,
                 tp_price,
                 client_order_id,
+                "CRYPTO-WATCHDOG" if is_crypto else "BRACKET",
             )
 
             # ----------------------------------------------------------------
-            # Bracket order: market entry with OTO TP + SL legs
-            # Crypto uses GTC; equities use DAY.
+            # Branch: Crypto → plain market buy | Equity → full bracket
             # ----------------------------------------------------------------
-            is_crypto = self._is_crypto(symbol)
-            tif = TimeInForce.GTC if is_crypto else TimeInForce.DAY
-
-            order_request = MarketOrderRequest(
-                symbol=symbol,
-                qty=qty,
-                side=OrderSide.BUY,
-                time_in_force=tif,
-                client_order_id=client_order_id,
-                order_class="bracket",
-                take_profit=TakeProfitRequest(limit_price=round(tp_price, 2)),
-                stop_loss=StopLossRequest(stop_price=round(sl_price, 2)),
-            )
+            if is_crypto:
+                # Alpaca rejects order_class="bracket" for crypto.
+                # SL/TP are monitored by _crypto_watchdog_loop instead.
+                order_request = MarketOrderRequest(
+                    symbol=symbol,
+                    qty=qty,
+                    side=OrderSide.BUY,
+                    time_in_force=tif,
+                    client_order_id=client_order_id,
+                )
+            else:
+                # Equities — native Alpaca bracket with OTO TP + SL legs
+                order_request = MarketOrderRequest(
+                    symbol=symbol,
+                    qty=qty,
+                    side=OrderSide.BUY,
+                    time_in_force=tif,
+                    client_order_id=client_order_id,
+                    order_class="bracket",
+                    take_profit=TakeProfitRequest(limit_price=round(tp_price, 2)),
+                    stop_loss=StopLossRequest(stop_price=round(sl_price, 2)),
+                )
 
             order = self._trading_client.submit_order(order_request)
             order_id = str(getattr(order, "id", "unknown"))
 
+            mode_label = "Crypto entry" if is_crypto else "Bracket"
             logger.info(
-                "[%s] Bracket submitted | alpaca_order_id=%s | client_id=%s",
+                "[%s] %s submitted | alpaca_order_id=%s | client_id=%s",
                 symbol,
+                mode_label,
                 order_id,
                 client_order_id,
             )
             self._log_activity(
                 symbol,
-                f"Bracket submitted | Qty: {qty:.4f} | SL: ${sl_price:.2f} "
+                f"{mode_label} submitted | Qty: {qty:.4f} | SL: ${sl_price:.2f} "
                 f"| TP: ${tp_price:.2f}",
                 "success",
             )
@@ -1074,13 +1149,13 @@ class LiveOrchestrator:
 
         except Exception as exc:
             logger.error(
-                "[%s] Bracket order submission failed: %s",
+                "[%s] Entry order submission failed: %s",
                 symbol,
                 exc,
                 exc_info=True,
             )
             self._notifier.send_system_message(
-                f"[LiveOrchestrator][{symbol}] Bracket order FAILED: {exc}"
+                f"[LiveOrchestrator][{symbol}] Entry order FAILED: {exc}"
             )
             return False
 
@@ -1150,10 +1225,13 @@ class LiveOrchestrator:
                     if ctx.state in (
                         SymbolState.PENDING,
                         SymbolState.IN_TRADE,
+                        SymbolState.PENDING_EXIT,
                     ):
                         ctx.state = SymbolState.FLAT
                         ctx.entry_price = None
                         ctx.entry_qty = None
+                        ctx.sl_price = None
+                        ctx.tp_price = None
                         logger.info(
                             "[%s] State -> FLAT | reason=%s",
                             symbol,
@@ -1162,16 +1240,151 @@ class LiveOrchestrator:
                         self._log_activity(symbol, f"Order {event_type}", "warning")
 
             # ----------------------------------------------------------------
-            # Bracket TP/SL hit — child SELL fill while IN_TRADE -> COOLING
+            # Bracket TP/SL hit (equity) or watchdog exit fill (crypto)
+            # — SELL fill while IN_TRADE or PENDING_EXIT -> COOLING
             # ----------------------------------------------------------------
             elif event_type == "fill":
                 order_side: str = str(getattr(order, "side", "")).upper()
                 async with ctx.lock:
-                    if ctx.state == SymbolState.IN_TRADE and order_side == "SELL":
+                    if (
+                        ctx.state in (SymbolState.IN_TRADE, SymbolState.PENDING_EXIT)
+                        and order_side == "SELL"
+                    ):
                         await self._enter_cooling(ctx)
 
         except Exception as exc:
             logger.error("Error in _on_trade_update: %s", exc, exc_info=True)
+
+    # -----------------------------------------------------------------------
+    # Crypto Watchdog — software SL/TP for assets that reject brackets
+    # -----------------------------------------------------------------------
+
+    async def _crypto_watchdog_loop(self) -> None:
+        """
+        Background coroutine that polls crypto positions once per second
+        and fires a market sell when ``last_price`` breaches the stored
+        SL or TP level.
+
+        This replaces the native Alpaca bracket legs that are unavailable
+        for crypto order classes.  Equity positions are unaffected — their
+        OTO legs are managed server-side by Alpaca.
+
+        The loop runs for the lifetime of the orchestrator and is added
+        to the ``stream_tasks`` gather in ``run()``.
+        """
+        logger.info("Crypto watchdog started — polling every 1s.")
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                break
+
+            for ctx in self._contexts.values():
+                # Only monitor crypto symbols that are actively in a trade
+                if not ctx.is_crypto:
+                    continue
+                if ctx.state != SymbolState.IN_TRADE:
+                    continue
+                if (
+                    ctx.last_price is None
+                    or ctx.tp_price is None
+                    or ctx.sl_price is None
+                ):
+                    continue
+
+                # Check TP / SL breach
+                tp_hit = ctx.last_price >= ctx.tp_price
+                sl_hit = ctx.last_price <= ctx.sl_price
+
+                if not (tp_hit or sl_hit):
+                    continue
+
+                reason = "TP" if tp_hit else "SL"
+
+                # Acquire lock and verify state hasn't been changed by
+                # another coroutine between the check above and now.
+                async with ctx.lock:
+                    if ctx.state != SymbolState.IN_TRADE:
+                        continue  # Another path already transitioned — skip
+                    ctx.state = SymbolState.PENDING_EXIT
+                    exit_qty = ctx.entry_qty
+
+                logger.info(
+                    "[%s] Crypto watchdog %s breach | price=%.4f | "
+                    "tp=%.4f | sl=%.4f — submitting manual exit.",
+                    ctx.symbol,
+                    reason,
+                    ctx.last_price,
+                    ctx.tp_price,
+                    ctx.sl_price,
+                )
+                self._log_activity(
+                    ctx.symbol,
+                    f"Watchdog {reason} hit @ ${ctx.last_price:,.2f}",
+                    "warning" if reason == "SL" else "success",
+                )
+
+                # Fire-and-forget the blocking REST call on a thread
+                asyncio.create_task(
+                    asyncio.to_thread(self._submit_manual_exit, ctx.symbol, exit_qty)
+                )
+
+        logger.info("Crypto watchdog stopped.")
+
+    def _submit_manual_exit(self, symbol: str, qty: Optional[float]) -> bool:
+        """
+        Submit a market SELL to close a crypto position.
+
+        Called via ``asyncio.to_thread`` from the watchdog; must NOT call
+        any asyncio primitives.
+
+        Returns True on success, False on error.  The subsequent fill event
+        on TradingStream will drive ``PENDING_EXIT → COOLING`` via
+        ``_on_trade_update``.
+        """
+        try:
+            if qty is None or qty <= 0:
+                logger.error("[%s] Manual exit aborted — invalid qty=%s.", symbol, qty)
+                return False
+
+            order_request = MarketOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=OrderSide.SELL,
+                time_in_force=TimeInForce.GTC,
+            )
+
+            order = self._trading_client.submit_order(order_request)
+            order_id = str(getattr(order, "id", "unknown"))
+
+            logger.info(
+                "[%s] Manual exit submitted | qty=%.4f | alpaca_order_id=%s",
+                symbol,
+                qty,
+                order_id,
+            )
+            self._log_activity(
+                symbol,
+                f"Manual exit submitted | Qty: {qty:.4f}",
+                "info",
+            )
+
+            self._notifier.send_system_message(
+                f"[{symbol}] Crypto watchdog exit submitted | qty={qty:.4f}"
+            )
+            return True
+
+        except Exception as exc:
+            logger.error(
+                "[%s] Manual exit submission failed: %s",
+                symbol,
+                exc,
+                exc_info=True,
+            )
+            self._notifier.send_system_message(
+                f"[LiveOrchestrator][{symbol}] Manual exit FAILED: {exc}"
+            )
+            return False
 
     # -----------------------------------------------------------------------
     # Cooling-off logic
@@ -1192,6 +1405,8 @@ class LiveOrchestrator:
         ctx.state = SymbolState.COOLING
         ctx.entry_price = None
         ctx.entry_qty = None
+        ctx.sl_price = None
+        ctx.tp_price = None
 
         logger.info("[%s] State -> COOLING | reset in %ds.", symbol, COOLING_SECONDS)
         self._log_activity(

@@ -35,7 +35,8 @@ Defines the four lifecycle states for a single symbol's trading slot.
 |---|---|
 | `FLAT` | No position; eligible for new signals. |
 | `PENDING` | Order submitted to Alpaca; awaiting fill confirmation from TradingStream. |
-| `IN_TRADE` | Position filled; bracket TP/SL legs are active on the exchange. |
+| `IN_TRADE` | Position filled; bracket TP/SL legs are active on the exchange (equities) or monitored by the crypto watchdog (crypto). |
+| `PENDING_EXIT` | Watchdog (or manual trigger) has fired a market sell; awaiting sell-side fill confirmation before entering COOLING. Prevents double-fire. |
 | `COOLING` | Bracket resolved (TP or SL hit); 5-minute cooldown timer running before re-entry is allowed. |
 
 ---
@@ -54,6 +55,8 @@ Holds all mutable runtime state for a single tracked symbol — one instance per
 | `last_client_order_id` | `Optional[str]` | Deduplication — stores the most recent bracket entry's client order ID to prevent double-submission on the same bar. |
 | `entry_price` | `Optional[float]` | The filled average price of the current position (set by `_on_trade_update`). |
 | `entry_qty` | `Optional[float]` | The filled quantity (set by `_on_trade_update`). |
+| `sl_price` | `Optional[float]` | Stop-loss target price, set at signal time inside `_handle_signal`. Consumed by `_crypto_watchdog_loop` for crypto; equity bracket legs are server-side. |
+| `tp_price` | `Optional[float]` | Take-profit target price, set at signal time inside `_handle_signal`. Consumed by `_crypto_watchdog_loop` for crypto; equity bracket legs are server-side. |
 | `_cooling_task` | `Optional[asyncio.Task]` | Handle to the cooling timer coroutine so it can be cancelled on shutdown. |
 | `last_price` | `Optional[float]` | Most recent close price, used for dashboard display. |
 | `last_atr` | `Optional[float]` | Most recent NATR-14 value, used for dashboard display and kill switch evaluation. |
@@ -68,12 +71,14 @@ The async daemon that drives live paper-trading. Supports dual-stream operation:
 | Method | Purpose |
 |---|---|
 | `__init__(symbols, api_key, secret_key, paper, angel_model_path, devil_model_path, daemon_mode)` | Initialises all sub-components: `MLStrategy`, `FeatureEngineer`, `NotificationManager`, `TradingClient`, per-symbol `SymbolContext` dict, and stream placeholders. |
-| `run()` | Main entry-point: registers SIGTERM/SIGINT handlers, refreshes market clock, warms up aggregators, subscribes WebSocket streams, starts the dashboard loop, then blocks on `asyncio.gather()` until shutdown. |
+| `run()` | Main entry-point: registers SIGTERM/SIGINT handlers, refreshes market clock, warms up aggregators, subscribes WebSocket streams, launches `_crypto_watchdog_loop` (if crypto symbols present), starts the dashboard loop, then blocks on `asyncio.gather()` until shutdown. |
 | `_on_bar(bar)` | Shared callback for both stock and crypto streams — ingests a raw 1-min bar, applies the smart clock gate (equity bars blocked outside RTH; crypto always passes), feeds bar to aggregator, and kicks off `_run_inference` off-thread if enough history exists. |
 | `_run_inference(symbol, history_df)` | CPU-bound inference executed via `asyncio.to_thread` — validates schema, computes TA-Lib indicators via `FeatureEngineer`, checks ATR kill switch, runs Angel Stage 1 then Devil Stage 2, and returns a `Signal` on joint approval or `None`. |
-| `_handle_signal(ctx, sig)` | Gates the signal through the `SymbolState` machine (must be FLAT), generates a unique `client_order_id`, transitions to PENDING, and calls `_submit_bracket_order` off-thread. |
-| `_submit_bracket_order(sig, client_order_id)` | Submits a market entry with OTO bracket (TP + SL) to Alpaca REST API — calculates position size from 2% account risk, selects TIF (GTC for crypto, DAY for equities). |
-| `_on_trade_update(data)` | Drives `SymbolState` transitions from Alpaca order lifecycle WebSocket events — `fill`/`partial_fill` -> IN_TRADE, `canceled`/`expired`/`rejected` -> FLAT, sell-side `fill` while IN_TRADE -> COOLING. |
+| `_handle_signal(ctx, sig)` | Gates the signal through the `SymbolState` machine (must be FLAT), generates a unique `client_order_id`, transitions to PENDING, persists `sl_price`/`tp_price` on `ctx`, and calls `_submit_entry_order` off-thread. |
+| `_submit_entry_order(sig, client_order_id)` | Submits an entry order to Alpaca REST API — applies slippage/inversion guard, calculates position size from 2% account risk. **Crypto:** plain `MarketOrderRequest` (no bracket). **Equity:** full bracket with OTO TP + SL. Selects TIF (GTC for crypto, DAY for equities). |
+| `_on_trade_update(data)` | Drives `SymbolState` transitions from Alpaca order lifecycle WebSocket events — `fill`/`partial_fill` -> IN_TRADE, `canceled`/`expired`/`rejected` -> FLAT, sell-side `fill` while IN_TRADE or PENDING_EXIT -> COOLING. |
+| `_crypto_watchdog_loop()` | Background async coroutine that polls all crypto `SymbolContext` instances once per second. When `last_price` breaches `tp_price` or `sl_price` while state is IN_TRADE, transitions to PENDING_EXIT and fires `_submit_manual_exit` off-thread. |
+| `_submit_manual_exit(symbol, qty)` | Submits a `MarketOrderRequest(side=SELL, time_in_force=GTC)` to close a crypto position. Called via `asyncio.to_thread` from the watchdog. The subsequent fill drives `PENDING_EXIT -> COOLING` through `_on_trade_update`. |
 | `_enter_cooling(ctx)` | Transitions symbol to COOLING and schedules `_reset_after_cooling` as an async task. |
 | `_reset_after_cooling(ctx)` | Sleeps for `COOLING_SECONDS` (300s / 5min), then returns the symbol to FLAT. |
 | `_warmup_aggregator()` | Pre-loads each symbol's `LiveBarAggregator` with the last 60 one-minute bars from Alpaca REST so SMA-50 and all indicators are ready on first live bar. |
@@ -327,15 +332,17 @@ The transmission converts signals into real Alpaca orders and manages position l
 
 ### Live Execution (LiveOrchestrator)
 
-**Where bracket orders are submitted:**
-`src/execution/live_orchestrator.py` -> `LiveOrchestrator._submit_bracket_order(sig, client_order_id)`
+**Where entry orders are submitted:**
+`src/execution/live_orchestrator.py` -> `LiveOrchestrator._submit_entry_order(sig, client_order_id)`
 
 This method:
-1. Queries `TradingClient.get_account()` to get current equity.
-2. Calculates `risk_dollars = equity * 0.02` (2% risk per trade).
-3. Calculates `qty = risk_dollars / (entry_price - sl_price)`.
-4. Submits a `MarketOrderRequest` with `order_class="bracket"`, `TakeProfitRequest(limit_price=tp_price)`, and `StopLossRequest(stop_price=sl_price)`.
-5. Uses `TimeInForce.GTC` for crypto, `TimeInForce.DAY` for equities.
+1. **Slippage / Inversion Guard:** Rejects the trade if `tp_price <= entry * 1.001` or `sl_price >= entry * 0.999`.
+2. Queries `TradingClient.get_account()` to get current equity.
+3. Calculates `risk_dollars = equity * 0.02` (2% risk per trade).
+4. Calculates `qty = risk_dollars / (entry_price - sl_price)`.
+5. **Crypto branch:** Submits a plain `MarketOrderRequest` (no `order_class`, no SL/TP legs). SL/TP are monitored by `_crypto_watchdog_loop`.
+6. **Equity branch:** Submits a `MarketOrderRequest` with `order_class="bracket"`, `TakeProfitRequest(limit_price=tp_price)`, and `StopLossRequest(stop_price=sl_price)`.
+7. Uses `TimeInForce.GTC` for crypto, `TimeInForce.DAY` for equities.
 
 **Where stop-loss and take-profit are calculated:**
 `src/execution/live_orchestrator.py` -> `LiveOrchestrator._run_inference()`, inside the Signal metadata:
@@ -345,13 +352,28 @@ tp_price = current_price + (TP_ATR_MULTIPLIER * atr_abs)   # 3.0x ATR above entr
 ```
 Where `atr_abs = (natr_14 / 100) * current_price` (converting percentage NATR to absolute ATR).
 
+These values are persisted on `SymbolContext.sl_price` and `SymbolContext.tp_price` inside `_handle_signal` so the crypto watchdog can access them.
+
+**Where crypto exits are managed (software SL/TP):**
+`src/execution/live_orchestrator.py` -> `LiveOrchestrator._crypto_watchdog_loop()`
+
+This async coroutine:
+1. Polls all crypto `SymbolContext` instances every 1 second.
+2. If `ctx.last_price >= ctx.tp_price` or `ctx.last_price <= ctx.sl_price` while state is `IN_TRADE`:
+   - Acquires `ctx.lock`, verifies state is still `IN_TRADE`, transitions to `PENDING_EXIT`.
+   - Fires `_submit_manual_exit(symbol, qty)` off-thread via `asyncio.create_task(asyncio.to_thread(...))`.
+
+`src/execution/live_orchestrator.py` -> `LiveOrchestrator._submit_manual_exit(symbol, qty)`
+
+Submits a `MarketOrderRequest(side=SELL, time_in_force=GTC)` to close the crypto position. The fill event from TradingStream drives `PENDING_EXIT -> COOLING` through `_on_trade_update`.
+
 **Where trade_updates are intercepted:**
 `src/execution/live_orchestrator.py` -> `LiveOrchestrator._on_trade_update(data)`
 
 This method drives the authoritative state machine:
 - `fill` / `partial_fill` event -> PENDING to IN_TRADE (records fill price and qty).
-- `canceled` / `expired` / `rejected` event -> resets to FLAT.
-- Sell-side `fill` while IN_TRADE -> enters COOLING via `_enter_cooling()`.
+- `canceled` / `expired` / `rejected` event -> resets to FLAT (from PENDING, IN_TRADE, or PENDING_EXIT).
+- Sell-side `fill` while IN_TRADE or PENDING_EXIT -> enters COOLING via `_enter_cooling()`.
 
 ---
 
@@ -756,14 +778,19 @@ Bash script that automates the full OOS testing pipeline with colored terminal o
                                               SymbolState == FLAT?
                                                          │ yes
                                                          ▼
-                                              _submit_bracket_order()
-                                              (Market + OTO TP/SL)
-                                                         │
-    Alpaca TradingStream ────────> _on_trade_update()
-                                         │
-                                   fill ──> IN_TRADE
-                                   sell fill ──> COOLING (5min) ──> FLAT
-                                   cancel/reject ──> FLAT
+                                               _submit_entry_order()
+                                          ┌────── Equity: bracket (OTO TP/SL)
+                                          └────── Crypto: plain market buy
+                                                          │
+     _crypto_watchdog_loop() ──────────> [1s poll crypto IN_TRADE]
+          │ TP/SL breach                         │
+          └──> PENDING_EXIT ──> _submit_manual_exit()
+                                                  │
+     Alpaca TradingStream ────────> _on_trade_update()
+                                          │
+                                    fill ──> IN_TRADE
+                                    sell fill (IN_TRADE|PENDING_EXIT) ──> COOLING (5min) ──> FLAT
+                                    cancel/reject ──> FLAT
 ```
 
 ```
