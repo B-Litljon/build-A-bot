@@ -1062,10 +1062,13 @@ class LiveOrchestrator:
                 return False
 
             # ----------------------------------------------------------------
-            # Position sizing: 2% of account equity at risk
+            # Position sizing: 2% of account equity at risk + Notional Guards
             # ----------------------------------------------------------------
             account = self._trading_client.get_account()
             equity: float = float(account.equity)
+            buying_power: float = float(account.buying_power)
+            cash: float = float(account.cash)
+
             risk_dollars: float = equity * ACCOUNT_RISK_PER_TRADE
             risk_per_share: float = sig.price - sl_price
 
@@ -1078,9 +1081,35 @@ class LiveOrchestrator:
                 return False
 
             qty: float = risk_dollars / risk_per_share
-            qty = max(round(qty, 4), 0.0001)  # Alpaca fractional floor
+            intended_notional: float = qty * sig.price
 
             is_crypto = self._is_crypto(symbol)
+
+            # --- HOTFIX v2: Margin vs Cash Bounds Guard ---
+            # Crypto is strictly non-marginable on Alpaca; we must cap by available cash.
+            # Equities can utilize the standard buying_power.
+            max_notional = (cash * 0.95) if is_crypto else (buying_power * 0.95)
+            min_notional = 2.0  # Safe floor above Alpaca's $1.00 minimum
+
+            if intended_notional > max_notional:
+                cap_type = "Cash" if is_crypto else "Buying Power"
+                logger.warning(
+                    "[%s] Tight SL created massive notional ($%.2f). Capping to %s ($%.2f).",
+                    symbol,
+                    intended_notional,
+                    cap_type,
+                    max_notional,
+                )
+                qty = max_notional / sig.price
+            elif intended_notional < min_notional:
+                logger.warning(
+                    "[%s] Wide SL created tiny notional ($%.2f). Aborting (Alpaca min is $1.00).",
+                    symbol,
+                    intended_notional,
+                )
+                return False
+
+            qty = max(round(qty, 4), 0.0001)  # Alpaca fractional floor
             tif = TimeInForce.GTC if is_crypto else TimeInForce.DAY
 
             logger.info(
