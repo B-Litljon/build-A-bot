@@ -45,6 +45,8 @@ class NotificationManager:
         ):
             description += f"\n🛑 **Stop Loss:** ${signal.metadata['sl_price']:.4f}\n"
             description += f"🚀 **Take Profit:** ${signal.metadata['tp_price']:.4f}\n"
+            if "expected_pct_growth" in signal.metadata:
+                description += f"📈 **Projected Growth:** {signal.metadata['expected_pct_growth']:.2f}%\n"
 
         payload = {
             "username": "Build-A-Bot Executive",
