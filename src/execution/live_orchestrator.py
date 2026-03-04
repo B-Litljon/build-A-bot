@@ -1171,6 +1171,12 @@ class LiveOrchestrator:
                 "success",
             )
 
+            # Inject execution context for Discord alert
+            sig.metadata["qty"] = qty
+            sig.metadata["expected_pct_growth"] = (
+                (tp_price - sig.price) / sig.price
+            ) * 100
+
             # Notify Discord
             self._notifier.send_trade_alert(sig, action="ENTRY")
 

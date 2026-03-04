@@ -1,0 +1,24 @@
+[0;1;32m●[0m universal-scalper.service - Universal Scalper v3.1 Daemon
+     Loaded: loaded (]8;;file://seraphim/home/tha_magick_man/.config/systemd/user/universal-scalper.service\/home/tha_magick_man/.config/systemd/user/universal-scalper.service]8;;\; [0;1;32menabled[0m; preset: [0;1;38:5:185mdisabled[0m)
+    Drop-In: /usr/lib/systemd/user/service.d
+             └─]8;;file://seraphim/usr/lib/systemd/user/service.d/10-timeout-abort.conf\10-timeout-abort.conf]8;;\
+     Active: [0;1;32mactive (running)[0m since Mon 2026-03-02 00:14:03 PST; 1 day 23h ago
+ Invocation: 92a736c2c5ca4f829df4d82df1cc0190
+       Docs: ]8;;https://github.com/anomalyco/opencode\https://github.com/anomalyco/opencode]8;;\
+   Main PID: 10240 (python)
+      Tasks: 47[0;38;5;245m (limit: 33265)[0m
+     Memory: 182.6M (peak: 185.5M)
+        CPU: 3min 45.050s
+     CGroup: /user.slice/user-1000.slice/user@1000.service/app.slice/universal-scalper.service
+             └─[0;38;5;245m10240 /home/tha_magick_man/mystuf/development/build-A-bot/.venv/bin/python run_live.py --daemon[0m
+
+Mar 03 23:44:54 seraphim python[10240]: 2026-03-03 23:44:54,552  WARNING   data websocket error, restarting connection: no close frame received or sent
+Mar 03 23:44:54 seraphim python[10240]: 2026-03-03 23:44:54,552  INFO      starting data websocket connection
+Mar 03 23:44:54 seraphim python[10240]: 2026-03-03 23:44:54,552  INFO      connecting to wss://stream.data.alpaca.markets/v1beta3/crypto/us
+Mar 03 23:44:54 seraphim python[10240]: 2026-03-03 23:44:54,552  WARNING   data websocket error, restarting connection: no close frame received or sent
+Mar 03 23:44:54 seraphim python[10240]: 2026-03-03 23:44:54,552  INFO      starting data websocket connection
+Mar 03 23:44:54 seraphim python[10240]: 2026-03-03 23:44:54,552  INFO      connecting to wss://stream.data.alpaca.markets/v2/iex
+Mar 03 23:44:54 seraphim python[10240]: 2026-03-03 23:44:54,964  INFO      connected to wss://stream.data.alpaca.markets/v1beta3/crypto/us
+Mar 03 23:44:54 seraphim python[10240]: 2026-03-03 23:44:54,972  INFO      connected to wss://stream.data.alpaca.markets/v2/iex
+Mar 03 23:44:55 seraphim python[10240]: 2026-03-03 23:44:55,134  INFO      subscribed to bars: ['ETH/USD', 'BTC/USD']
+Mar 03 23:44:55 seraphim python[10240]: 2026-03-03 23:44:55,135  INFO      subscribed to bars: ['COIN', 'MARA', 'NVDA', 'SMCI', 'TSLA']
