@@ -1,6 +1,6 @@
 """
-Universal Scalper V3.1 — Live Forward-Testing Orchestrator (Phase 6 — Dual-Stream)
-====================================================================================
+Universal Scalper V3.2 — Live Forward-Testing Orchestrator (Phase 7 — Watchdog Persistence & Fractional Unification)
+=====================================================================================================================
 
 Production-ready dual-stream orchestrator that concurrently trades both
 **equities** (via StockDataStream / IEX) and **crypto** (via CryptoDataStream)
@@ -53,6 +53,7 @@ Schema failure policy: catch → Discord alert → drop bar → symbol stays FLA
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -106,10 +107,7 @@ from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, OrderType, TimeInForce
 from alpaca.trading.requests import (
-    LimitOrderRequest,
     MarketOrderRequest,
-    TakeProfitRequest,
-    StopLossRequest,
 )
 from alpaca.trading.stream import TradingStream
 
@@ -157,6 +155,9 @@ ACCOUNT_RISK_PER_TRADE: float = 0.02  # 2% of account equity per trade
 
 # Market hours clock TTL (seconds) — avoids hammering the REST API
 CLOCK_CACHE_TTL: float = 30.0
+
+# Persistent state file — survives bot restarts so in-trade SL/TP are not lost
+STATE_FILE: str = "active_trades.json"
 
 # Dashboard update interval (seconds)
 DASHBOARD_REFRESH_INTERVAL: float = 1.0
@@ -350,6 +351,123 @@ class LiveOrchestrator:
             ATR_KILL_SWITCH_THRESHOLD,
             COOLING_SECONDS,
         )
+
+        # Reload any in-trade positions that survived a restart
+        self._load_state()
+
+    # -----------------------------------------------------------------------
+    # State persistence — survives restarts mid-trade (amnesia fix)
+    # -----------------------------------------------------------------------
+
+    def _save_state(self) -> None:
+        """
+        Serialize every IN_TRADE symbol's SL, TP, and qty to STATE_FILE.
+
+        Called after a successful market buy and after every trade close so
+        the file always reflects the current live positions.  Failures are
+        logged as warnings — a missing persist is recoverable; a crash in
+        this path must not hide the underlying trade activity.
+        """
+        try:
+            payload: Dict[str, dict] = {}
+            for sym, ctx in self._contexts.items():
+                if ctx.state == SymbolState.IN_TRADE:
+                    payload[sym] = {
+                        "sl_price": ctx.sl_price,
+                        "tp_price": ctx.tp_price,
+                        "qty": ctx.entry_qty,
+                    }
+
+            with open(STATE_FILE, "w") as fh:
+                json.dump(payload, fh, indent=2)
+
+            logger.debug(
+                "State persisted | %d active trade(s) written to %s",
+                len(payload),
+                STATE_FILE,
+            )
+        except Exception as exc:
+            logger.warning("_save_state failed — state file not updated: %s", exc)
+
+    def _load_state(self) -> None:
+        """
+        On startup, read STATE_FILE and re-inject SL/TP for any symbol that
+        Alpaca still shows as an open position.
+
+        If the file is absent or corrupt the bot starts cleanly with all
+        symbols in FLAT state (normal cold-start behaviour).
+        """
+        state_path = Path(STATE_FILE)
+        if not state_path.exists():
+            logger.info("No state file found at %s — fresh start.", STATE_FILE)
+            return
+
+        try:
+            with open(state_path, "r") as fh:
+                saved: Dict[str, dict] = json.load(fh)
+        except Exception as exc:
+            logger.warning(
+                "Could not parse state file %s: %s — ignoring.", STATE_FILE, exc
+            )
+            return
+
+        if not saved:
+            return
+
+        # Cross-reference against Alpaca's actual open positions so we don't
+        # phantom-inject state for a position that was closed while the bot
+        # was down.
+        try:
+            open_positions = self._trading_client.get_all_positions()
+            open_symbols: Set[str] = {
+                str(getattr(p, "symbol", "")).upper() for p in open_positions
+            }
+        except Exception as exc:
+            logger.warning(
+                "_load_state: could not fetch open positions from Alpaca: %s — "
+                "skipping state reload.",
+                exc,
+            )
+            return
+
+        restored = 0
+        for sym, data in saved.items():
+            if sym not in self._contexts:
+                logger.debug(
+                    "_load_state: saved symbol %s not in active basket — skipping.", sym
+                )
+                continue
+
+            if sym not in open_symbols:
+                logger.info(
+                    "_load_state: %s has no open Alpaca position — treating as FLAT.",
+                    sym,
+                )
+                continue
+
+            ctx = self._contexts[sym]
+            ctx.sl_price = data.get("sl_price")
+            ctx.tp_price = data.get("tp_price")
+            ctx.entry_qty = data.get("qty")
+            ctx.state = SymbolState.IN_TRADE
+
+            logger.info(
+                "_load_state: restored %s | state=IN_TRADE | SL=%.4f | TP=%.4f | qty=%s",
+                sym,
+                ctx.sl_price or 0.0,
+                ctx.tp_price or 0.0,
+                ctx.entry_qty,
+            )
+            restored += 1
+
+        if restored:
+            logger.info(
+                "State reload complete — %d symbol(s) restored to IN_TRADE.", restored
+            )
+        else:
+            logger.info(
+                "State file present but no positions matched Alpaca's open list."
+            )
 
     # -----------------------------------------------------------------------
     # Asset-class helpers
@@ -557,17 +675,15 @@ class LiveOrchestrator:
         # Always run the clock refresh loop
         stream_tasks.append(self._clock_refresh_loop())
 
-        # Crypto watchdog — software SL/TP polling for crypto positions
-        if self._crypto_symbols:
-            stream_tasks.append(self._crypto_watchdog_loop())
+        # Universal watchdog — software SL/TP polling for ALL positions
+        stream_tasks.append(self._universal_watchdog_loop())
 
         logger.info(
             "WebSocket subscriptions registered | "
-            "streams=%d (crypto=%s, stock=%s, trade=1, watchdog=%s) — starting.",
+            "streams=%d (crypto=%s, stock=%s, trade=1, watchdog=universal) — starting.",
             len(stream_tasks),
             bool(self._crypto_symbols),
             bool(self._stock_symbols),
-            bool(self._crypto_symbols),
         )
 
         # Start dashboard
@@ -1020,12 +1136,13 @@ class LiveOrchestrator:
 
     def _submit_entry_order(self, sig: Signal, client_order_id: str) -> bool:
         """
-        Submit an entry order to Alpaca.
+        Submit a plain fractional market buy for any asset class (equity or crypto).
 
-        - **Equities:** Full bracket (market entry + OTO take-profit + stop-loss).
-        - **Crypto:** Plain market buy (no ``order_class``).  SL/TP are managed
-          by ``_crypto_watchdog_loop`` because Alpaca rejects advanced order
-          classes for crypto assets.
+        All entries now use a simple ``MarketOrderRequest`` with
+        ``time_in_force=DAY`` and qty rounded to 4 decimal places (min
+        0.0001).  SL/TP are managed entirely by ``_universal_watchdog_loop``,
+        eliminating Alpaca's ``order_class="bracket"`` which rejects for
+        fractional equities and all crypto pairs.
 
         Called via asyncio.to_thread; must NOT call any asyncio primitives.
 
@@ -1041,8 +1158,8 @@ class LiveOrchestrator:
             # Slippage / Inversion Guard
             # ----------------------------------------------------------------
             # After high slippage the fill price can move so close to one of
-            # the bracket legs that the TP is effectively <= entry or the SL
-            # is effectively >= entry.  Reject the trade early.
+            # the targets that the TP is effectively <= entry or the SL is
+            # effectively >= entry.  Reject the trade early.
             if tp_price <= sig.price * 1.001:
                 logger.warning(
                     "[%s] Slippage guard: TP=%.4f <= entry*1.001=%.4f — aborting.",
@@ -1085,9 +1202,8 @@ class LiveOrchestrator:
 
             is_crypto = self._is_crypto(symbol)
 
-            # --- HOTFIX v2: Margin vs Cash Bounds Guard ---
-            # Crypto is strictly non-marginable on Alpaca; we must cap by available cash.
-            # Equities can utilize the standard buying_power.
+            # Crypto is non-marginable on Alpaca; cap by cash.
+            # Equities may use buying power.
             max_notional = (cash * 0.95) if is_crypto else (buying_power * 0.95)
             min_notional = 2.0  # Safe floor above Alpaca's $1.00 minimum
 
@@ -1109,13 +1225,12 @@ class LiveOrchestrator:
                 )
                 return False
 
-            qty = max(round(qty, 4), 0.0001)  # Alpaca fractional floor
-            tif = TimeInForce.GTC if is_crypto else TimeInForce.DAY
+            # Round to 4 decimals; enforce fractional floor of 0.0001
+            qty = max(round(qty, 4), 0.0001)
 
             logger.info(
-                "[%s] Entry order | equity=%.2f | risk=$%.2f | "
-                "qty=%.4f | entry~%.2f | SL=%.4f | TP=%.4f | id=%s | "
-                "mode=%s",
+                "[%s] Universal entry order | equity=%.2f | risk=$%.2f | "
+                "qty=%.4f | entry~%.2f | SL=%.4f | TP=%.4f | id=%s",
                 symbol,
                 equity,
                 risk_dollars,
@@ -1124,49 +1239,33 @@ class LiveOrchestrator:
                 sl_price,
                 tp_price,
                 client_order_id,
-                "CRYPTO-WATCHDOG" if is_crypto else "BRACKET",
             )
 
             # ----------------------------------------------------------------
-            # Branch: Crypto → plain market buy | Equity → full bracket
+            # Universal fractional market buy — no bracket, no OTO legs.
+            # SL/TP targets are enforced by _universal_watchdog_loop.
+            # time_in_force=DAY works for both equities and crypto on Alpaca.
             # ----------------------------------------------------------------
-            if is_crypto:
-                # Alpaca rejects order_class="bracket" for crypto.
-                # SL/TP are monitored by _crypto_watchdog_loop instead.
-                order_request = MarketOrderRequest(
-                    symbol=symbol,
-                    qty=qty,
-                    side=OrderSide.BUY,
-                    time_in_force=tif,
-                    client_order_id=client_order_id,
-                )
-            else:
-                # Equities — native Alpaca bracket with OTO TP + SL legs
-                order_request = MarketOrderRequest(
-                    symbol=symbol,
-                    qty=qty,
-                    side=OrderSide.BUY,
-                    time_in_force=tif,
-                    client_order_id=client_order_id,
-                    order_class="bracket",
-                    take_profit=TakeProfitRequest(limit_price=round(tp_price, 2)),
-                    stop_loss=StopLossRequest(stop_price=round(sl_price, 2)),
-                )
+            order_request = MarketOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=OrderSide.BUY,
+                time_in_force=TimeInForce.DAY,
+                client_order_id=client_order_id,
+            )
 
             order = self._trading_client.submit_order(order_request)
             order_id = str(getattr(order, "id", "unknown"))
 
-            mode_label = "Crypto entry" if is_crypto else "Bracket"
             logger.info(
-                "[%s] %s submitted | alpaca_order_id=%s | client_id=%s",
+                "[%s] Universal entry submitted | alpaca_order_id=%s | client_id=%s",
                 symbol,
-                mode_label,
                 order_id,
                 client_order_id,
             )
             self._log_activity(
                 symbol,
-                f"{mode_label} submitted | Qty: {qty:.4f} | SL: ${sl_price:.2f} "
+                f"Entry submitted | Qty: {qty:.4f} | SL: ${sl_price:.2f} "
                 f"| TP: ${tp_price:.2f}",
                 "success",
             )
@@ -1179,6 +1278,14 @@ class LiveOrchestrator:
 
             # Notify Discord
             self._notifier.send_trade_alert(sig, action="ENTRY")
+
+            # Persist state immediately so a restart mid-trade can recover
+            # NOTE: entry_qty is set properly by _on_trade_update on fill;
+            # we pre-seed it here from the submitted qty so _save_state has
+            # a value even if the fill event hasn't arrived yet.
+            ctx = self._contexts[symbol]
+            ctx.entry_qty = qty
+            self._save_state()
 
             return True
 
@@ -1291,23 +1398,23 @@ class LiveOrchestrator:
             logger.error("Error in _on_trade_update: %s", exc, exc_info=True)
 
     # -----------------------------------------------------------------------
-    # Crypto Watchdog — software SL/TP for assets that reject brackets
+    # Universal Watchdog — software SL/TP for ALL positions (equity + crypto)
     # -----------------------------------------------------------------------
 
-    async def _crypto_watchdog_loop(self) -> None:
+    async def _universal_watchdog_loop(self) -> None:
         """
-        Background coroutine that polls crypto positions once per second
-        and fires a market sell when ``last_price`` breaches the stored
-        SL or TP level.
+        Background coroutine that polls every IN_TRADE position once per
+        second and fires a market sell when ``last_price`` breaches the
+        stored SL or TP level.
 
-        This replaces the native Alpaca bracket legs that are unavailable
-        for crypto order classes.  Equity positions are unaffected — their
-        OTO legs are managed server-side by Alpaca.
+        This replaces Alpaca's server-side bracket legs entirely, which
+        allows fractional equity buys (e.g. $10 of MARA) that are rejected
+        when ``order_class="bracket"`` is used.
 
-        The loop runs for the lifetime of the orchestrator and is added
-        to the ``stream_tasks`` gather in ``run()``.
+        The loop runs for the lifetime of the orchestrator regardless of
+        whether the symbol basket contains crypto, equities, or both.
         """
-        logger.info("Crypto watchdog started — polling every 1s.")
+        logger.info("Universal watchdog started — polling every 1s.")
         while not self._shutdown_event.is_set():
             try:
                 await asyncio.sleep(1)
@@ -1315,9 +1422,7 @@ class LiveOrchestrator:
                 break
 
             for ctx in self._contexts.values():
-                # Only monitor crypto symbols that are actively in a trade
-                if not ctx.is_crypto:
-                    continue
+                # Monitor every symbol that is actively in a trade
                 if ctx.state != SymbolState.IN_TRADE:
                     continue
                 if (
@@ -1345,7 +1450,7 @@ class LiveOrchestrator:
                     exit_qty = ctx.entry_qty
 
                 logger.info(
-                    "[%s] Crypto watchdog %s breach | price=%.4f | "
+                    "[%s] Universal watchdog %s breach | price=%.4f | "
                     "tp=%.4f | sl=%.4f — submitting manual exit.",
                     ctx.symbol,
                     reason,
@@ -1364,14 +1469,14 @@ class LiveOrchestrator:
                     asyncio.to_thread(self._submit_manual_exit, ctx.symbol, exit_qty)
                 )
 
-        logger.info("Crypto watchdog stopped.")
+        logger.info("Universal watchdog stopped.")
 
     def _submit_manual_exit(self, symbol: str, qty: Optional[float]) -> bool:
         """
         Submit a market SELL to close a crypto position.
 
-        Called via ``asyncio.to_thread`` from the watchdog; must NOT call
-        any asyncio primitives.
+        Called via ``asyncio.to_thread`` from ``_universal_watchdog_loop``;
+        must NOT call any asyncio primitives.
 
         Returns True on success, False on error.  The subsequent fill event
         on TradingStream will drive ``PENDING_EXIT → COOLING`` via
@@ -1405,7 +1510,7 @@ class LiveOrchestrator:
             )
 
             self._notifier.send_system_message(
-                f"[{symbol}] Crypto watchdog exit submitted | qty={qty:.4f}"
+                f"[{symbol}] Universal watchdog exit submitted | qty={qty:.4f}"
             )
             return True
 
@@ -1442,6 +1547,9 @@ class LiveOrchestrator:
         ctx.entry_qty = None
         ctx.sl_price = None
         ctx.tp_price = None
+
+        # Persist immediately so restart doesn't re-inject a closed trade
+        self._save_state()
 
         logger.info("[%s] State -> COOLING | reset in %ds.", symbol, COOLING_SECONDS)
         self._log_activity(
@@ -1851,8 +1959,13 @@ class LiveOrchestrator:
 
         for stream, name in streams:
             try:
-                await stream.stop_ws()  # type: ignore[union-attr]
+                await asyncio.wait_for(stream.stop_ws(), timeout=5.0)  # type: ignore[union-attr]
                 logger.info("%s stopped.", name)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "%s did not stop within 5s — forcing continuation of shutdown.",
+                    name,
+                )
             except Exception as exc:
                 logger.warning("Error stopping %s: %s", name, exc)
 
