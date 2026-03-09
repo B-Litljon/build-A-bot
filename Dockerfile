@@ -38,11 +38,13 @@ RUN pip install --no-cache-dir pipenv && \
 
 # --- APPLICATION CODE ---
 COPY src/ ./src/
-COPY main.py .
+COPY run_live.py .
 
 # --- SANITY CHECK ---
 # Verify critical dependencies are importable before runtime
 RUN python -c "import pytz; import polars; import numpy; import talib; print('Dependencies verified.')"
 
 # --- RUNTIME ---
-CMD ["python", "main.py"]
+# run_live.py launches the V3.2 LiveOrchestrator daemon.
+# --daemon suppresses the Rich interactive dashboard for headless/systemd operation.
+CMD ["python", "run_live.py", "--daemon"]

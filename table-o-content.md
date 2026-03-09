@@ -1,10 +1,10 @@
-# HAYNES MANUAL — Universal Scalper V3.1
+# HAYNES MANUAL — Universal Scalper V3.2
 
 ## Complete Codebase Reference Guide
 
-**Generated:** 2026-02-26
-**System:** Universal Scalper V3.1 — Dual-Stream Live Trading Bot
-**Architecture:** Angel/Devil Meta-Labeling + ATR-Based Dynamic Brackets + Rich CLI Dashboard
+**Generated:** 2026-03-07
+**System:** Universal Scalper V3.2 — Dual-Stream Live Trading Bot
+**Architecture:** Angel/Devil Meta-Labeling + ATR-Based Dynamic Brackets + Walk-Forward Validation Gate + Rich CLI Dashboard
 
 ---
 
@@ -680,18 +680,25 @@ The feedback loop is a multi-phase pipeline that detects model drift and trigger
 
 **Exit codes:** 0=healthy, 1=error, 2=safety switch triggered.
 
-#### Phase 5: Automated Retraining ("The Cure")
+#### Phase 5: Automated Retraining ("The Cure V2")
 **File:** `src/core/retrainer.py`
 
 | Function | Purpose |
 |---|---|
 | `fetch_training_data(client, days_back)` | Fetches 60 days of 1-min bars from Alpaca for `["TSLA", "NVDA", "MARA", "COIN", "SMCI"]`. |
-| `engineer_features_and_labels(df)` | Computes TA-Lib indicators (RSI, MACD, BBANDS) and generates targets: Angel (3-bar momentum), Devil (15-bar bracket +0.5%/-0.2%). |
+| `engineer_features_and_labels(df)` | Delegates to `FeatureEngineer.compute_indicators()` (zero training/inference skew). Generates ATR-dynamic targets: Angel (3-bar momentum, ATR-relative threshold), Devil (bar-by-bar bracket simulation: SL=1.5×ATR checked first, TP=3.0×ATR, 15-bar timeout — matches `evaluate_performance.py`). Returns the 10-feature set used by `MLStrategy` at inference time. |
+| `_compute_devil_targets_atr(df, sl_mult, tp_mult, max_hold)` | Bar-by-bar bracket simulator. For each bar simulates `SL = close - 1.5×ATR_abs`, `TP = close + 3.0×ATR_abs`, walks forward ≤15 bars, checks SL first. O(n × max_hold). |
 | `generate_time_decay_weights(n_samples, decay_factor)` | Creates exponential time-decay weights (newest=1.0, oldest=0.1) to prevent catastrophic forgetting. |
 | `refit_models(df, feature_cols)` | Trains Angel on base features, generates Angel probabilities, trains Devil on base features + angel_prob (meta-labeling). Both use time-decay sample weights. |
+| `validate_candidate(df, feature_cols, n_folds)` | Runs 3-fold expanding-window cross-validation split by calendar date. Fold schedule: Train 0–29/Val 30–39, Train 0–39/Val 40–49, Train 0–49/Val 50–59. Per fold: trains models, runs Angel→Devil inference, computes Brier score + R-multiple EV + win rate. Profit Factor gate uses the **Fold 3 model on Fold 3 val data** (strictly OOS — no data leakage). Full-data model only trained after gate passes. Gate thresholds: Brier ≤ 0.25, EV ≥ 0.0005, PF ≥ 1.2. Returns `ValidationReport` + final models. |
+| `promote_or_reject(report, angel_model, devil_model)` | If gate passed: calls `save_models()` atomically, sends Discord promotion report. If gate failed: retains production weights, sends rejection report. Returns `bool`. |
 | `save_models(angel_model, devil_model)` | Atomic serialization: writes to temp file, then `os.replace()` for zero-downtime swap (safe for live hot-reloader). |
 
-**Output:** `models/angel_latest.pkl`, `models/devil_latest.pkl`
+**Dataclasses:** `FoldMetrics` (per-fold Brier/EV/WR/trade counts), `ValidationReport` (aggregate gate decision + per-fold list + rejection reasons).
+
+**Exit codes:** `0` = models promoted, `1` = execution error, `2` = models rejected by gate (production weights intact).
+
+**Output (gate passed):** `models/angel_latest.pkl`, `models/devil_latest.pkl` (trained on full 60 days)
 
 ---
 
@@ -705,7 +712,13 @@ Bash script that automates the full OOS testing pipeline with colored terminal o
 3. `run_replay` — Phase 2: `python -m src.replay_test`.
 4. `run_resolver` — Phase 3: `python -m src.evaluate_performance`.
 5. `run_feedback` — Phase 4: `python -m src.core.feedback_loop`.
-6. If exit code 2 (critical drift): `run_retrainer` — Phase 5: `python -m src.core.retrainer`.
+6. If feedback exit code 2 (critical drift): `run_retrainer` — Phase 5: `python -m src.core.retrainer`. Retrainer exit code is captured separately and passed to `handle_completion`.
+
+`handle_completion` branches on both exit codes:
+- Feedback 0 → healthy, no retraining.
+- Feedback 2 + Retrainer 0 → drift detected, gate passed, new models promoted.
+- Feedback 2 + Retrainer 2 → drift detected, gate rejected, production weights retained, manual review recommended.
+- Feedback 2 + Retrainer 1 → retraining execution error, script exits non-zero.
 
 ---
 
@@ -726,8 +739,8 @@ Bash script that automates the full OOS testing pipeline with colored terminal o
 - Base image: `python:3.12-slim-bookworm`.
 - Compiles TA-Lib 0.4.0 from source.
 - Installs Python deps via Pipenv (`--system --deploy`).
-- Copies `src/` and `main.py`.
-- Runs `python main.py` (legacy Gen-1 entry point).
+- Copies `src/` and `run_live.py`.
+- Runs `python run_live.py` (V3.2 LiveOrchestrator entry point).
 
 **File:** `docker-compose.yml`
 
