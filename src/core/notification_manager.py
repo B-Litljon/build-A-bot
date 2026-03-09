@@ -3,7 +3,6 @@ import logging
 import requests
 from datetime import datetime
 from typing import Optional
-from core.signal import Signal, SignalType
 
 logger = logging.getLogger(__name__)
 
@@ -14,8 +13,12 @@ class NotificationManager:
         if not self.webhook_url:
             logger.warning("DISCORD_WEBHOOK_URL not set. Notifications disabled.")
 
-    def send_trade_alert(self, signal: Signal, action: str = "ENTRY"):
+    def send_trade_alert(self, signal, action: str = "ENTRY"):
         """Sends a formatted Meta-Labeling trade alert to Discord."""
+        from core.signal import (
+            SignalType,
+        )  # lazy import — only needed in live orchestrator context
+
         if not self.webhook_url:
             return
 
