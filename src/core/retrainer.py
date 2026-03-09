@@ -44,6 +44,7 @@ from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.data.enums import DataFeed
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import brier_score_loss
+from sklearn.model_selection import cross_val_predict, TimeSeriesSplit
 
 from src.ml.feature_pipeline import FeatureEngineer
 from src.core.notification_manager import NotificationManager
@@ -497,18 +498,85 @@ def refit_models(
     logger.info(f"✓ Angel model trained on {len(feature_cols)} features")
 
     # ═══════════════════════════════════════════════════════════════════
-    # STEP 2: Generate Meta-Features (Angel's Probabilities)
+    # STEP 2: Generate Out-Of-Fold Meta-Features (Angel's Probabilities)
     # ═══════════════════════════════════════════════════════════════════
-    logger.info("\n[Step 2/4] Generating meta-features (Angel's probabilities)...")
+    logger.info(
+        "\n[Step 2/4] Generating OOF meta-features (temporal cross-validation)..."
+    )
+
+    # CRITICAL FIX: Use TimeSeriesSplit with a manual fold loop to generate
+    # Angel probabilities via out-of-fold predictions. This prevents the Devil
+    # from training on the Angel's inflated in-sample confidence.
+    #
+    # Why manual loop instead of cross_val_predict:
+    #   cross_val_predict requires that every sample appears in exactly one
+    #   test fold (a strict partition). TimeSeriesSplit's first ~1/n_splits
+    #   of samples are never in any test fold (always train-only). sklearn
+    #   raises "cross_val_predict only works for partitions" in this case.
+    #   The manual loop handles the train-only head by filling those rows
+    #   from a model trained on just that first-fold window — still OOF
+    #   for the rows that follow (zero leakage into the majority of data).
+    #
+    # Why TimeSeriesSplit: respects chronological ordering — each fold only
+    # trains on past bars. KFold would let the Angel see future bars.
+    #
+    # n_splits=5: 5 expanding folds. Early folds → noisier Angel probs,
+    # which is realistic (production Angel also starts uncertain).
+
+    tss = TimeSeriesSplit(n_splits=5)
+    angel_probs_oof = np.full(len(X_base), np.nan)
 
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
-        angel_probs_train = angel_model.predict_proba(X_base)[:, 1]
 
-    df = df.with_columns(pl.Series("angel_prob", angel_probs_train))
-    logger.info(f"✓ Generated {len(angel_probs_train):,} Angel probabilities")
+        for fold_train_idx, fold_val_idx in tss.split(X_base):
+            fold_weights = sample_weights[fold_train_idx]
+            fold_angel = RandomForestClassifier(**ANGEL_PARAMS)
+            fold_angel.fit(
+                X_base[fold_train_idx],
+                y_angel[fold_train_idx],
+                sample_weight=fold_weights,
+            )
+            angel_probs_oof[fold_val_idx] = fold_angel.predict_proba(
+                X_base[fold_val_idx]
+            )[:, 1]
+
+        # Fill train-only head (first ~1/n_splits rows never appear in val)
+        # using a model trained solely on that window — no leakage from future.
+        head_missing = np.isnan(angel_probs_oof)
+        if head_missing.sum() > 0:
+            first_train_idx, _ = next(iter(tss.split(X_base)))
+            head_angel = RandomForestClassifier(**ANGEL_PARAMS)
+            head_angel.fit(
+                X_base[first_train_idx],
+                y_angel[first_train_idx],
+                sample_weight=sample_weights[first_train_idx],
+            )
+            angel_probs_oof[head_missing] = head_angel.predict_proba(
+                X_base[head_missing]
+            )[:, 1]
+            logger.info(
+                f"  Head fill: {head_missing.sum()} train-only rows scored by "
+                f"Fold-1 Angel (no leakage from future)"
+            )
+
+    # Add OOF angel_prob as a new column to the DataFrame
+    df = df.with_columns(pl.Series("angel_prob", angel_probs_oof))
+
+    logger.info(f"✓ Generated {len(angel_probs_oof):,} OOF Angel probabilities")
     logger.info(
-        f"  Angel prob range: [{angel_probs_train.min():.3f}, {angel_probs_train.max():.3f}]"
+        f"  OOF Angel prob range:  [{angel_probs_oof.min():.3f}, {angel_probs_oof.max():.3f}]"
+    )
+    logger.info(f"  OOF Angel prob median: {np.median(angel_probs_oof):.3f}")
+
+    # Compare OOF vs in-sample to confirm leakage was present
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+        angel_probs_insample = angel_model.predict_proba(X_base)[:, 1]
+
+    logger.info(
+        f"  In-sample Angel prob median: {np.median(angel_probs_insample):.3f} "
+        f"(should be much higher than OOF — confirms leakage was present)"
     )
 
     # ═══════════════════════════════════════════════════════════════════
@@ -725,6 +793,79 @@ def validate_candidate(
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
             devil_probs_val = devil_model.predict_proba(meta_df)[:, 1]
+
+        # ═══════════════════════════════════════════════════════════════════
+        # DEVIL DIAGNOSTIC: Probability Distribution Analysis
+        # ═══════════════════════════════════════════════════════════════════
+        if len(devil_probs_val) > 0:
+            logger.info(f"\n{'─' * 60}")
+            logger.info(f"DEVIL DIAGNOSTIC — Fold {fold_number}")
+            logger.info(f"{'─' * 60}")
+
+            # 1. Global Distribution
+            logger.info(f"  Probability Distribution (n={len(devil_probs_val)}):")
+            logger.info(f"    Min:    {np.min(devil_probs_val):.4f}")
+            logger.info(f"    P25:    {np.percentile(devil_probs_val, 25):.4f}")
+            logger.info(f"    Median: {np.median(devil_probs_val):.4f}")
+            logger.info(f"    P75:    {np.percentile(devil_probs_val, 75):.4f}")
+            logger.info(f"    Max:    {np.max(devil_probs_val):.4f}")
+
+            # 2. Threshold Density
+            n_total = len(devil_probs_val)
+            logger.info(f"  Threshold Density:")
+            logger.info(
+                f"    Above 0.50: {(devil_probs_val >= 0.50).sum():>4d} / {n_total} ({(devil_probs_val >= 0.50).mean():.1%})"
+            )
+            logger.info(
+                f"    Above 0.55: {(devil_probs_val >= 0.55).sum():>4d} / {n_total} ({(devil_probs_val >= 0.55).mean():.1%})"
+            )
+            logger.info(
+                f"    Above 0.60: {(devil_probs_val >= 0.60).sum():>4d} / {n_total} ({(devil_probs_val >= 0.60).mean():.1%})"
+            )
+            logger.info(
+                f"    Above 0.65: {(devil_probs_val >= 0.65).sum():>4d} / {n_total} ({(devil_probs_val >= 0.65).mean():.1%})"
+            )
+            logger.info(
+                f"    Above 0.70: {(devil_probs_val >= 0.70).sum():>4d} / {n_total} ({(devil_probs_val >= 0.70).mean():.1%})"
+            )
+
+            # 3. Separation Check: Does the Devil actually distinguish wins from losses?
+            # proposed_devil_targets is y_val_devil[signal_mask] — ground truth for Angel-proposed rows
+            wins_mask = proposed_devil_targets == 1
+            losses_mask = proposed_devil_targets == 0
+
+            if wins_mask.sum() > 0 and losses_mask.sum() > 0:
+                mean_prob_wins = devil_probs_val[wins_mask].mean()
+                mean_prob_losses = devil_probs_val[losses_mask].mean()
+                separation = mean_prob_wins - mean_prob_losses
+
+                logger.info(f"  Separation Check:")
+                logger.info(
+                    f"    Mean prob (Actual Wins):   {mean_prob_wins:.4f}  (n={wins_mask.sum()})"
+                )
+                logger.info(
+                    f"    Mean prob (Actual Losses): {mean_prob_losses:.4f}  (n={losses_mask.sum()})"
+                )
+                logger.info(f"    Separation Gap:            {separation:+.4f}")
+
+                if separation > 0.05:
+                    logger.info(
+                        f"    Verdict: SIGNAL DETECTED -- Devil can distinguish (gap > 0.05)"
+                    )
+                elif separation > 0.02:
+                    logger.info(
+                        f"    Verdict: WEAK SIGNAL -- marginal separation (0.02 < gap < 0.05)"
+                    )
+                else:
+                    logger.info(
+                        f"    Verdict: NO SIGNAL -- Devil cannot distinguish wins from losses"
+                    )
+            else:
+                logger.info(
+                    f"  Separation Check: SKIPPED (wins={wins_mask.sum()}, losses={losses_mask.sum()})"
+                )
+
+            logger.info(f"{'─' * 60}\n")
 
         approved_mask = devil_probs_val >= DEVIL_THRESHOLD
         n_devil_approved = int(approved_mask.sum())
