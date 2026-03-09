@@ -45,8 +45,8 @@ from alpaca.data.enums import DataFeed
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import brier_score_loss
 
-from ml.feature_pipeline import FeatureEngineer
-from core.notification_manager import NotificationManager
+from src.ml.feature_pipeline import FeatureEngineer
+from src.core.notification_manager import NotificationManager
 
 logging.basicConfig(
     level=logging.INFO,
