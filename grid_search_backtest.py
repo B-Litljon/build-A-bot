@@ -103,7 +103,7 @@ for profile_name, sl_mult, tp_mult in risk_profiles:
                     del self.active_orders[oid]
 
     bom = BOM(order_params, 10000.0)
-    lba = LiveBarAggregator(timeframe=1, history_size=240)
+    lba = LiveBarAggregator(timeframe=1, history_size=400)
     symbol = "SPY"
 
     for i, row in enumerate(test_df.iter_rows(named=True)):

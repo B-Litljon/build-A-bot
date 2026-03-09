@@ -77,7 +77,7 @@ class BOM:
 
 
 bom = BOM(order_params, 10000.0)
-lba = LiveBarAggregator(timeframe=1, history_size=240)
+lba = LiveBarAggregator(timeframe=1, history_size=400)
 symbol = "SPY"
 
 print("Running...")

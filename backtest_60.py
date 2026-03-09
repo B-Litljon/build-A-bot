@@ -50,7 +50,7 @@ class BOM:
                 del self.active_orders[oid]
 
 bom = BOM(op, 10000.0)
-lba = LiveBarAggregator(timeframe=1, history_size=240)
+lba = LiveBarAggregator(timeframe=1, history_size=400)
 symbol = 'SPY'
 
 print('Running...')

@@ -144,11 +144,12 @@ TP_ATR_MULTIPLIER: float = 3.0
 COOLING_SECONDS: int = 5 * 60  # 5 minutes
 
 # Minimum history rows required before inference is attempted.
-# Must be >= SMA-50 period + safety margin.
-MIN_HISTORY_BARS: int = 60
+# V3.3: must be >= 5m SMA-50 warm-up (50 × 5 = 250 bars) + safety margin.
+MIN_HISTORY_BARS: int = 260
 
-# Rolling window retained by each LiveBarAggregator (memory cap)
-HISTORY_SIZE: int = 120
+# Rolling window retained by each LiveBarAggregator (memory cap).
+# V3.3: expanded to hold enough 1m bars for 5m HTF SMA-50 (needs 250) plus margin.
+HISTORY_SIZE: int = 400
 
 # Capital and risk settings (paper trading defaults; override via env)
 ACCOUNT_RISK_PER_TRADE: float = 0.02  # 2% of account equity per trade
@@ -921,6 +922,7 @@ class LiveOrchestrator:
             # ----------------------------------------------------------------
             features_df = self._feature_engineer.compute_indicators(history_df)
 
+            # V3.3: 14-feature set (10 base + 4 HTF 5m features)
             ml_feature_names = [
                 "rsi_14",
                 "ppo",
@@ -932,6 +934,11 @@ class LiveOrchestrator:
                 "hour_of_day",
                 "dist_sma50",
                 "vol_rel",
+                # V3.3: HTF features
+                "htf_rsi_14",
+                "htf_trend_agreement",
+                "htf_vol_rel",
+                "htf_bb_pct_b",
             ]
 
             # Drop any rows containing Nulls, NaNs, or Infinities to prevent model crashes
@@ -1586,9 +1593,13 @@ class LiveOrchestrator:
 
     async def _warmup_aggregator(self) -> None:
         """
-        Pre-loads each symbol's LiveBarAggregator with the last 60 one-minute
-        bars from the Alpaca REST API so that the SMA-50 (and all other
+        Pre-loads each symbol's LiveBarAggregator with the last ~480 one-minute
+        bars from the Alpaca REST API so that the 5m HTF SMA-50 (and all other
         indicators) are ready the moment the first live WebSocket bar arrives.
+
+        V3.3: limit raised from 60 to 480 (8 hours × 60 bars/hr) to ensure
+        the 5m HTF SMA-50 warm-up (250 bars minimum) is satisfied even after
+        overnight gaps and missed bars.
 
         Uses CryptoHistoricalDataClient for crypto symbols and
         StockHistoricalDataClient for equity symbols.  Both result sets are
@@ -1827,7 +1838,7 @@ class LiveOrchestrator:
         request = CryptoBarsRequest(
             symbol_or_symbols=self._crypto_symbols,
             timeframe=TimeFrame.Minute,
-            limit=60,
+            limit=480,  # V3.3: 8h × 60 bars — ensures HTF SMA-50 warm-up (needs 250)
             end=end_time,
         )
 
@@ -1855,7 +1866,7 @@ class LiveOrchestrator:
         request = StockBarsRequest(
             symbol_or_symbols=self._stock_symbols,
             timeframe=TimeFrame.Minute,
-            limit=60,
+            limit=480,  # V3.3: 8h × 60 bars — ensures HTF SMA-50 warm-up (needs 250)
             end=end_time,
             adjustment=Adjustment.SPLIT,
         )

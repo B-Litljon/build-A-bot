@@ -40,7 +40,9 @@ class LiveBarAggregator:
         "volume": pl.Float64,
     }
 
-    def __init__(self, timeframe: int, history_size: int = 240):
+    def __init__(
+        self, timeframe: int, history_size: int = 400
+    ):  # V3.3: expanded for HTF warm-up
         """
         Args:
             timeframe:    Number of minutes per aggregated candle (e.g. 5 for

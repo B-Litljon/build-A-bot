@@ -127,7 +127,7 @@ async def run_backtest():
     # 3. Simulation Loop
     from utils.bar_aggregator import LiveBarAggregator
 
-    lba = LiveBarAggregator(timeframe=1, history_size=240)
+    lba = LiveBarAggregator(timeframe=1, history_size=400)
 
     symbol = "SPY"
 

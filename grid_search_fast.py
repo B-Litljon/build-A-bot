@@ -35,7 +35,7 @@ for name, sl_mult, tp_mult in configs:
     print(f"\n🔄 Testing Config {name}")
     
     strategy = MLStrategy(model_path="src/ml/models/rf_model.joblib", threshold=0.50)
-    lba = LiveBarAggregator(timeframe=1, history_size=240)
+    lba = LiveBarAggregator(timeframe=1, history_size=400)
     
     capital = 10000.0
     active_order = None
