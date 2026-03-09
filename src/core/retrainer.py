@@ -726,6 +726,79 @@ def validate_candidate(
             warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
             devil_probs_val = devil_model.predict_proba(meta_df)[:, 1]
 
+        # ═══════════════════════════════════════════════════════════════════
+        # DEVIL DIAGNOSTIC: Probability Distribution Analysis
+        # ═══════════════════════════════════════════════════════════════════
+        if len(devil_probs_val) > 0:
+            logger.info(f"\n{'─' * 60}")
+            logger.info(f"DEVIL DIAGNOSTIC — Fold {fold_number}")
+            logger.info(f"{'─' * 60}")
+
+            # 1. Global Distribution
+            logger.info(f"  Probability Distribution (n={len(devil_probs_val)}):")
+            logger.info(f"    Min:    {np.min(devil_probs_val):.4f}")
+            logger.info(f"    P25:    {np.percentile(devil_probs_val, 25):.4f}")
+            logger.info(f"    Median: {np.median(devil_probs_val):.4f}")
+            logger.info(f"    P75:    {np.percentile(devil_probs_val, 75):.4f}")
+            logger.info(f"    Max:    {np.max(devil_probs_val):.4f}")
+
+            # 2. Threshold Density
+            n_total = len(devil_probs_val)
+            logger.info(f"  Threshold Density:")
+            logger.info(
+                f"    Above 0.50: {(devil_probs_val >= 0.50).sum():>4d} / {n_total} ({(devil_probs_val >= 0.50).mean():.1%})"
+            )
+            logger.info(
+                f"    Above 0.55: {(devil_probs_val >= 0.55).sum():>4d} / {n_total} ({(devil_probs_val >= 0.55).mean():.1%})"
+            )
+            logger.info(
+                f"    Above 0.60: {(devil_probs_val >= 0.60).sum():>4d} / {n_total} ({(devil_probs_val >= 0.60).mean():.1%})"
+            )
+            logger.info(
+                f"    Above 0.65: {(devil_probs_val >= 0.65).sum():>4d} / {n_total} ({(devil_probs_val >= 0.65).mean():.1%})"
+            )
+            logger.info(
+                f"    Above 0.70: {(devil_probs_val >= 0.70).sum():>4d} / {n_total} ({(devil_probs_val >= 0.70).mean():.1%})"
+            )
+
+            # 3. Separation Check: Does the Devil actually distinguish wins from losses?
+            # proposed_devil_targets is y_val_devil[signal_mask] — ground truth for Angel-proposed rows
+            wins_mask = proposed_devil_targets == 1
+            losses_mask = proposed_devil_targets == 0
+
+            if wins_mask.sum() > 0 and losses_mask.sum() > 0:
+                mean_prob_wins = devil_probs_val[wins_mask].mean()
+                mean_prob_losses = devil_probs_val[losses_mask].mean()
+                separation = mean_prob_wins - mean_prob_losses
+
+                logger.info(f"  Separation Check:")
+                logger.info(
+                    f"    Mean prob (Actual Wins):   {mean_prob_wins:.4f}  (n={wins_mask.sum()})"
+                )
+                logger.info(
+                    f"    Mean prob (Actual Losses): {mean_prob_losses:.4f}  (n={losses_mask.sum()})"
+                )
+                logger.info(f"    Separation Gap:            {separation:+.4f}")
+
+                if separation > 0.05:
+                    logger.info(
+                        f"    Verdict: SIGNAL DETECTED -- Devil can distinguish (gap > 0.05)"
+                    )
+                elif separation > 0.02:
+                    logger.info(
+                        f"    Verdict: WEAK SIGNAL -- marginal separation (0.02 < gap < 0.05)"
+                    )
+                else:
+                    logger.info(
+                        f"    Verdict: NO SIGNAL -- Devil cannot distinguish wins from losses"
+                    )
+            else:
+                logger.info(
+                    f"  Separation Check: SKIPPED (wins={wins_mask.sum()}, losses={losses_mask.sum()})"
+                )
+
+            logger.info(f"{'─' * 60}\n")
+
         approved_mask = devil_probs_val >= DEVIL_THRESHOLD
         n_devil_approved = int(approved_mask.sum())
         logger.info(
