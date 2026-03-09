@@ -65,7 +65,7 @@ class MLStrategy(Strategy):
         devil_path: str | Path = "src/ml/models/devil_rf_model.joblib",
         angel_threshold: float = 0.40,
         devil_threshold: float = 0.50,
-        warmup_period: int = 60,
+        warmup_period: int = 260,  # V3.3: expanded for 5m HTF SMA-50 warm-up
     ):
         super().__init__()
 
@@ -112,6 +112,7 @@ class MLStrategy(Strategy):
         self.feature_engineer = FeatureEngineer()
 
         # Feature columns (excluding absolute price columns to prevent leakage)
+        # V3.3: expanded from 10 to 14 features with multi-timeframe (5m) additions
         self.feature_names = [
             "rsi_14",
             "ppo",
@@ -123,6 +124,11 @@ class MLStrategy(Strategy):
             "hour_of_day",
             "dist_sma50",
             "vol_rel",
+            # V3.3: HTF features
+            "htf_rsi_14",
+            "htf_trend_agreement",
+            "htf_vol_rel",
+            "htf_bb_pct_b",
         ]
 
         self.order_params = OrderParams(

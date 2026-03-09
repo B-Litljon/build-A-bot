@@ -96,7 +96,7 @@ async def run_backtest():
     backtest_om = BacktestOrderManager(order_params, 10000.0)
 
     from utils.bar_aggregator import LiveBarAggregator
-    lba = LiveBarAggregator(timeframe=1, history_size=240)
+    lba = LiveBarAggregator(timeframe=1, history_size=400)
     symbol = "SPY"
     total_bars = len(test_df)
 

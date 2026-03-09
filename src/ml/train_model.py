@@ -50,6 +50,18 @@ EXCLUDE_COLS = [
     "bb_middle",
     "bb_lower",
     "sma_50",
+    # V3.3: HTF intermediate columns (safety net — _compute_htf_features drops these,
+    # but list them here in case any code path bypasses the pipeline cleanup)
+    "_htf_sma_50",
+    "_htf_bb_upper",
+    "_htf_bb_lower",
+    "_htf_bb_middle",
+    "htf_open",
+    "htf_high",
+    "htf_low",
+    "htf_close",
+    "htf_volume",
+    "available_at",
 ]
 
 

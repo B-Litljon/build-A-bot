@@ -122,6 +122,11 @@ FEATURE_COLS: List[str] = [
     "hour_of_day",
     "dist_sma50",
     "vol_rel",
+    # V3.3: Multi-timeframe (5m) features
+    "htf_rsi_14",
+    "htf_trend_agreement",
+    "htf_vol_rel",
+    "htf_bb_pct_b",
 ]
 
 
@@ -348,7 +353,7 @@ def engineer_features_and_labels(df: pl.DataFrame) -> Tuple[pl.DataFrame, List[s
     # TECHNICAL INDICATORS via FeatureEngineer (prevents training/inference skew)
     # ═══════════════════════════════════════════════════════════════════
     logger.info("Computing indicators via FeatureEngineer (zero-skew pipeline)...")
-    df = FeatureEngineer.compute_indicators(df)
+    df = FeatureEngineer().compute_indicators(df)
     logger.info(
         "Applied indicators: RSI, PPO, NATR, BBANDS, SMA50, log_return, "
         "hour_of_day, vol_rel"

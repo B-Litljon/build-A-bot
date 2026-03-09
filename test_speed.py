@@ -19,7 +19,7 @@ test_df = df.filter((pl.col("timestamp") >= start) & (pl.col("timestamp") < end)
 print(f"Testing with {len(test_df)} bars (2 days)")
 
 strategy = MLStrategy(model_path="src/ml/models/rf_model.joblib", threshold=0.50)
-lba = LiveBarAggregator(timeframe=1, history_size=240)
+lba = LiveBarAggregator(timeframe=1, history_size=400)
 symbol = "SPY"
 
 total_analysis_time = 0

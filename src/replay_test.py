@@ -48,9 +48,9 @@ DEVIL_MODEL_PATH = Path("src/ml/models/devil_rf_model.joblib")
 # Thresholds (must match training configuration)
 ANGEL_THRESHOLD = 0.40
 DEVIL_THRESHOLD = 0.50
-WARMUP_PERIOD = 60
+WARMUP_PERIOD = 260  # V3.3: expanded for 5m HTF SMA-50 warm-up (250 bars minimum)
 
-# Feature names (must match MLStrategy)
+# Feature names (must match MLStrategy and retrainer.FEATURE_COLS)
 FEATURE_NAMES = [
     "rsi_14",
     "ppo",
@@ -62,6 +62,11 @@ FEATURE_NAMES = [
     "hour_of_day",
     "dist_sma50",
     "vol_rel",
+    # V3.3: HTF features
+    "htf_rsi_14",
+    "htf_trend_agreement",
+    "htf_vol_rel",
+    "htf_bb_pct_b",
 ]
 
 
