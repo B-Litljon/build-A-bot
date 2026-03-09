@@ -77,6 +77,74 @@ class NotificationManager:
         except Exception as e:
             logger.error(f"Failed to send Discord system message: {e}")
 
+    def send_retraining_report(self, report, promoted: bool):
+        """
+        Sends a detailed retraining report to Discord.
+
+        Uses "The Accountant" persona.  Shows per-fold metrics, aggregate
+        scores, and the final PROMOTED / REJECTED verdict.
+
+        Args:
+            report: ValidationReport dataclass from retrainer.validate_candidate()
+            promoted: Whether the model was promoted (True) or rejected (False)
+        """
+        if not self.webhook_url:
+            return
+
+        # Build per-fold summary
+        fold_lines = []
+        for fm in report.fold_metrics:
+            fold_lines.append(
+                f"Fold {fm.fold_number}: "
+                f"Brier={fm.brier_score:.4f} | "
+                f"EV={fm.expected_value:.6f} | "
+                f"WR={fm.win_rate:.1%} | "
+                f"Trades={fm.devil_approved_trades}"
+            )
+        fold_text = "\n".join(fold_lines)
+
+        if promoted:
+            verdict = "✅ PROMOTED"
+            color = 0x00FF00  # Green
+            desc_header = "**New models passed all validation gates and are now live.**"
+        else:
+            verdict = "🚫 REJECTED"
+            color = 0xFF0000  # Red
+            reasons_text = "\n".join(f"• {r}" for r in report.rejection_reasons)
+            desc_header = (
+                f"**Models failed validation. Production weights retained.**\n\n"
+                f"**Rejection Reasons:**\n{reasons_text}"
+            )
+
+        description = (
+            f"{desc_header}\n\n"
+            f"**Per-Fold Results:**\n```\n{fold_text}\n```\n\n"
+            f"📊 **Mean Brier Score:** {report.mean_brier:.4f} (threshold ≤ 0.25)\n"
+            f"💰 **Mean EV:** {report.mean_ev:.6f} (threshold ≥ 0.0005)\n"
+            f"📈 **Final Profit Factor:** {report.final_profit_factor:.2f} (threshold ≥ 1.2)\n"
+            f"🎯 **Final Win Rate:** {report.final_win_rate:.1%}\n"
+            f"📋 **Final Trades:** {report.final_total_trades}"
+        )
+
+        payload = {
+            "username": "The Accountant",
+            "embeds": [
+                {
+                    "title": f"{verdict}: MODEL RETRAINING REPORT",
+                    "description": description,
+                    "color": color,
+                    "footer": {"text": f"Report Time: {datetime.now().isoformat()}"},
+                }
+            ],
+        }
+
+        try:
+            response = requests.post(self.webhook_url, json=payload, timeout=5)
+            response.raise_for_status()
+            logger.info(f"Retraining report sent to Discord (verdict: {verdict})")
+        except Exception as e:
+            logger.error(f"Failed to send retraining report: {e}")
+
     def send_drift_alert(self, metrics: dict):
         """Sends a critical drift alert to Discord for The Accountant."""
         if not self.webhook_url:

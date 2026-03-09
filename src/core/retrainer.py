@@ -1,16 +1,27 @@
 """
-The Cure - Automated Model Retraining Pipeline.
+The Cure V2 - Validated Model Retraining Pipeline.
 
 Triggered when feedback_loop.py detects critical model drift.
-Fetches fresh data, applies time-decay weighting, and refits
-Angel/Devil Random Forest models.
+Fetches fresh data, engineers ATR-dynamic labels, runs a 3-fold
+walk-forward validation gate, and only promotes models that prove
+profitability across multiple chronological market regimes.
 
 Usage:
     python -m src.core.retrainer
 
+Exit Codes:
+    0 = Models promoted successfully
+    1 = Execution error (data fetch failed, config error, etc.)
+    2 = Models rejected by validation gate (production weights retained)
+
+    NOTE: run_pipeline.sh checks feedback_loop.py's exit code (2 = trigger
+    retraining), NOT this retrainer's exit code. Exit code 2 from the
+    retrainer means "tried but rejected" and does not cause an infinite loop.
+
 Environment Variables:
     ALPACA_API_KEY: Alpaca API key
     ALPACA_SECRET_KEY: Alpaca API secret
+    DISCORD_WEBHOOK_URL: Discord webhook for retraining reports (optional)
 """
 
 from __future__ import annotations
@@ -18,6 +29,8 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import warnings
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -25,12 +38,15 @@ from typing import List, Optional, Tuple
 import joblib
 import numpy as np
 import polars as pl
-import talib
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.data.enums import DataFeed
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import brier_score_loss
+
+from ml.feature_pipeline import FeatureEngineer
+from core.notification_manager import NotificationManager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,7 +54,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Configuration
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
 DAYS_BACK = 60
 TICKERS: List[str] = ["TSLA", "NVDA", "MARA", "COIN", "SMCI"]
 TIMEFRAME = TimeFrame(1, TimeFrameUnit.Minute)
@@ -64,6 +83,84 @@ DEVIL_PARAMS = {
     "class_weight": "balanced",
     "n_jobs": -1,
 }
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ATR BRACKET PARAMETERS (must match evaluate_performance.py and LiveOrchestrator)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+SL_ATR_MULTIPLIER = 1.5
+TP_ATR_MULTIPLIER = 3.0
+MAX_HOLD_BARS = 15
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# INFERENCE THRESHOLDS (must match MLStrategy)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+ANGEL_THRESHOLD = 0.40
+DEVIL_THRESHOLD = 0.50
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# VALIDATION GATE THRESHOLDS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+BRIER_THRESHOLD = 0.25  # Max acceptable Brier score (lower = better)
+EV_THRESHOLD = 0.0005  # Min acceptable Expected Value
+PROFIT_FACTOR_THRESHOLD = 1.2  # Min acceptable Profit Factor
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FEATURE COLUMNS (must match MLStrategy.feature_names and FeatureEngineer output)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+FEATURE_COLS: List[str] = [
+    "rsi_14",
+    "ppo",
+    "natr_14",
+    "bb_pct_b",
+    "bb_width_pct",
+    "price_sma50_ratio",
+    "log_return",
+    "hour_of_day",
+    "dist_sma50",
+    "vol_rel",
+]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DATACLASSES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class FoldMetrics:
+    """Metrics for a single walk-forward CV fold."""
+
+    fold_number: int
+    train_size: int
+    val_size: int
+    brier_score: float
+    expected_value: float
+    angel_proposed_trades: int
+    devil_approved_trades: int
+    win_rate: float
+
+
+@dataclass
+class ValidationReport:
+    """Aggregated validation report across all walk-forward folds."""
+
+    fold_metrics: List[FoldMetrics]
+    mean_brier: float
+    mean_ev: float
+    final_profit_factor: float
+    final_win_rate: float
+    final_total_trades: int
+    gate_passed: bool
+    rejection_reasons: List[str] = field(default_factory=list)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ALPACA DATA FETCHING
+# ═══════════════════════════════════════════════════════════════════════════════
 
 
 def get_alpaca_client() -> StockHistoricalDataClient:
@@ -149,136 +246,165 @@ def fetch_training_data(
     return combined
 
 
-def engineer_features_and_labels(df: pl.DataFrame) -> Tuple[pl.DataFrame, List[str]]:
+# ═══════════════════════════════════════════════════════════════════════════════
+# ATR-DYNAMIC DEVIL TARGET (Bar-by-Bar Bracket Simulation)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _compute_devil_targets_atr(
+    df: pl.DataFrame,
+    sl_mult: float = SL_ATR_MULTIPLIER,
+    tp_mult: float = TP_ATR_MULTIPLIER,
+    max_hold: int = MAX_HOLD_BARS,
+) -> np.ndarray:
     """
-    Engineer technical features and generate target labels using TA-Lib + Polars.
+    Compute Devil targets using dynamic ATR brackets with bar-by-bar resolution.
 
-    Features:
-        - rsi_14: 14-period RSI
-        - macd: MACD line
-        - macd_signal: MACD signal line
-        - bb_upper: Bollinger Bands upper band
-        - bb_lower: Bollinger Bands lower band
+    For each bar i, simulates a bracket order:
+        SL = close[i] - sl_mult * ATR_abs[i]
+        TP = close[i] + tp_mult * ATR_abs[i]
 
-    Targets:
-        - angel_target: 1 if close 3 bars ahead > current close + 0.1%
-        - devil_target: 1 if +0.5% TP hit before -0.2% SL in next 15 bars
+    Then walks forward up to max_hold bars checking:
+        - If low[j] <= SL → loss (0)
+        - If high[j] >= TP → win (1)
+        - SL is checked FIRST (conservative, matches evaluate_performance.py)
+        - If neither hit in max_hold bars → loss (0, timeout)
+
+    This avoids rolling max/min which does not respect the temporal ordering
+    of SL vs TP hits.  Complexity: O(n × max_hold).  At 60 days × 5 tickers
+    × ~390 bars/day ≈ 117k rows × 15 bars = ~1.75M iterations — runs in
+    under 2 seconds on modern hardware.
 
     Args:
-        df: Raw OHLCV DataFrame with columns: open, high, low, close, volume, symbol, timestamp
+        df: DataFrame containing 'close', 'high', 'low', 'natr_14' columns.
+        sl_mult: ATR multiplier for stop-loss (default: SL_ATR_MULTIPLIER).
+        tp_mult: ATR multiplier for take-profit (default: TP_ATR_MULTIPLIER).
+        max_hold: Maximum bars to hold before timeout (default: MAX_HOLD_BARS).
 
     Returns:
-        Tuple of (features DataFrame, feature column names)
+        NumPy array of int8 (0 = loss/timeout, 1 = win), same length as df.
+        NaN/invalid entries at the tail are set to 0.
+    """
+    close = df["close"].to_numpy()
+    high = df["high"].to_numpy()
+    low = df["low"].to_numpy()
+    natr = df["natr_14"].to_numpy()
+    n = len(close)
+    targets = np.zeros(n, dtype=np.int8)
+
+    for i in range(n - 1):
+        atr_abs = close[i] * natr[i] / 100.0
+        if np.isnan(atr_abs) or atr_abs <= 0:
+            continue
+
+        sl_price = close[i] - sl_mult * atr_abs
+        tp_price = close[i] + tp_mult * atr_abs
+
+        for j in range(i + 1, min(i + max_hold + 1, n)):
+            # SL checked first (conservative — matches evaluate_performance.py)
+            if low[j] <= sl_price:
+                targets[i] = 0
+                break
+            if high[j] >= tp_price:
+                targets[i] = 1
+                break
+        # If loop completes without break → timeout → 0 (already default)
+
+    return targets
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FEATURE ENGINEERING & LABEL GENERATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def engineer_features_and_labels(df: pl.DataFrame) -> Tuple[pl.DataFrame, List[str]]:
+    """
+    Engineer technical features and generate ATR-dynamic target labels.
+
+    Delegates feature computation to FeatureEngineer.compute_indicators() to
+    guarantee zero training/inference skew with the production MLStrategy.
+
+    Features (produced by FeatureEngineer, matches MLStrategy.feature_names):
+        rsi_14, ppo, natr_14, bb_pct_b, bb_width_pct,
+        price_sma50_ratio, log_return, hour_of_day, dist_sma50, vol_rel
+
+    Targets:
+        angel_target: 1 if close 3 bars ahead > close + 0.5 × ATR (ATR-relative)
+        devil_target: 1 if TP (3.0 × ATR) hit before SL (1.5 × ATR) in ≤15 bars
+
+    Args:
+        df: Raw OHLCV DataFrame with columns:
+            open, high, low, close, volume, symbol, timestamp
+
+    Returns:
+        Tuple of (features DataFrame with targets, feature column names)
     """
     logger.info("=" * 70)
     logger.info("ENGINEERING FEATURES & LABELS")
     logger.info("=" * 70)
 
-    # Convert Polars columns to numpy for talib (native compatibility)
-    close = df["close"].to_numpy()
-    high = df["high"].to_numpy()
-    low = df["low"].to_numpy()
-
     # ═══════════════════════════════════════════════════════════════════
-    # TECHNICAL INDICATORS (TA-Lib)
+    # TECHNICAL INDICATORS via FeatureEngineer (prevents training/inference skew)
     # ═══════════════════════════════════════════════════════════════════
-
-    # RSI (14-period)
-    rsi = talib.RSI(close, timeperiod=14)
-
-    # MACD (12, 26, 9)
-    macd, macd_signal, macd_hist = talib.MACD(
-        close, fastperiod=12, slowperiod=26, signalperiod=9
-    )
-
-    # Bollinger Bands (20-period, 2 std dev)
-    bb_upper, bb_middle, bb_lower = talib.BBANDS(
-        close, timeperiod=20, nbdevup=2, nbdevdn=2, matype=talib.MA_Type.SMA
-    )
-
-    # Add features to DataFrame
-    df = df.with_columns(
-        [
-            pl.Series("rsi_14", rsi),
-            pl.Series("macd", macd),
-            pl.Series("macd_signal", macd_signal),
-            pl.Series("bb_upper", bb_upper),
-            pl.Series("bb_lower", bb_lower),
-        ]
-    )
-
-    logger.info("Applied TA-Lib indicators: RSI, MACD, BBANDS")
-
-    # ═══════════════════════════════════════════════════════════════════
-    # TARGET GENERATION (Lookahead Logic)
-    # ═══════════════════════════════════════════════════════════════════
-
-    # Angel Target: Momentum shift (close 3 bars ahead > current + 0.1%)
-    df = df.with_columns(
-        [
-            (pl.col("close").shift(-3) > pl.col("close") * 1.001)
-            .cast(pl.Int8)
-            .alias("angel_target")
-        ]
-    )
-
-    # Devil Target: Bracket resolution (TP +0.5% hit before SL -0.2%)
-    # Lookahead window: 15 bars
-    lookahead = 15
-
-    df = df.with_columns(
-        [
-            # Calculate forward rolling max (highest high in next N bars)
-            pl.col("high")
-            .rolling_max(window_size=lookahead, min_periods=1)
-            .shift(-lookahead)
-            .alias("forward_high_max"),
-            # Calculate forward rolling min (lowest low in next N bars)
-            pl.col("low")
-            .rolling_min(window_size=lookahead, min_periods=1)
-            .shift(-lookahead)
-            .alias("forward_low_min"),
-        ]
-    )
-
-    # Devil target: TP hit (+0.5%) AND SL not hit (-0.2%)
-    df = df.with_columns(
-        [
-            (
-                (pl.col("forward_high_max") >= pl.col("close") * 1.005)
-                & (pl.col("forward_low_min") > pl.col("close") * 0.998)
-            )
-            .cast(pl.Int8)
-            .alias("devil_target")
-        ]
-    )
-
-    # Drop intermediate columns
-    df = df.drop(["forward_high_max", "forward_low_min"])
-
+    logger.info("Computing indicators via FeatureEngineer (zero-skew pipeline)...")
+    df = FeatureEngineer.compute_indicators(df)
     logger.info(
-        f"Generated targets: angel_target (3-bar), devil_target ({lookahead}-bar bracket)"
+        "Applied indicators: RSI, PPO, NATR, BBANDS, SMA50, log_return, "
+        "hour_of_day, vol_rel"
     )
 
     # ═══════════════════════════════════════════════════════════════════
-    # CLEANUP: Remove rows with nulls
+    # ANGEL TARGET: ATR-relative 3-bar momentum
+    # 1 if close 3 bars ahead > close + 0.5 × ATR_abs
+    # natr_14 is a percentage: ATR_abs = close * natr_14 / 100
     # ═══════════════════════════════════════════════════════════════════
+    df = df.with_columns(
+        (
+            pl.col("close").shift(-3)
+            > pl.col("close") + 0.5 * (pl.col("close") * pl.col("natr_14") / 100.0)
+        )
+        .cast(pl.Int8)
+        .alias("angel_target")
+    )
+    logger.info("Generated angel_target (ATR-relative 3-bar momentum)")
 
+    # ═══════════════════════════════════════════════════════════════════
+    # DEVIL TARGET: ATR-dynamic bracket resolution (bar-by-bar simulation)
+    # Must match evaluate_performance.py: SL=1.5×ATR, TP=3.0×ATR, max 15 bars
+    # ═══════════════════════════════════════════════════════════════════
+    logger.info(
+        f"Computing devil_target via ATR bracket simulation "
+        f"(SL={SL_ATR_MULTIPLIER}×ATR, TP={TP_ATR_MULTIPLIER}×ATR, "
+        f"max_hold={MAX_HOLD_BARS} bars)..."
+    )
+    devil_targets = _compute_devil_targets_atr(df)
+    df = df.with_columns(pl.Series("devil_target", devil_targets))
+    logger.info(
+        f"Generated devil_target: "
+        f"{int(devil_targets.sum())} wins / {len(devil_targets)} total "
+        f"({devil_targets.mean():.1%} win rate)"
+    )
+
+    # ═══════════════════════════════════════════════════════════════════
+    # CLEANUP: Drop NaN/null rows (uses FeatureEngineer.clean_data)
+    # ═══════════════════════════════════════════════════════════════════
     initial_count = len(df)
-    df = df.drop_nulls()
+    df = FeatureEngineer.clean_data(df)
     dropped_count = initial_count - len(df)
 
     logger.info(
         f"Dropped {dropped_count:,} rows with nulls ({dropped_count / initial_count:.1%})"
     )
     logger.info(f"Final dataset: {len(df):,} rows")
+    logger.info(f"Feature columns: {FEATURE_COLS}")
 
-    # Define feature columns for model training
-    feature_cols = ["rsi_14", "macd", "macd_signal", "bb_upper", "bb_lower"]
+    return df, FEATURE_COLS
 
-    logger.info(f"Feature columns: {feature_cols}")
 
-    return df, feature_cols
+# ═══════════════════════════════════════════════════════════════════════════════
+# TIME-DECAY WEIGHTS
+# ═══════════════════════════════════════════════════════════════════════════════
 
 
 def generate_time_decay_weights(
@@ -309,6 +435,11 @@ def generate_time_decay_weights(
     return weights
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# MODEL TRAINING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
 def refit_models(
     df: pl.DataFrame,
     feature_cols: List[str],
@@ -322,8 +453,8 @@ def refit_models(
     3. Train Devil on base features + angel_prob
 
     Args:
-        df: Feature-engineered DataFrame
-        feature_cols: List of feature column names
+        df: Feature-engineered DataFrame with 'angel_target' and 'devil_target'
+        feature_cols: List of base feature column names
 
     Returns:
         Tuple of (Angel model, Devil model, angel_features, devil_features)
@@ -365,15 +496,10 @@ def refit_models(
     # ═══════════════════════════════════════════════════════════════════
     logger.info("\n[Step 2/4] Generating meta-features (Angel's probabilities)...")
 
-    # Get Angel's prediction probabilities on training data
-    # Suppress sklearn warning about feature names during training inference
-    import warnings
-
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
         angel_probs_train = angel_model.predict_proba(X_base)[:, 1]
 
-    # Add angel_prob as a new column to the DataFrame
     df = df.with_columns(pl.Series("angel_prob", angel_probs_train))
     logger.info(f"✓ Generated {len(angel_probs_train):,} Angel probabilities")
     logger.info(
@@ -385,7 +511,6 @@ def refit_models(
     # ═══════════════════════════════════════════════════════════════════
     logger.info("\n[Step 3/4] Training Devil model (Conviction with meta-features)...")
 
-    # Devil sees base features + Angel's probability
     devil_features = feature_cols + ["angel_prob"]
     X_devil = df[devil_features].to_numpy()
 
@@ -400,7 +525,6 @@ def refit_models(
     # ═══════════════════════════════════════════════════════════════════
     logger.info("\n[Step 4/4] Model validation...")
 
-    # Quick validation
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
         angel_acc = angel_model.score(X_base, y_angel, sample_weight=sample_weights)
@@ -414,6 +538,397 @@ def refit_models(
     logger.info(f"Devil can now veto Angel when angel_prob is misleading")
 
     return angel_model, devil_model, feature_cols, devil_features
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WALK-FORWARD VALIDATION GATE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def validate_candidate(
+    df: pl.DataFrame,
+    feature_cols: List[str],
+    n_folds: int = 3,
+) -> Tuple[
+    ValidationReport,
+    RandomForestClassifier,
+    RandomForestClassifier,
+    List[str],
+    List[str],
+]:
+    """
+    Run expanding-window walk-forward cross-validation and apply the promotion gate.
+
+    Splits the 60-day dataset into 3 expanding folds by calendar date (not row
+    index) so that all symbols' data for a given date range stays in the same
+    fold.  For each fold, trains Angel + Devil on the training window and
+    evaluates strictly out-of-sample on the validation window.
+
+    Fold schedule (calendar days from the earliest timestamp in df):
+        Fold 1: Train days  0–29, Validate days 30–39
+        Fold 2: Train days  0–39, Validate days 40–49
+        Fold 3: Train days  0–49, Validate days 50–59  ← Profit Factor gate
+
+    TEMPORAL BOUNDARY:
+        The Profit Factor gate uses the Fold 3 model (trained on days 0–49)
+        evaluated on the Fold 3 val set (days 50–59). This is strictly OOS.
+        The final full-data model (all 60 days) is ONLY trained AFTER the gate
+        passes. Training on all 60 days and then evaluating on a subset would
+        be data leakage.
+
+    Promotion thresholds:
+        Mean Brier Score   ≤ 0.25   (across all folds)
+        Mean EV            ≥ 0.0005 (across all folds)
+        Profit Factor      ≥ 1.20   (Fold 3 val set only)
+
+    Args:
+        df: Full 60-day feature-engineered DataFrame (output of
+            engineer_features_and_labels).
+        feature_cols: List of base feature column names.
+        n_folds: Number of expanding folds (default: 3).
+
+    Returns:
+        Tuple of:
+            - ValidationReport (gate decision + per-fold metrics)
+            - angel_model (full-data if gate passed, Fold 3 if rejected)
+            - devil_model (full-data if gate passed, Fold 3 if rejected)
+            - angel_feature_names
+            - devil_feature_names
+    """
+    logger.info("=" * 70)
+    logger.info("WALK-FORWARD VALIDATION (3 EXPANDING FOLDS)")
+    logger.info("=" * 70)
+
+    # ───────────────────────────────────────────────────────────────────
+    # Build date-based fold boundaries
+    # ───────────────────────────────────────────────────────────────────
+    min_date = df["timestamp"].min()
+
+    # fold_configs: (train_end_days, val_end_days) — exclusive upper bounds
+    fold_configs = [
+        (30, 40),  # Fold 1: Train days 0–29, Val days 30–39
+        (40, 50),  # Fold 2: Train days 0–39, Val days 40–49
+        (50, 60),  # Fold 3: Train days 0–49, Val days 50–59
+    ]
+
+    fold_metrics: List[FoldMetrics] = []
+
+    # Placeholders for Fold 3 outputs (used for PF gate and fallback)
+    fold3_angel: Optional[RandomForestClassifier] = None
+    fold3_devil: Optional[RandomForestClassifier] = None
+    fold3_angel_feats: Optional[List[str]] = None
+    fold3_devil_feats: Optional[List[str]] = None
+    profit_factor: float = 0.0
+    final_win_rate: float = 0.0
+    final_total_trades: int = 0
+
+    for fold_idx, (train_end_day, val_end_day) in enumerate(fold_configs):
+        fold_number = fold_idx + 1
+
+        # Compute cutoff timestamps
+        train_cutoff = min_date + timedelta(days=train_end_day)
+        val_cutoff = min_date + timedelta(days=val_end_day)
+
+        train_df = df.filter(pl.col("timestamp") < train_cutoff)
+        val_df = df.filter(
+            (pl.col("timestamp") >= train_cutoff) & (pl.col("timestamp") < val_cutoff)
+        )
+
+        logger.info(
+            f"\n[Fold {fold_number}/{n_folds}] "
+            f"Train: {len(train_df):,} rows | "
+            f"Val: {len(val_df):,} rows"
+        )
+
+        if len(train_df) == 0 or len(val_df) == 0:
+            logger.warning(
+                f"[Fold {fold_number}] Empty split — skipping. "
+                f"Train={len(train_df)}, Val={len(val_df)}"
+            )
+            fold_metrics.append(
+                FoldMetrics(
+                    fold_number=fold_number,
+                    train_size=len(train_df),
+                    val_size=len(val_df),
+                    brier_score=1.0,
+                    expected_value=-1.0,
+                    angel_proposed_trades=0,
+                    devil_approved_trades=0,
+                    win_rate=0.0,
+                )
+            )
+            continue
+
+        # ─────────────────────────────────────────────────────────────
+        # Train on this fold's training window
+        # ─────────────────────────────────────────────────────────────
+        angel_model, devil_model, angel_feats, devil_feats = refit_models(
+            train_df, feature_cols
+        )
+
+        # ─────────────────────────────────────────────────────────────
+        # Score on validation window
+        # ─────────────────────────────────────────────────────────────
+        X_val_base = val_df[feature_cols].to_numpy()
+        y_val_angel = val_df["angel_target"].to_numpy()
+        y_val_devil = val_df["devil_target"].to_numpy()
+
+        # Stage 1: Angel inference
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+            angel_probs_val = angel_model.predict_proba(X_val_base)[:, 1]
+
+        signal_mask = angel_probs_val >= ANGEL_THRESHOLD
+        n_angel_proposed = int(signal_mask.sum())
+        logger.info(
+            f"[Fold {fold_number}] Angel proposed {n_angel_proposed} trades "
+            f"({n_angel_proposed / len(val_df):.1%} of val rows)"
+        )
+
+        if n_angel_proposed == 0:
+            logger.warning(
+                f"[Fold {fold_number}] Zero Angel-proposed trades — "
+                f"setting worst-case metrics"
+            )
+            fold_metrics.append(
+                FoldMetrics(
+                    fold_number=fold_number,
+                    train_size=len(train_df),
+                    val_size=len(val_df),
+                    brier_score=1.0,
+                    expected_value=-1.0,
+                    angel_proposed_trades=0,
+                    devil_approved_trades=0,
+                    win_rate=0.0,
+                )
+            )
+            if fold_number == n_folds:
+                fold3_angel, fold3_devil = angel_model, devil_model
+                fold3_angel_feats, fold3_devil_feats = angel_feats, devil_feats
+            continue
+
+        # Stage 2: Devil inference on Angel-proposed rows
+        import pandas as pd  # noqa: PLC0415 — used only for sklearn compat
+
+        proposed_base_feats = X_val_base[signal_mask]
+        proposed_angel_probs = angel_probs_val[signal_mask]
+        proposed_devil_targets = y_val_devil[signal_mask]
+
+        meta_df = pd.DataFrame(proposed_base_feats, columns=feature_cols)
+        meta_df["angel_prob"] = proposed_angel_probs
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+            devil_probs_val = devil_model.predict_proba(meta_df)[:, 1]
+
+        approved_mask = devil_probs_val >= DEVIL_THRESHOLD
+        n_devil_approved = int(approved_mask.sum())
+        logger.info(
+            f"[Fold {fold_number}] Devil approved {n_devil_approved} trades "
+            f"({n_devil_approved / max(n_angel_proposed, 1):.1%} of Angel proposals)"
+        )
+
+        if n_devil_approved == 0:
+            logger.warning(
+                f"[Fold {fold_number}] Zero Devil-approved trades — "
+                f"setting worst-case metrics"
+            )
+            fold_metrics.append(
+                FoldMetrics(
+                    fold_number=fold_number,
+                    train_size=len(train_df),
+                    val_size=len(val_df),
+                    brier_score=1.0,
+                    expected_value=-1.0,
+                    angel_proposed_trades=n_angel_proposed,
+                    devil_approved_trades=0,
+                    win_rate=0.0,
+                )
+            )
+            if fold_number == n_folds:
+                fold3_angel, fold3_devil = angel_model, devil_model
+                fold3_angel_feats, fold3_devil_feats = angel_feats, devil_feats
+            continue
+
+        # ─────────────────────────────────────────────────────────────
+        # Compute fold metrics on Devil-approved trades
+        # ─────────────────────────────────────────────────────────────
+        approved_devil_probs = devil_probs_val[approved_mask]
+        approved_targets = proposed_devil_targets[approved_mask]
+
+        brier = float(brier_score_loss(approved_targets, approved_devil_probs))
+        win_rate = float(approved_targets.mean()) if len(approved_targets) > 0 else 0.0
+
+        # EV using ATR R-multiple: wins = +TP_MULT R, losses = -SL_MULT R
+        # Where R = 1 unit of SL_ATR_MULTIPLIER ATR
+        # EV = win_rate * (TP_MULT / SL_MULT) - (1 - win_rate) * 1
+        # With TP=3.0, SL=1.5: EV = win_rate * 2 - (1 - win_rate) * 1 = 3*wr - 1
+        ev = float(
+            win_rate * (TP_ATR_MULTIPLIER / SL_ATR_MULTIPLIER) - (1.0 - win_rate)
+        )
+
+        logger.info(
+            f"[Fold {fold_number}] "
+            f"Brier={brier:.4f} | EV={ev:.6f} | WR={win_rate:.1%} | "
+            f"Trades={n_devil_approved}"
+        )
+
+        fm = FoldMetrics(
+            fold_number=fold_number,
+            train_size=len(train_df),
+            val_size=len(val_df),
+            brier_score=brier,
+            expected_value=ev,
+            angel_proposed_trades=n_angel_proposed,
+            devil_approved_trades=n_devil_approved,
+            win_rate=win_rate,
+        )
+        fold_metrics.append(fm)
+
+        # ─────────────────────────────────────────────────────────────
+        # Fold 3 — retain model refs + compute Profit Factor gate
+        # CRITICAL: PF is computed from Fold 3 model on Fold 3 val set.
+        # These are the same approved_targets already computed above —
+        # no additional training or data access needed.
+        # ─────────────────────────────────────────────────────────────
+        if fold_number == n_folds:
+            fold3_angel = angel_model
+            fold3_devil = devil_model
+            fold3_angel_feats = angel_feats
+            fold3_devil_feats = devil_feats
+
+            wins = int(approved_targets.sum())
+            losses = n_devil_approved - wins
+            gross_profit = wins * TP_ATR_MULTIPLIER
+            gross_loss = losses * SL_ATR_MULTIPLIER
+            profit_factor = (
+                gross_profit / gross_loss if gross_loss > 0 else float("inf")
+            )
+            final_win_rate = win_rate
+            final_total_trades = n_devil_approved
+
+            logger.info(
+                f"[Fold {fold_number}] Profit Factor = "
+                f"{gross_profit:.2f} / {gross_loss:.2f} = {profit_factor:.4f}"
+            )
+
+    # ───────────────────────────────────────────────────────────────────
+    # Aggregate metrics and apply gate
+    # ───────────────────────────────────────────────────────────────────
+    mean_brier = float(np.mean([fm.brier_score for fm in fold_metrics]))
+    mean_ev = float(np.mean([fm.expected_value for fm in fold_metrics]))
+
+    rejection_reasons: List[str] = []
+    if mean_brier > BRIER_THRESHOLD:
+        rejection_reasons.append(
+            f"Brier {mean_brier:.4f} > {BRIER_THRESHOLD} threshold"
+        )
+    if mean_ev < EV_THRESHOLD:
+        rejection_reasons.append(f"EV {mean_ev:.6f} < {EV_THRESHOLD} threshold")
+    if profit_factor < PROFIT_FACTOR_THRESHOLD:
+        rejection_reasons.append(
+            f"Profit Factor {profit_factor:.4f} < {PROFIT_FACTOR_THRESHOLD} threshold"
+        )
+
+    gate_passed = len(rejection_reasons) == 0
+
+    logger.info("=" * 70)
+    logger.info("VALIDATION GATE SUMMARY")
+    logger.info("=" * 70)
+    logger.info(f"Mean Brier Score : {mean_brier:.4f} (threshold ≤ {BRIER_THRESHOLD})")
+    logger.info(f"Mean EV          : {mean_ev:.6f} (threshold ≥ {EV_THRESHOLD})")
+    logger.info(
+        f"Profit Factor    : {profit_factor:.4f} "
+        f"(threshold ≥ {PROFIT_FACTOR_THRESHOLD}, Fold 3 OOS)"
+    )
+    logger.info(f"Gate Result      : {'PASSED ✅' if gate_passed else 'FAILED 🚫'}")
+
+    # ───────────────────────────────────────────────────────────────────
+    # If gate passed — train final production model on ALL 60 days.
+    # This is the REWARD for passing: maximum information for production.
+    # If gate failed — keep Fold 3 models as placeholders (NOT saved).
+    # ───────────────────────────────────────────────────────────────────
+    if gate_passed:
+        logger.info("Gate passed — training final production model on full dataset")
+        final_angel, final_devil, final_angel_feats, final_devil_feats = refit_models(
+            df, feature_cols
+        )
+    else:
+        logger.info(
+            "Gate failed — skipping full-data training. Production weights retained."
+        )
+        final_angel = fold3_angel
+        final_devil = fold3_devil
+        final_angel_feats = fold3_angel_feats
+        final_devil_feats = fold3_devil_feats
+
+    report = ValidationReport(
+        fold_metrics=fold_metrics,
+        mean_brier=mean_brier,
+        mean_ev=mean_ev,
+        final_profit_factor=profit_factor,
+        final_win_rate=final_win_rate,
+        final_total_trades=final_total_trades,
+        gate_passed=gate_passed,
+        rejection_reasons=rejection_reasons,
+    )
+
+    return report, final_angel, final_devil, final_angel_feats, final_devil_feats
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GATE DECISION & MODEL PROMOTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def promote_or_reject(
+    report: ValidationReport,
+    angel_model: RandomForestClassifier,
+    devil_model: RandomForestClassifier,
+) -> bool:
+    """
+    Promote or reject candidate models based on the validation report.
+
+    If gate passed: the models passed in were trained on the full 60-day
+    dataset (after CV validation confirmed generalizability). Saves them
+    atomically via save_models().
+
+    If gate failed: the models passed in are Fold 3 models (not saved).
+    Production weights are retained, rejection alert is sent to Discord.
+
+    Args:
+        report: ValidationReport from validate_candidate()
+        angel_model: Final model (full-data if gate passed, Fold 3 if failed)
+        devil_model: Final model (full-data if gate passed, Fold 3 if failed)
+
+    Returns:
+        True if models were promoted, False if rejected.
+    """
+    notifier = NotificationManager()
+
+    if report.gate_passed:
+        logger.info("=" * 70)
+        logger.info("✅ VALIDATION GATE PASSED — PROMOTING MODELS")
+        logger.info("=" * 70)
+
+        save_models(angel_model, devil_model)
+
+        notifier.send_retraining_report(report, promoted=True)
+        return True
+    else:
+        logger.warning("=" * 70)
+        logger.warning("🚫 VALIDATION GATE FAILED — MODELS REJECTED")
+        logger.warning("=" * 70)
+        for reason in report.rejection_reasons:
+            logger.warning(f"  Rejection: {reason}")
+
+        notifier.send_retraining_report(report, promoted=False)
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MODEL SERIALIZATION (ATOMIC)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 
 def save_models(
@@ -445,18 +960,13 @@ def save_models(
     # ATOMIC WRITE: Angel Model
     # ═══════════════════════════════════════════════════════════════════
     try:
-        # Write to temp file first
         joblib.dump(angel_model, angel_temp)
         angel_size = angel_temp.stat().st_size / (1024 * 1024)
-
-        # Atomic swap: instant replacement at OS level
         os.replace(angel_temp, ANGEL_PATH)
-
         logger.info(f"[ATOMIC] Angel model saved: {ANGEL_PATH} ({angel_size:.1f} MB)")
 
     except Exception as e:
         logger.error(f"[ATOMIC] Failed to save Angel model: {e}")
-        # Clean up temp file if it exists
         if angel_temp.exists():
             angel_temp.unlink()
         raise
@@ -465,68 +975,91 @@ def save_models(
     # ATOMIC WRITE: Devil Model
     # ═══════════════════════════════════════════════════════════════════
     try:
-        # Write to temp file first
         joblib.dump(devil_model, devil_temp)
         devil_size = devil_temp.stat().st_size / (1024 * 1024)
-
-        # Atomic swap: instant replacement at OS level
         os.replace(devil_temp, DEVIL_PATH)
-
         logger.info(f"[ATOMIC] Devil model saved: {DEVIL_PATH} ({devil_size:.1f} MB)")
 
     except Exception as e:
         logger.error(f"[ATOMIC] Failed to save Devil model: {e}")
-        # Clean up temp file if it exists
         if devil_temp.exists():
             devil_temp.unlink()
         raise
 
     logger.info(
-        "[ATOMIC] Model serialization complete - Live bot can hot-reload safely"
+        "[ATOMIC] Model serialization complete — live bot can hot-reload safely"
     )
 
 
-def main():
-    """Main entry point for model retraining."""
+# ═══════════════════════════════════════════════════════════════════════════════
+# ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def main() -> int:
+    """
+    Main entry point for the validated model retraining pipeline.
+
+    Exit codes:
+        0 = Models promoted successfully
+        1 = Execution error
+        2 = Models rejected by validation gate (production weights retained)
+
+    NOTE: run_pipeline.sh only checks feedback_loop.py's exit code to decide
+    whether to trigger retraining. The retrainer's exit code 2 ("tried but
+    rejected") is logged for observability but does NOT cause an infinite loop.
+    """
     try:
         logger.info(
             "╔══════════════════════════════════════════════════════════════════╗"
         )
         logger.info(
-            "║                    THE CURE - MODEL RETRAINER                    ║"
+            "║              THE CURE V2 - VALIDATED MODEL RETRAINER             ║"
         )
         logger.info(
             "╚══════════════════════════════════════════════════════════════════╝"
         )
 
-        # Initialize Alpaca client
+        # ─── Phase 1: Fetch data ────────────────────────────────────────────
         client = get_alpaca_client()
         logger.info("Alpaca client initialized")
-
-        # Fetch fresh training data
         raw_data = fetch_training_data(client)
 
-        # Engineer features and labels
+        # ─── Phase 2: Engineer features with ATR-dynamic labels ────────────
         features_df, feature_cols = engineer_features_and_labels(raw_data)
 
-        # Refit models with time-decay weighting
-        angel_model, devil_model, angel_features, devil_features = refit_models(
-            features_df, feature_cols
+        # ─── Phase 3: Walk-forward validation (3-fold expanding window) ────
+        # TEMPORAL BOUNDARY: CV folds and the Profit Factor gate are evaluated
+        # strictly OOS (Fold 3 model evaluated on days 51–60). The full-data
+        # production model is only trained AFTER the gate passes. Running the
+        # full-data model against any data used in its training would be data
+        # leakage.
+        logger.info("=" * 70)
+        logger.info("WALK-FORWARD VALIDATION (3 EXPANDING FOLDS)")
+        logger.info("=" * 70)
+
+        report, angel_model, devil_model, angel_feats, devil_feats = validate_candidate(
+            features_df, feature_cols, n_folds=3
         )
 
-        # Save models
-        save_models(angel_model, devil_model)
+        # ─── Phase 4: Gate decision ─────────────────────────────────────────
+        # If gate passed: angel_model/devil_model are trained on full 60 days
+        # If gate failed: they are Fold 3 models (will NOT be saved)
+        promoted = promote_or_reject(report, angel_model, devil_model)
 
-        # Success message
-        logger.info("=" * 70)
-        logger.info("✅ MODELS SUCCESSFULLY REFIT AND SERIALIZED")
-        logger.info("=" * 70)
-        logger.info("Models are ready for the next live market open.")
-        logger.info(f"  - Angel: {ANGEL_PATH}")
-        logger.info(f"  - Devil: {DEVIL_PATH}")
-        logger.info("\n🎯 The system is cured and ready for deployment!")
-
-        return 0
+        if promoted:
+            logger.info("=" * 70)
+            logger.info("✅ MODELS PROMOTED — Ready for next market open")
+            logger.info(f"  Angel: {ANGEL_PATH}")
+            logger.info(f"  Devil: {DEVIL_PATH}")
+            logger.info("=" * 70)
+            return 0
+        else:
+            logger.warning("=" * 70)
+            logger.warning("🚫 MODELS REJECTED — Production weights retained")
+            logger.warning("Manual review recommended.")
+            logger.warning("=" * 70)
+            return 2  # 2 = retrained but rejected; production weights intact
 
     except ValueError as e:
         logger.error(f"Configuration error: {e}")

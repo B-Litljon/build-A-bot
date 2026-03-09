@@ -170,30 +170,39 @@ run_feedback() {
 }
 
 # Phase 5: Model Retraining (The Cure)
+# Exit codes from retrainer:
+#   0 = models promoted (gate passed, full-data model saved)
+#   1 = execution error (data fetch failed, config error, etc.)
+#   2 = models rejected by validation gate (production weights retained)
 run_retrainer() {
-    print_section "PHASE 5: THE CURE - Model Retraining"
-    echo "Critical drift detected. Initiating automated retraining..."
+    print_section "PHASE 5: THE CURE - Validated Model Retraining"
+    echo "Critical drift detected. Initiating walk-forward validated retraining..."
     echo "Fetching 60 days of fresh training data..."
-    echo "Applying time-decay weighting to prevent catastrophic forgetting..."
+    echo "Running 3-fold expanding-window cross-validation gate..."
     echo ""
-    
+
+    # Disable exit-on-error so exit code 2 (gate rejected) doesn't abort the script
+    set +e
     python -m src.core.retrainer
-    
-    print_success "Model retraining complete"
-    echo "Updated models:"
-    echo "  - models/angel_latest.pkl"
-    echo "  - models/devil_latest.pkl"
+    RETRAINER_STATUS=$?
+    set -e
+
+    return $RETRAINER_STATUS
 }
 
-# Handle pipeline completion based on feedback status
+# Handle pipeline completion based on feedback and retrainer status
+# Args:
+#   $1 = feedback_status  (0=healthy, 2=drift triggered retraining)
+#   $2 = retrainer_status (0=promoted, 1=error, 2=rejected) — only set when $1==2
 handle_completion() {
     local feedback_status=$1
-    
+    local retrainer_status=${2:-0}
+
     echo ""
     echo -e "${CYAN}$(printf '=%.0s' {1..70})${NC}"
-    
+
     if [[ $feedback_status -eq 0 ]]; then
-        # Healthy - normal completion
+        # Healthy - no retraining needed
         print_success "OOS PIPELINE COMPLETED SUCCESSFULLY"
         echo ""
         echo "Generated files:"
@@ -202,24 +211,48 @@ handle_completion() {
         echo "  - data/resolved_ledger.csv (resolved outcomes)"
         echo ""
         print_success "Model health: WITHIN PARAMETERS"
-        
+
     elif [[ $feedback_status -eq 2 ]]; then
-        # Critical drift detected - retraining was triggered
-        print_warning "⚠️  CRITICAL DRIFT DETECTED - RETRAINING EXECUTED"
-        echo ""
-        echo "The system has been automatically cured:"
-        echo "  - Fresh models trained on 60 days of data"
-        echo "  - Time-decay weighting applied"
-        echo "  - Models ready for next market open"
-        echo ""
-        print_success "AUTONOMOUS RECOVERY COMPLETE"
-        
+        # Drift was detected and retraining was attempted — branch on retrainer result
+        if [[ $retrainer_status -eq 0 ]]; then
+            # Gate passed — new models promoted
+            print_success "CRITICAL DRIFT DETECTED — RETRAINING COMPLETE — MODELS PROMOTED"
+            echo ""
+            echo "New models passed walk-forward validation and are now live:"
+            echo "  - models/angel_latest.pkl  (trained on 60 days, full-data)"
+            echo "  - models/devil_latest.pkl  (trained on 60 days, full-data)"
+            echo ""
+            print_success "AUTONOMOUS RECOVERY COMPLETE"
+
+        elif [[ $retrainer_status -eq 2 ]]; then
+            # Gate rejected — production weights retained
+            print_warning "⚠️  CRITICAL DRIFT DETECTED — RETRAINING ATTEMPTED — MODELS REJECTED"
+            echo ""
+            echo "Candidate models failed walk-forward validation gate."
+            echo "Production weights were NOT replaced. Manual review recommended."
+            echo ""
+            echo "Check the retrainer log for rejection reasons:"
+            echo "  Brier Score  > 0.25  OR"
+            echo "  Expected Value < 0.0005  OR"
+            echo "  Profit Factor (Fold 3 OOS) < 1.2"
+            echo ""
+            print_warning "MANUAL REVIEW REQUIRED"
+
+        else
+            # Retrainer crashed (exit code 1)
+            print_error "RETRAINING FAILED WITH EXECUTION ERROR (exit code $retrainer_status)"
+            echo ""
+            echo "The retrainer encountered an unexpected error."
+            echo "Production weights were NOT replaced."
+            exit 1
+        fi
+
     else
-        # Error in execution
+        # Feedback loop itself errored
         print_error "Pipeline failed with exit code $feedback_status"
         exit 1
     fi
-    
+
     echo -e "${CYAN}$(printf '=%.0s' {1..70})${NC}"
 }
 
@@ -230,22 +263,23 @@ trap 'print_error "Pipeline interrupted by user"; exit 130' INT TERM
 main() {
     local start_time=$(date +%s)
     local feedback_status=0
-    
+    local retrainer_status=0
+
     print_header
-    
+
     # Pre-flight checks
     check_environment
     check_python
-    
+
     # Run pipeline phases 1-3 (these must succeed)
     run_harvester
     run_replay
     run_resolver
-    
+
     # Phase 4: Drift evaluation (handles its own exit codes)
     run_feedback
     feedback_status=$?
-    
+
     # Route based on feedback status
     if [[ $feedback_status -eq 2 ]]; then
         # Critical drift detected - trigger retraining
@@ -254,23 +288,24 @@ main() {
         echo -e "${RED}║              🚨 CRITICAL DRIFT ALERT 🚨                          ║${NC}"
         echo -e "${RED}╚══════════════════════════════════════════════════════════════════╝${NC}"
         echo ""
-        echo "[+] INITIATING THE CURE..."
+        echo "[+] INITIATING THE CURE (walk-forward validated)..."
         echo ""
-        
+
         run_retrainer
+        retrainer_status=$?
     fi
-    
+
     # Calculate execution time
     local end_time=$(date +%s)
     local duration=$((end_time - start_time))
     local minutes=$((duration / 60))
     local seconds=$((duration % 60))
-    
+
     echo ""
     print_success "Total execution time: ${minutes}m ${seconds}s"
-    
-    # Handle completion based on feedback status
-    handle_completion $feedback_status
+
+    # Handle completion based on both feedback and retrainer status
+    handle_completion $feedback_status $retrainer_status
 }
 
 # Run main function
