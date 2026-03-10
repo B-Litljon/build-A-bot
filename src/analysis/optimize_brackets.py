@@ -23,6 +23,7 @@ import numpy as np
 import polars as pl
 
 from src.ml.feature_pipeline import FeatureEngineer
+from src.core.retrainer import fetch_training_data, get_alpaca_client
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,9 +49,7 @@ MODEL_PATHS = [
     ),
 ]
 
-# Data paths
-OOS_BARS_PATH = Path("data/oos_bars.parquet")
-RAW_DATA_DIR = Path("data/raw")
+# Ticker list (matches retrainer; kept here for reference only)
 TICKERS = ["TSLA", "NVDA", "MARA", "COIN", "SMCI"]
 
 # Minimum trades for a configuration to be reported
@@ -88,25 +87,20 @@ class BracketResult:
 
 
 def load_data() -> pl.DataFrame:
-    if OOS_BARS_PATH.exists():
-        logger.info(f"Loading OOS bars from {OOS_BARS_PATH}")
-        return pl.read_parquet(OOS_BARS_PATH)
+    """
+    Fetch 60 days of 1-minute bars from Alpaca via the retrainer's pipeline.
 
-    logger.info(f"No OOS bars found. Scanning {RAW_DATA_DIR}")
-    frames = []
-    for path in sorted(RAW_DATA_DIR.glob("*_1min.parquet")):
-        symbol = path.stem.replace("_1min", "").upper()
-        if symbol in TICKERS:
-            df = pl.read_parquet(path)
-            if "symbol" not in df.columns:
-                df = df.with_columns(pl.lit(symbol).alias("symbol"))
-            frames.append(df)
-
-    if not frames:
-        raise FileNotFoundError(
-            f"No bar data found at {OOS_BARS_PATH} or in {RAW_DATA_DIR}/*.parquet"
-        )
-    return pl.concat(frames, how="vertical_relaxed").sort(["symbol", "timestamp"])
+    Uses the same fetch_training_data() / get_alpaca_client() functions as
+    src/core/retrainer.py to guarantee data consistency with training.
+    Requires ALPACA_API_KEY and ALPACA_SECRET_KEY in the environment (.env).
+    """
+    logger.info("Fetching 60 days of 1-minute bars from Alpaca...")
+    client = get_alpaca_client()
+    raw_df = fetch_training_data(client)
+    logger.info(
+        f"Fetched {len(raw_df):,} bars across {raw_df['symbol'].n_unique()} symbols"
+    )
+    return raw_df
 
 
 def load_models():
@@ -128,6 +122,14 @@ def generate_signals(
     devil_model,
 ) -> Tuple[pl.DataFrame, pl.DataFrame]:
     """Run Angel -> Devil inference; return (signals_df, featured_df)."""
+    # Safety: ensure timestamp is UTC-aware (fetch_training_data should already do this)
+    if "timestamp" in bars_df.columns:
+        ts_dtype = bars_df.schema["timestamp"]
+        if not hasattr(ts_dtype, "time_zone") or ts_dtype.time_zone is None:
+            bars_df = bars_df.with_columns(
+                pl.col("timestamp").dt.replace_time_zone("UTC")
+            )
+
     fe = FeatureEngineer()
     featured_df = fe.compute_indicators(bars_df)
 
@@ -511,6 +513,21 @@ def main() -> int:
         print("=" * 92)
 
         bars_df = load_data()
+
+        # Data coverage confirmation
+        n_symbols = bars_df["symbol"].n_unique()
+        symbols = sorted(bars_df["symbol"].unique().to_list())
+        min_ts = bars_df["timestamp"].min()
+        max_ts = bars_df["timestamp"].max()
+        try:
+            days_covered = (max_ts - min_ts).days
+        except Exception:
+            days_covered = "?"
+        logger.info(
+            f"Data coverage: {days_covered} days | {n_symbols} symbols: {symbols}"
+        )
+        logger.info(f"Total bars: {len(bars_df):,}")
+
         angel_model, devil_model = load_models()
         logger.info(
             f"Angel features ({len(angel_model.feature_names_in_)}): "
