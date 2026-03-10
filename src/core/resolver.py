@@ -38,8 +38,12 @@ BARS_PATH = Path("data/oos_bars.parquet")
 OUTPUT_PATH = Path("data/resolved_ledger.csv")
 
 # Bracket Order Parameters
-TP_MULTIPLIER = 1.005  # +0.5%
-SL_MULTIPLIER = 0.998  # -0.2%
+# NOTE: Legacy Phase 4 static-percentage brackets. This resolver is used by the
+# old OOS pipeline path (feedback_loop.py drift detection against resolved_ledger.csv).
+# The production system uses ATR-dynamic brackets: SL=0.5×ATR, TP=3.0×ATR, Hold=45 bars.
+# See src/evaluate_performance.py for the current bracket implementation.
+TP_MULTIPLIER = 1.005  # +0.5% (legacy static bracket — superseded by ATR-dynamic)
+SL_MULTIPLIER = 0.998  # -0.2% (legacy static bracket — superseded by ATR-dynamic)
 
 
 @dataclass

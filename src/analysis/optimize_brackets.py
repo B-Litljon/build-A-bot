@@ -415,11 +415,11 @@ def print_results(results: List[BracketResult]) -> None:
     current_matches = [
         r
         for r in results
-        if r.config.sl_mult == 1.5
+        if r.config.sl_mult == 0.5
         and r.config.tp_mult == 3.0
-        and r.config.max_hold == 15
+        and r.config.max_hold == 45
     ]
-    print(f"\n{_SEP}\nCURRENT CONFIG BASELINE  (SL=1.5× TP=3.0× Hold=15)\n{_SEP}")
+    print(f"\n{_SEP}\nCURRENT CONFIG BASELINE  (SL=0.5× TP=3.0× Hold=45)\n{_SEP}")
     if current_matches:
         c = current_matches[0]
         print(_HDR)
@@ -428,9 +428,9 @@ def print_results(results: List[BracketResult]) -> None:
         pf_rank = next(
             i + 1
             for i, r in enumerate(by_pf)
-            if r.config.sl_mult == 1.5
+            if r.config.sl_mult == 0.5
             and r.config.tp_mult == 3.0
-            and r.config.max_hold == 15
+            and r.config.max_hold == 45
         )
         print(_row(pf_rank, c) + f"  ← PF rank #{pf_rank}/{len(valid)}")
     else:

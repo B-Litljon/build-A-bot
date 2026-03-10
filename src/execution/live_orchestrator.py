@@ -136,8 +136,8 @@ ATR_KILL_SWITCH_THRESHOLD: float = 0.5204  # natr_14 percentage units
 ANGEL_THRESHOLD: float = 0.40
 DEVIL_THRESHOLD: float = 0.50
 
-# Bracket ATR multipliers (matching OOS backtest that produced +39.03R)
-SL_ATR_MULTIPLIER: float = 1.5
+# Bracket ATR multipliers (V3.3 grid-search optimum: SL=0.5×, TP=3.0×, Hold=45)
+SL_ATR_MULTIPLIER: float = 0.5
 TP_ATR_MULTIPLIER: float = 3.0
 
 # Cooldown after any bracket resolves before re-entry is allowed (seconds)

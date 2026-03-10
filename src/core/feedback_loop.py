@@ -40,8 +40,13 @@ logger = logging.getLogger(__name__)
 RESOLVED_PATH = Path("data/resolved_ledger.csv")
 
 # Bracket Parameters for EV Calculation
-TAKE_PROFIT = 0.005  # +0.5%
-STOP_LOSS = 0.002  # -0.2%
+# NOTE: These are legacy static-percentage brackets from the pre-V3.2 era.
+# The live system now uses ATR-dynamic brackets (SL=0.5×ATR, TP=3.0×ATR, Hold=45).
+# These constants are retained here for backward compatibility with resolved_ledger.csv
+# data produced by src/core/resolver.py, which also uses static percentage brackets.
+# They are superseded by the ATR-dynamic constants in retrainer.py / evaluate_performance.py.
+TAKE_PROFIT = 0.005  # +0.5% (legacy static bracket — superseded by ATR-dynamic)
+STOP_LOSS = 0.002  # -0.2% (legacy static bracket — superseded by ATR-dynamic)
 
 # Drift Detection Thresholds
 CRITICAL_BRIER = 0.25
