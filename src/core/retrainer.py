@@ -89,9 +89,9 @@ DEVIL_PARAMS = {
 # ATR BRACKET PARAMETERS (must match evaluate_performance.py and LiveOrchestrator)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-SL_ATR_MULTIPLIER = 1.5
+SL_ATR_MULTIPLIER = 0.5
 TP_ATR_MULTIPLIER = 3.0
-MAX_HOLD_BARS = 15
+MAX_HOLD_BARS = 45
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # INFERENCE THRESHOLDS (must match MLStrategy)
@@ -337,7 +337,7 @@ def engineer_features_and_labels(df: pl.DataFrame) -> Tuple[pl.DataFrame, List[s
 
     Targets:
         angel_target: 1 if close 3 bars ahead > close + 0.5 × ATR (ATR-relative)
-        devil_target: 1 if TP (3.0 × ATR) hit before SL (1.5 × ATR) in ≤15 bars
+        devil_target: 1 if TP (3.0 × ATR) hit before SL (0.5 × ATR) in ≤45 bars
 
     Args:
         df: Raw OHLCV DataFrame with columns:
@@ -377,7 +377,7 @@ def engineer_features_and_labels(df: pl.DataFrame) -> Tuple[pl.DataFrame, List[s
 
     # ═══════════════════════════════════════════════════════════════════
     # DEVIL TARGET: ATR-dynamic bracket resolution (bar-by-bar simulation)
-    # Must match evaluate_performance.py: SL=1.5×ATR, TP=3.0×ATR, max 15 bars
+    # Must match evaluate_performance.py: SL=0.5×ATR, TP=3.0×ATR, max 45 bars
     # ═══════════════════════════════════════════════════════════════════
     logger.info(
         f"Computing devil_target via ATR bracket simulation "

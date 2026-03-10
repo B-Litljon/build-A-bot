@@ -13,9 +13,9 @@ Inputs:
 
 Exit Logic:
     - Entry: Close price of signal bar
-    - SL: Entry - (1.5 * ATR)
+    - SL: Entry - (0.5 * ATR)
     - TP: Entry + (3.0 * ATR)
-    - Max Hold: 15 bars
+    - Max Hold: 45 bars
 """
 
 from __future__ import annotations
@@ -43,9 +43,9 @@ OUTPUT_PATH = Path("data/evaluation_results.parquet")
 DRIFT_REPORT_PATH = Path("data/drift_report.json")
 
 # Exit Parameters
-SL_MULTIPLIER = 1.5
+SL_MULTIPLIER = 0.5
 TP_MULTIPLIER = 3.0
-MAX_HOLD_BARS = 15
+MAX_HOLD_BARS = 45
 
 # Dynamic Thresholding Parameters
 BASE_THRESHOLD = 0.50  # Normal regime conviction requirement

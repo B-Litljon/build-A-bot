@@ -31,9 +31,9 @@ logger = logging.getLogger(__name__)
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 # Bracket parameters (must match retrainer and evaluate_performance)
-SL_ATR_MULTIPLIER = 1.5
+SL_ATR_MULTIPLIER = 0.5
 TP_ATR_MULTIPLIER = 3.0
-MAX_HOLD_BARS = 15
+MAX_HOLD_BARS = 45
 FAST_SL_CUTOFF = 3  # bars 1-3 = "fast" SL hit
 
 # Model thresholds (must match LiveOrchestrator / MLStrategy)
@@ -402,7 +402,7 @@ def print_analysis(trades: List[Dict]) -> None:
             print("   Consider both regime gating AND bracket tuning")
 
     # ── Break-even analysis ───────────────────────────────────────────────────
-    # Need WR > SL / (SL + TP) = 1.5 / (1.5 + 3.0) = 33.3%
+    # Need WR > SL / (SL + TP) = 0.5 / (0.5 + 3.0) = 14.3%
     breakeven_wr = SL_ATR_MULTIPLIER / (SL_ATR_MULTIPLIER + TP_ATR_MULTIPLIER)
     actual_wr = n_wins / n_total
     print(f"\n{'─' * 70}")
