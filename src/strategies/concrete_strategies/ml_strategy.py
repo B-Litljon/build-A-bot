@@ -94,6 +94,9 @@ class MLStrategy(Strategy):
         # Load models and track modification times
         logger.info(f"Loading Angel model from {angel_file}")
         self.angel_model = joblib.load(angel_file)
+        self.angel_model.n_jobs = (
+            1  # Prevent joblib IPC overhead on single-row inference
+        )
         self.angel_mtime = os.path.getmtime(angel_file)
         logger.info(
             f"Angel model loaded: {type(self.angel_model).__name__} (mtime: {self.angel_mtime})"
@@ -101,6 +104,9 @@ class MLStrategy(Strategy):
 
         logger.info(f"Loading Devil model from {devil_file}")
         self.devil_model = joblib.load(devil_file)
+        self.devil_model.n_jobs = (
+            1  # Prevent joblib IPC overhead on single-row inference
+        )
         self.devil_mtime = os.path.getmtime(devil_file)
         logger.info(
             f"Devil model loaded: {type(self.devil_model).__name__} (mtime: {self.devil_mtime})"
@@ -213,6 +219,9 @@ class MLStrategy(Strategy):
                     try:
                         new_angel_model = joblib.load(self.angel_path)
                         self.angel_model = new_angel_model
+                        self.angel_model.n_jobs = (
+                            1  # Prevent joblib IPC overhead on single-row inference
+                        )
                         self.angel_mtime = current_angel_mtime
                         logger.info(f"[HOT-RELOAD] Angel model updated successfully")
                         reloaded = True
@@ -229,6 +238,9 @@ class MLStrategy(Strategy):
                     try:
                         new_devil_model = joblib.load(self.devil_path)
                         self.devil_model = new_devil_model
+                        self.devil_model.n_jobs = (
+                            1  # Prevent joblib IPC overhead on single-row inference
+                        )
                         self.devil_mtime = current_devil_mtime
                         logger.info(f"[HOT-RELOAD] Devil model updated successfully")
                         reloaded = True

@@ -185,8 +185,14 @@ class ReplayHarness:
         # Load models
         logger.info("Loading Angel model...")
         self.angel_model = joblib.load(angel_model_path)
+        self.angel_model.n_jobs = (
+            1  # Prevent joblib IPC overhead on single-row inference
+        )
         logger.info("Loading Devil model...")
         self.devil_model = joblib.load(devil_model_path)
+        self.devil_model.n_jobs = (
+            1  # Prevent joblib IPC overhead on single-row inference
+        )
 
         # ═══════════════════════════════════════════════════════════════════
         # Dynamic Devil threshold — read from models/threshold.json so replay
