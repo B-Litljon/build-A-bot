@@ -89,11 +89,19 @@ def load_models():
     """Load Angel and Devil models from primary or fallback paths."""
     if ANGEL_PATH.exists() and DEVIL_PATH.exists():
         logger.info(f"Loading models from {ANGEL_PATH} / {DEVIL_PATH}")
-        return joblib.load(ANGEL_PATH), joblib.load(DEVIL_PATH)
+        angel_model = joblib.load(ANGEL_PATH)
+        devil_model = joblib.load(DEVIL_PATH)
+        angel_model.n_jobs = 1  # Prevent joblib IPC overhead on single-row inference
+        devil_model.n_jobs = 1
+        return angel_model, devil_model
 
     if ALT_ANGEL_PATH.exists() and ALT_DEVIL_PATH.exists():
         logger.info(f"Loading models from {ALT_ANGEL_PATH} / {ALT_DEVIL_PATH}")
-        return joblib.load(ALT_ANGEL_PATH), joblib.load(ALT_DEVIL_PATH)
+        angel_model = joblib.load(ALT_ANGEL_PATH)
+        devil_model = joblib.load(ALT_DEVIL_PATH)
+        angel_model.n_jobs = 1  # Prevent joblib IPC overhead on single-row inference
+        devil_model.n_jobs = 1
+        return angel_model, devil_model
 
     raise FileNotFoundError(
         f"Models not found at {ANGEL_PATH} or {ALT_ANGEL_PATH}. "

@@ -17,6 +17,7 @@ Usage:
     )
 """
 
+import json
 import logging
 import os
 from pathlib import Path
@@ -93,6 +94,9 @@ class MLStrategy(Strategy):
         # Load models and track modification times
         logger.info(f"Loading Angel model from {angel_file}")
         self.angel_model = joblib.load(angel_file)
+        self.angel_model.n_jobs = (
+            1  # Prevent joblib IPC overhead on single-row inference
+        )
         self.angel_mtime = os.path.getmtime(angel_file)
         logger.info(
             f"Angel model loaded: {type(self.angel_model).__name__} (mtime: {self.angel_mtime})"
@@ -100,6 +104,9 @@ class MLStrategy(Strategy):
 
         logger.info(f"Loading Devil model from {devil_file}")
         self.devil_model = joblib.load(devil_file)
+        self.devil_model.n_jobs = (
+            1  # Prevent joblib IPC overhead on single-row inference
+        )
         self.devil_mtime = os.path.getmtime(devil_file)
         logger.info(
             f"Devil model loaded: {type(self.devil_model).__name__} (mtime: {self.devil_mtime})"
@@ -138,6 +145,52 @@ class MLStrategy(Strategy):
             use_trailing_stop=False,
         )
 
+        # Override devil_threshold with the value persisted by the retrainer
+        # (models/threshold.json).  Must be called AFTER self.devil_threshold is
+        # set above so _load_threshold() can use it as a fallback.
+        self.devil_threshold = self._load_threshold()
+
+    def _load_threshold(self) -> float:
+        """
+        Load the Devil model's optimal threshold from models/threshold.json.
+
+        Written by retrainer.save_threshold() after a successful validation gate.
+        Falls back to self.devil_threshold (the value passed to __init__) if the
+        file is absent or corrupt.
+
+        Returns:
+            float: The production threshold for Devil approval decisions.
+        """
+        # Search relative to project root (4 levels up from this file in src/)
+        project_root = Path(__file__).resolve().parent.parent.parent.parent
+        threshold_path = project_root / "models" / "threshold.json"
+        if not threshold_path.exists():
+            logger.warning(
+                "_load_threshold: models/threshold.json not found — "
+                "using constructor default devil_threshold=%.2f",
+                self.devil_threshold,
+            )
+            return self.devil_threshold
+        try:
+            with open(threshold_path, "r") as fh:
+                data = json.load(fh)
+            threshold = float(data["devil_threshold"])
+            logger.info(
+                "_load_threshold: loaded production threshold=%.4f from %s",
+                threshold,
+                threshold_path,
+            )
+            return threshold
+        except Exception as exc:
+            logger.warning(
+                "_load_threshold: failed to read %s (%s) — "
+                "using constructor default devil_threshold=%.2f",
+                threshold_path,
+                exc,
+                self.devil_threshold,
+            )
+            return self.devil_threshold
+
     @property
     def warmup_period(self) -> int:
         """Returns minimum candles required for indicators to warm up."""
@@ -166,6 +219,9 @@ class MLStrategy(Strategy):
                     try:
                         new_angel_model = joblib.load(self.angel_path)
                         self.angel_model = new_angel_model
+                        self.angel_model.n_jobs = (
+                            1  # Prevent joblib IPC overhead on single-row inference
+                        )
                         self.angel_mtime = current_angel_mtime
                         logger.info(f"[HOT-RELOAD] Angel model updated successfully")
                         reloaded = True
@@ -182,6 +238,9 @@ class MLStrategy(Strategy):
                     try:
                         new_devil_model = joblib.load(self.devil_path)
                         self.devil_model = new_devil_model
+                        self.devil_model.n_jobs = (
+                            1  # Prevent joblib IPC overhead on single-row inference
+                        )
                         self.devil_mtime = current_devil_mtime
                         logger.info(f"[HOT-RELOAD] Devil model updated successfully")
                         reloaded = True
@@ -190,9 +249,21 @@ class MLStrategy(Strategy):
 
             # Send notification if any model was reloaded
             if reloaded:
+                # Also reload the threshold — a retrain always produces a new
+                # threshold.json alongside the new model weights.
+                old_threshold = self.devil_threshold
+                self.devil_threshold = self._load_threshold()
+                if self.devil_threshold != old_threshold:
+                    logger.info(
+                        "[HOT-RELOAD] Devil threshold updated: %.4f -> %.4f",
+                        old_threshold,
+                        self.devil_threshold,
+                    )
+
                 alert_message = (
                     "🔄 [HOT-RELOAD] New model weights ingested from disk. "
-                    f"Angel: {self.angel_path.name}, Devil: {self.devil_path.name}"
+                    f"Angel: {self.angel_path.name}, Devil: {self.devil_path.name} "
+                    f"| devil_threshold={self.devil_threshold:.4f}"
                 )
                 logger.critical(alert_message)
                 self.notification_manager.send_system_message(alert_message)

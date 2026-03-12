@@ -16,12 +16,14 @@ Features:
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Deque, Dict, Iterator, List, Optional, Tuple
 
 import joblib
 import numpy as np
@@ -183,8 +185,45 @@ class ReplayHarness:
         # Load models
         logger.info("Loading Angel model...")
         self.angel_model = joblib.load(angel_model_path)
+        self.angel_model.n_jobs = (
+            1  # Prevent joblib IPC overhead on single-row inference
+        )
         logger.info("Loading Devil model...")
         self.devil_model = joblib.load(devil_model_path)
+        self.devil_model.n_jobs = (
+            1  # Prevent joblib IPC overhead on single-row inference
+        )
+
+        # ═══════════════════════════════════════════════════════════════════
+        # Dynamic Devil threshold — read from models/threshold.json so replay
+        # uses exactly the same threshold the retrainer selected.  Falls back
+        # to the module-level DEVIL_THRESHOLD constant if file is absent.
+        # ═══════════════════════════════════════════════════════════════════
+        project_root = Path(__file__).resolve().parent.parent
+        threshold_path = project_root / "models" / "threshold.json"
+        self.devil_threshold: float = DEVIL_THRESHOLD  # start with module default
+        if threshold_path.exists():
+            try:
+                with open(threshold_path, "r") as _fh:
+                    _data = json.load(_fh)
+                self.devil_threshold = float(_data["devil_threshold"])
+                logger.info(
+                    "Dynamic Devil threshold loaded: %.4f (from %s)",
+                    self.devil_threshold,
+                    threshold_path,
+                )
+            except Exception as _exc:
+                logger.warning(
+                    "Could not read %s (%s) — using fallback DEVIL_THRESHOLD=%.2f",
+                    threshold_path,
+                    _exc,
+                    DEVIL_THRESHOLD,
+                )
+        else:
+            logger.warning(
+                "models/threshold.json not found — using fallback DEVIL_THRESHOLD=%.2f",
+                DEVIL_THRESHOLD,
+            )
 
         # ═══════════════════════════════════════════════════════════════════
         # IRONCLAD ALIGNMENT: Capture official feature order from models
@@ -201,8 +240,11 @@ class ReplayHarness:
                 "⚠️  Devil's last feature is not 'angel_prob' - meta-labeling may be misconfigured"
             )
 
-        # Track historical data per symbol for feature calculation
-        self.symbol_history: Dict[str, pl.DataFrame] = {}
+        # Track historical data per symbol for feature calculation.
+        # Each value is a deque of raw row dicts capped at WARMUP_PERIOD * 2
+        # entries.  Using a deque avoids the O(n²) pl.concat accumulation that
+        # the previous pl.DataFrame-per-symbol approach caused.
+        self.symbol_history: Dict[str, Deque[dict]] = {}
 
         # In-memory signal ledger (no row-by-row disk writes)
         self.signal_ledger: List[Dict] = []
@@ -212,26 +254,35 @@ class ReplayHarness:
         self.signals_generated = 0
 
     def _update_symbol_history(self, symbol: str, bar: pl.DataFrame) -> None:
-        """Append new bar to symbol's history, maintaining rolling window."""
+        """Append new bar to symbol's history deque (O(1), no DataFrame copy).
+
+        The deque is capped at WARMUP_PERIOD * 2 rows via maxlen; old entries
+        are automatically evicted when the window is full.  The DataFrame is
+        only materialised when _generate_features() is actually called.
+        """
         if symbol not in self.symbol_history:
-            self.symbol_history[symbol] = bar
-        else:
-            # Append and keep last N bars for warmup
-            self.symbol_history[symbol] = pl.concat(
-                [self.symbol_history[symbol], bar], how="vertical_relaxed"
-            ).tail(WARMUP_PERIOD * 2)  # Keep extra buffer
+            self.symbol_history[symbol] = deque(maxlen=WARMUP_PERIOD * 2)
+        # Extract the single row as a plain dict and append — O(1)
+        self.symbol_history[symbol].append(bar.row(0, named=True))
 
     def _generate_features(self, symbol: str) -> Optional[pl.DataFrame]:
-        """Generate features for a symbol's current history."""
+        """Generate features for a symbol's current history.
+
+        Materialises the deque of row dicts into a Polars DataFrame only at
+        inference time — no per-bar copy overhead.
+        """
         if symbol not in self.symbol_history:
             return None
 
-        df = self.symbol_history[symbol]
+        history_deque = self.symbol_history[symbol]
 
-        if len(df) < WARMUP_PERIOD:
+        if len(history_deque) < WARMUP_PERIOD:
             return None
 
         try:
+            # Build DataFrame from the deque once per inference call (O(n))
+            df = pl.DataFrame(list(history_deque))
+
             features_df = self.feature_engineer.compute_indicators(df)
 
             # Filter to feature columns only
@@ -305,7 +356,7 @@ class ReplayHarness:
             warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
             devil_prob = self.devil_model.predict_proba(devil_input)[0, 1]
 
-        if devil_prob < DEVIL_THRESHOLD:
+        if devil_prob < self.devil_threshold:
             return None  # Rejection - not appended to ledger
 
         # Both agree - BUY signal
@@ -332,7 +383,9 @@ class ReplayHarness:
         logger.info("OOS REPLAY HARNESS v3.0")
         logger.info("=" * 70)
         logger.info(f"Angel threshold: {ANGEL_THRESHOLD}")
-        logger.info(f"Devil threshold: {DEVIL_THRESHOLD}")
+        logger.info(
+            f"Devil threshold: {self.devil_threshold} (module default: {DEVIL_THRESHOLD})"
+        )
         logger.info(f"Warmup period: {WARMUP_PERIOD} bars")
 
         # Main replay loop

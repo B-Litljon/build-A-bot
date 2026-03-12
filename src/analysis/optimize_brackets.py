@@ -107,7 +107,13 @@ def load_models():
     for angel_path, devil_path in MODEL_PATHS:
         if angel_path.exists() and devil_path.exists():
             logger.info(f"Loading models from {angel_path.parent}/")
-            return joblib.load(angel_path), joblib.load(devil_path)
+            angel_model = joblib.load(angel_path)
+            devil_model = joblib.load(devil_path)
+            angel_model.n_jobs = (
+                1  # Prevent joblib IPC overhead on single-row inference
+            )
+            devil_model.n_jobs = 1
+            return angel_model, devil_model
     raise FileNotFoundError(
         "Models not found. Run the retrainer: python -m src.core.retrainer"
     )
