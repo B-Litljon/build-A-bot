@@ -168,7 +168,7 @@ class MLStrategy(Strategy):
         try:
             with open(threshold_path, "r") as fh:
                 data = json.load(fh)
-            threshold = float(data["threshold"])
+            threshold = float(data["devil_threshold"])
             logger.info(
                 "_load_threshold: loaded production threshold=%.4f from %s",
                 threshold,
