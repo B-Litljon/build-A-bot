@@ -134,7 +134,51 @@ ATR_KILL_SWITCH_THRESHOLD: float = 0.5204  # natr_14 percentage units
 # Angel/Devil classification thresholds — restored to standard after the
 # crypto-only stress-test sprint.
 ANGEL_THRESHOLD: float = 0.40
+# Legacy fallback only — production threshold is loaded dynamically from
+# models/threshold.json by _load_devil_threshold() at orchestrator startup.
 DEVIL_THRESHOLD: float = 0.50
+
+
+def _load_devil_threshold() -> float:
+    """
+    Load the Devil model's optimal threshold from models/threshold.json.
+
+    Written by retrainer.save_threshold() after a successful validation gate.
+    Falls back to the module-level DEVIL_THRESHOLD constant if the file is
+    absent or corrupt so the bot remains operational after a fresh clone or
+    before the first successful retrain.
+
+    Returns:
+        float: The production threshold to use for Devil approval decisions.
+    """
+    threshold_path = Path("models/threshold.json")
+    if not threshold_path.exists():
+        logger.warning(
+            "_load_devil_threshold: models/threshold.json not found — "
+            "using legacy fallback DEVIL_THRESHOLD=%.2f",
+            DEVIL_THRESHOLD,
+        )
+        return DEVIL_THRESHOLD
+    try:
+        with open(threshold_path, "r") as fh:
+            data = json.load(fh)
+        threshold = float(data["threshold"])
+        logger.info(
+            "_load_devil_threshold: loaded production threshold=%.4f from %s",
+            threshold,
+            threshold_path,
+        )
+        return threshold
+    except Exception as exc:
+        logger.warning(
+            "_load_devil_threshold: failed to read %s (%s) — "
+            "using legacy fallback DEVIL_THRESHOLD=%.2f",
+            threshold_path,
+            exc,
+            DEVIL_THRESHOLD,
+        )
+        return DEVIL_THRESHOLD
+
 
 # Bracket ATR multipliers (V3.3 grid-search optimum: SL=0.5×, TP=3.0×, Hold=45)
 SL_ATR_MULTIPLIER: float = 0.5
@@ -303,12 +347,15 @@ class LiveOrchestrator:
         self._crypto_set: Set[str] = set(self._crypto_symbols)
         self._stock_set: Set[str] = set(self._stock_symbols)
 
+        # -- Dynamic Devil threshold (loaded from models/threshold.json) --
+        self._devil_threshold: float = _load_devil_threshold()
+
         # -- Core components (stateless / shared across symbols) --
         self._strategy = MLStrategy(
             angel_path=angel_model_path,
             devil_path=devil_model_path,
             angel_threshold=ANGEL_THRESHOLD,
-            devil_threshold=DEVIL_THRESHOLD,
+            devil_threshold=self._devil_threshold,
             warmup_period=MIN_HISTORY_BARS,
         )
         self._feature_engineer = FeatureEngineer()
@@ -1011,13 +1058,13 @@ class LiveOrchestrator:
                 self._strategy.devil_model.predict_proba(meta_df)[0, 1]
             )
 
-            if devil_prob < DEVIL_THRESHOLD:
+            if devil_prob < self._devil_threshold:
                 logger.debug(
                     "[%s] Devil VETO | angel=%.4f devil=%.4f < threshold=%.4f",
                     symbol,
                     angel_prob,
                     devil_prob,
-                    DEVIL_THRESHOLD,
+                    self._devil_threshold,
                 )
                 return None
 

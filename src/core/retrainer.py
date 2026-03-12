@@ -26,6 +26,7 @@ Environment Variables:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
@@ -81,7 +82,9 @@ DEVIL_PARAMS = {
     "n_estimators": 100,
     "max_depth": 8,
     "random_state": 42,
-    "class_weight": "balanced",
+    # class_weight intentionally None — the Devil must learn the true ~20%
+    # base rate. "balanced" artificially inflated probabilities, causing
+    # Brier Score failure (0.31 > 0.25 threshold) and rubber-stamping.
     "n_jobs": -1,
 }
 
@@ -98,6 +101,8 @@ MAX_HOLD_BARS = 45
 # ═══════════════════════════════════════════════════════════════════════════════
 
 ANGEL_THRESHOLD = 0.40
+# Legacy: used as a fallback. In validate_candidate(), the Devil threshold
+# is dynamically selected per-fold via _find_optimal_threshold().
 DEVIL_THRESHOLD = 0.50
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -614,6 +619,66 @@ def refit_models(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# DYNAMIC THRESHOLD SELECTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _find_optimal_threshold(
+    devil_probs: np.ndarray,
+    targets: np.ndarray,
+    sl_mult: float = SL_ATR_MULTIPLIER,
+    tp_mult: float = TP_ATR_MULTIPLIER,
+    min_trades: int = 5,
+) -> Tuple[float, float]:
+    """
+    Sweep thresholds to find the one that maximizes Expected Value.
+
+    For each candidate threshold, computes:
+      - Which trades are approved (devil_prob >= threshold)
+      - Win rate on approved trades
+      - EV = win_rate * tp_mult - (1 - win_rate) * sl_mult
+
+    Without class_weight="balanced", the Devil's probabilities reflect the true
+    ~20% base rate, so predictions cluster in the 0.10–0.35 range. A hardcoded
+    0.50 threshold would reject everything. This sweep finds the actual optimal
+    decision boundary per fold.
+
+    Args:
+        devil_probs: Array of Devil's predicted probabilities
+        targets: Array of ground truth devil_target (0 or 1)
+        sl_mult: Stop-loss ATR multiplier (for R-multiple EV calculation)
+        tp_mult: Take-profit ATR multiplier (for R-multiple EV calculation)
+        min_trades: Minimum approved trades for a threshold to be considered valid
+
+    Returns:
+        Tuple of (optimal_threshold, best_ev)
+    """
+    thresholds = np.arange(0.10, 0.46, 0.02)  # 0.10, 0.12, 0.14, ..., 0.44
+    best_threshold = 0.20  # fallback default
+    best_ev = -float("inf")
+
+    for t in thresholds:
+        mask = devil_probs >= t
+        n_approved = int(mask.sum())
+
+        if n_approved < min_trades:
+            continue
+
+        approved_targets = targets[mask]
+        win_rate = float(approved_targets.mean())
+
+        # EV in R-multiples: wins pay tp_mult/sl_mult R, losses pay -1R
+        rr_ratio = tp_mult / sl_mult
+        ev = win_rate * rr_ratio - (1.0 - win_rate)
+
+        if ev > best_ev:
+            best_ev = ev
+            best_threshold = float(t)
+
+    return best_threshold, float(best_ev)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # WALK-FORWARD VALIDATION GATE
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -628,6 +693,7 @@ def validate_candidate(
     RandomForestClassifier,
     List[str],
     List[str],
+    float,
 ]:
     """
     Run expanding-window walk-forward cross-validation and apply the promotion gate.
@@ -654,6 +720,12 @@ def validate_candidate(
         Mean EV            ≥ 0.0005 (across all folds)
         Profit Factor      ≥ 1.20   (Fold 3 val set only)
 
+    Dynamic threshold:
+        With class_weight=None, Devil probabilities reflect the true ~20% base
+        rate. Per-fold, _find_optimal_threshold() sweeps 0.10–0.44 and selects
+        the threshold maximizing EV. The Fold 3 threshold is returned as the
+        production threshold.
+
     Args:
         df: Full 60-day feature-engineered DataFrame (output of
             engineer_features_and_labels).
@@ -667,6 +739,7 @@ def validate_candidate(
             - devil_model (full-data if gate passed, Fold 3 if rejected)
             - angel_feature_names
             - devil_feature_names
+            - production_threshold (optimal Devil threshold from Fold 3)
     """
     logger.info("=" * 70)
     logger.info("WALK-FORWARD VALIDATION (3 EXPANDING FOLDS)")
@@ -694,6 +767,7 @@ def validate_candidate(
     profit_factor: float = 0.0
     final_win_rate: float = 0.0
     final_total_trades: int = 0
+    production_threshold: float = 0.20  # fallback; overwritten by Fold 3
 
     for fold_idx, (train_end_day, val_end_day) in enumerate(fold_configs):
         fold_number = fold_idx + 1
@@ -867,7 +941,29 @@ def validate_candidate(
 
             logger.info(f"{'─' * 60}\n")
 
-        approved_mask = devil_probs_val >= DEVIL_THRESHOLD
+        # ─────────────────────────────────────────────────────────────
+        # Dynamic threshold selection — sweep 0.10–0.44 for max EV
+        # Replaces hardcoded DEVIL_THRESHOLD (0.50) which rejects all
+        # trades when class_weight=None shifts probs to the true ~20%
+        # base-rate range.
+        # ─────────────────────────────────────────────────────────────
+        optimal_threshold, fold_ev_at_threshold = _find_optimal_threshold(
+            devil_probs=devil_probs_val,
+            targets=proposed_devil_targets,
+        )
+        logger.info(
+            f"  [Fold {fold_number}] Dynamic threshold: {optimal_threshold:.2f} "
+            f"(EV at threshold: {fold_ev_at_threshold:+.4f})"
+        )
+
+        # Store Fold 3 threshold as the production threshold
+        if fold_number == n_folds:
+            production_threshold = optimal_threshold
+            logger.info(
+                f"  Production threshold (Fold {fold_number}): {production_threshold:.2f}"
+            )
+
+        approved_mask = devil_probs_val >= optimal_threshold
         n_devil_approved = int(approved_mask.sum())
         logger.info(
             f"[Fold {fold_number}] Devil approved {n_devil_approved} trades "
@@ -1019,7 +1115,14 @@ def validate_candidate(
         rejection_reasons=rejection_reasons,
     )
 
-    return report, final_angel, final_devil, final_angel_feats, final_devil_feats
+    return (
+        report,
+        final_angel,
+        final_devil,
+        final_angel_feats,
+        final_devil_feats,
+        production_threshold,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1031,13 +1134,15 @@ def promote_or_reject(
     report: ValidationReport,
     angel_model: RandomForestClassifier,
     devil_model: RandomForestClassifier,
+    threshold: float = 0.20,
 ) -> bool:
     """
     Promote or reject candidate models based on the validation report.
 
     If gate passed: the models passed in were trained on the full 60-day
     dataset (after CV validation confirmed generalizability). Saves them
-    atomically via save_models().
+    atomically via save_models(), then saves the optimal threshold via
+    save_threshold().
 
     If gate failed: the models passed in are Fold 3 models (not saved).
     Production weights are retained, rejection alert is sent to Discord.
@@ -1046,6 +1151,7 @@ def promote_or_reject(
         report: ValidationReport from validate_candidate()
         angel_model: Final model (full-data if gate passed, Fold 3 if failed)
         devil_model: Final model (full-data if gate passed, Fold 3 if failed)
+        threshold: Optimal Devil threshold from Fold 3 (default: 0.20 fallback)
 
     Returns:
         True if models were promoted, False if rejected.
@@ -1058,6 +1164,7 @@ def promote_or_reject(
         logger.info("=" * 70)
 
         save_models(angel_model, devil_model)
+        save_threshold(threshold)
 
         notifier.send_retraining_report(report, promoted=True)
         return True
@@ -1137,6 +1244,36 @@ def save_models(
     )
 
 
+def save_threshold(threshold: float) -> None:
+    """
+    Save the optimal Devil threshold to disk as a JSON sidecar file.
+
+    Written atomically alongside the model .pkl files.  The LiveOrchestrator
+    and MLStrategy read this on startup and via hot-reload so the live bot
+    always uses the threshold that maximises EV on the most recent data.
+
+    Args:
+        threshold: The optimal Devil probability threshold (e.g., 0.28)
+    """
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    threshold_path = MODEL_DIR / "threshold.json"
+
+    data = {
+        "devil_threshold": round(threshold, 4),
+        "updated_at": datetime.now().isoformat(),
+    }
+
+    # Atomic write — same pattern as model serialisation
+    temp_path = MODEL_DIR / "threshold_temp.json"
+    with open(temp_path, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(temp_path, threshold_path)
+
+    logger.info(
+        f"[ATOMIC] Threshold saved: {threshold_path} (devil_threshold={threshold:.4f})"
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1184,14 +1321,22 @@ def main() -> int:
         logger.info("WALK-FORWARD VALIDATION (3 EXPANDING FOLDS)")
         logger.info("=" * 70)
 
-        report, angel_model, devil_model, angel_feats, devil_feats = validate_candidate(
-            features_df, feature_cols, n_folds=3
-        )
+        (
+            report,
+            angel_model,
+            devil_model,
+            angel_feats,
+            devil_feats,
+            optimal_threshold,
+        ) = validate_candidate(features_df, feature_cols, n_folds=3)
+        logger.info(f"Optimal Devil threshold (from Fold 3): {optimal_threshold:.4f}")
 
         # ─── Phase 4: Gate decision ─────────────────────────────────────────
         # If gate passed: angel_model/devil_model are trained on full 60 days
         # If gate failed: they are Fold 3 models (will NOT be saved)
-        promoted = promote_or_reject(report, angel_model, devil_model)
+        promoted = promote_or_reject(
+            report, angel_model, devil_model, optimal_threshold
+        )
 
         if promoted:
             logger.info("=" * 70)

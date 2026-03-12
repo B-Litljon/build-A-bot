@@ -16,6 +16,7 @@ Features:
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 from dataclasses import dataclass
@@ -187,6 +188,37 @@ class ReplayHarness:
         self.devil_model = joblib.load(devil_model_path)
 
         # ═══════════════════════════════════════════════════════════════════
+        # Dynamic Devil threshold — read from models/threshold.json so replay
+        # uses exactly the same threshold the retrainer selected.  Falls back
+        # to the module-level DEVIL_THRESHOLD constant if file is absent.
+        # ═══════════════════════════════════════════════════════════════════
+        project_root = Path(__file__).resolve().parent.parent
+        threshold_path = project_root / "models" / "threshold.json"
+        self.devil_threshold: float = DEVIL_THRESHOLD  # start with module default
+        if threshold_path.exists():
+            try:
+                with open(threshold_path, "r") as _fh:
+                    _data = json.load(_fh)
+                self.devil_threshold = float(_data["threshold"])
+                logger.info(
+                    "Dynamic Devil threshold loaded: %.4f (from %s)",
+                    self.devil_threshold,
+                    threshold_path,
+                )
+            except Exception as _exc:
+                logger.warning(
+                    "Could not read %s (%s) — using fallback DEVIL_THRESHOLD=%.2f",
+                    threshold_path,
+                    _exc,
+                    DEVIL_THRESHOLD,
+                )
+        else:
+            logger.warning(
+                "models/threshold.json not found — using fallback DEVIL_THRESHOLD=%.2f",
+                DEVIL_THRESHOLD,
+            )
+
+        # ═══════════════════════════════════════════════════════════════════
         # IRONCLAD ALIGNMENT: Capture official feature order from models
         # This ensures NumPy arrays match the exact column order from training
         # ═══════════════════════════════════════════════════════════════════
@@ -305,7 +337,7 @@ class ReplayHarness:
             warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
             devil_prob = self.devil_model.predict_proba(devil_input)[0, 1]
 
-        if devil_prob < DEVIL_THRESHOLD:
+        if devil_prob < self.devil_threshold:
             return None  # Rejection - not appended to ledger
 
         # Both agree - BUY signal
@@ -332,7 +364,9 @@ class ReplayHarness:
         logger.info("OOS REPLAY HARNESS v3.0")
         logger.info("=" * 70)
         logger.info(f"Angel threshold: {ANGEL_THRESHOLD}")
-        logger.info(f"Devil threshold: {DEVIL_THRESHOLD}")
+        logger.info(
+            f"Devil threshold: {self.devil_threshold} (module default: {DEVIL_THRESHOLD})"
+        )
         logger.info(f"Warmup period: {WARMUP_PERIOD} bars")
 
         # Main replay loop
