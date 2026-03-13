@@ -1108,7 +1108,7 @@ class LiveOrchestrator:
                     ]
                 )
 
-            # V3.3: 14-feature set (10 base + 4 HTF 5m features)
+            # V3.3: 18-feature set (10 base + 4 HTF 5m + 4 microstructure)
             ml_feature_names = [
                 "rsi_14",
                 "ppo",
@@ -1125,6 +1125,11 @@ class LiveOrchestrator:
                 "htf_trend_agreement",
                 "htf_vol_rel",
                 "htf_bb_pct_b",
+                # Phase 5: Microstructure features
+                "range_coil_10",
+                "bar_body_pct",
+                "bar_upper_wick_pct",
+                "bar_lower_wick_pct",
             ]
 
             # Drop any rows containing Nulls, NaNs, or Infinities to prevent model crashes
