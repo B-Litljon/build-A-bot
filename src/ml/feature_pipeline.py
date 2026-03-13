@@ -82,7 +82,7 @@ class FeatureEngineer:
             the 4 HTF features: htf_rsi_14, htf_trend_agreement,
             htf_vol_rel, htf_bb_pct_b.
         """
-        df = self._compute_base_features(df)
+        df = self.compute_base_features(df)
         if htf_timeframe is not None:
             df = self._compute_htf_features(df, htf_timeframe)
         return df
@@ -131,7 +131,7 @@ class FeatureEngineer:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _compute_base_features(df: pl.DataFrame) -> pl.DataFrame:
+    def compute_base_features(df: pl.DataFrame) -> pl.DataFrame:
         """
         Compute 1m technical indicators via TA-Lib.
 
@@ -222,7 +222,7 @@ class FeatureEngineer:
         Single-symbol path (live inference): no 'by' grouping needed.
 
         Args:
-            df:         1m DataFrame already enriched by _compute_base_features.
+            df:         1m DataFrame already enriched by compute_base_features.
                         Must contain: timestamp, high, low, close, volume.
             timeframe:  Polars group_by_dynamic period string (e.g. "5m").
 
