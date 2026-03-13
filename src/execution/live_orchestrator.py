@@ -60,7 +60,8 @@ import signal
 import sys
 import time
 import traceback
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
 from pathlib import Path
 from typing import Dict, List, Optional, Set
@@ -216,6 +217,81 @@ MAX_ACTIVITY_LOG: int = 5
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# HTF Feature Cache (Phase 6)
+# ---------------------------------------------------------------------------
+
+HTF_CACHE_PERIOD_MINUTES: int = 5  # Must match _HTF_TIMEFRAME in feature_pipeline.py
+
+
+@dataclass
+class HTFCache:
+    """
+    Stores the last computed HTF feature scalars for a single symbol.
+
+    Lifecycle:
+        - Created by _prime_htf_cache() immediately after warm-up completes.
+        - Refreshed by _run_inference() when bar_timestamp >= next_available_at
+          (cold path — full recompute via compute_indicators).
+        - On the warm path, its scalar values are injected as Polars literals,
+          bypassing the group_by_dynamic + TA-Lib resample entirely.
+
+    All datetime fields are UTC-aware. No naive datetimes permitted.
+    """
+
+    htf_rsi_14: float
+    htf_trend_agreement: int  # -1, 0, or 1
+    htf_vol_rel: float
+    htf_bb_pct_b: float
+    next_available_at: datetime  # UTC-aware: when to next re-seal
+    sealed_at: datetime  # UTC-aware: timestamp of last cold-path run
+
+    @classmethod
+    def from_features_df(
+        cls, features_df: pl.DataFrame, bar_ts: datetime
+    ) -> "HTFCache":
+        """
+        Build an HTFCache from the output of compute_indicators().
+
+        Extracts the last row's HTF scalar values and computes
+        next_available_at from bar_ts.
+
+        Args:
+            features_df: Output of FeatureEngineer.compute_indicators() —
+                         must contain htf_rsi_14, htf_trend_agreement,
+                         htf_vol_rel, htf_bb_pct_b columns.
+            bar_ts:      UTC-aware timestamp of the bar that triggered the
+                         cold-path recompute.
+
+        Returns:
+            A populated HTFCache instance.
+        """
+        latest = features_df.tail(1)
+
+        # Compute next seal boundary: floor to 5m window, then add two periods.
+        # Example: bar_ts=10:03 UTC → floor=10:00 → next_available_at=10:10
+        period = timedelta(minutes=HTF_CACHE_PERIOD_MINUTES)
+        bar_ts_naive_minutes = bar_ts.minute
+        floor_offset = timedelta(
+            minutes=bar_ts_naive_minutes % HTF_CACHE_PERIOD_MINUTES,
+            seconds=bar_ts.second,
+            microseconds=bar_ts.microsecond,
+        )
+        window_floor = bar_ts - floor_offset
+        next_available_at = (
+            window_floor + period + period
+        )  # current + 1 full period ahead
+
+        return cls(
+            htf_rsi_14=float(latest["htf_rsi_14"][0]),
+            htf_trend_agreement=int(latest["htf_trend_agreement"][0]),
+            htf_vol_rel=float(latest["htf_vol_rel"][0]),
+            htf_bb_pct_b=float(latest["htf_bb_pct_b"][0]),
+            next_available_at=next_available_at,
+            sealed_at=bar_ts,
+        )
+
+
 class SymbolState(Enum):
     """Lifecycle states for a single symbol's trading slot."""
 
@@ -270,6 +346,10 @@ class SymbolContext:
         self.last_price: Optional[float] = None
         self.last_atr: Optional[float] = None
         self.last_conviction: Optional[float] = None
+
+        # Phase 6: HTF feature cache — None until _prime_htf_cache() fires
+        # after warm-up. _run_inference() refreshes this on every cold path.
+        self.htf_cache: Optional[HTFCache] = None
 
     def __repr__(self) -> str:  # pragma: no cover
         asset = "CRYPTO" if self.is_crypto else "EQUITY"
@@ -965,9 +1045,68 @@ class LiveOrchestrator:
                 )
 
             # ----------------------------------------------------------------
-            # Feature engineering (TA-Lib; releases GIL on C extensions)
+            # Feature engineering — Phase 6 Cold/Warm Path
             # ----------------------------------------------------------------
-            features_df = self._feature_engineer.compute_indicators(history_df)
+            # Resolve bar timestamp for cache boundary check.
+            bar_timestamp: datetime = history_df.tail(1)["timestamp"][0]
+            if hasattr(bar_timestamp, "tzinfo") and bar_timestamp.tzinfo is None:
+                bar_timestamp = bar_timestamp.replace(tzinfo=timezone.utc)
+
+            ctx = self._contexts[symbol]
+
+            # Cold path: cache absent, stale, or seal boundary crossed.
+            # Handles: cold start, overnight gaps, any gap > 5m, session open.
+            if (
+                ctx.htf_cache is None
+                or bar_timestamp >= ctx.htf_cache.next_available_at
+            ):
+                logger.debug(
+                    "[%s] HTF cold path | bar_ts=%s | next_available_at=%s",
+                    symbol,
+                    bar_timestamp.isoformat(),
+                    ctx.htf_cache.next_available_at.isoformat()
+                    if ctx.htf_cache
+                    else "None",
+                )
+                # Full recompute — TA-Lib resample on all 400 1m bars
+                features_df = self._feature_engineer.compute_indicators(history_df)
+
+                # Refresh cache from the newly computed features
+                valid_htf = features_df.filter(
+                    pl.all_horizontal(
+                        pl.col(
+                            [
+                                "htf_rsi_14",
+                                "htf_trend_agreement",
+                                "htf_vol_rel",
+                                "htf_bb_pct_b",
+                            ]
+                        ).is_not_null()
+                    )
+                )
+                if len(valid_htf) > 0:
+                    ctx.htf_cache = HTFCache.from_features_df(valid_htf, bar_timestamp)
+
+            else:
+                # Warm path: compute 1m base features only, inject HTF scalars.
+                # Saves ~3ms by skipping group_by_dynamic + 4 TA-Lib HTF calls.
+                logger.debug(
+                    "[%s] HTF warm path | bar_ts=%s | cache sealed_at=%s",
+                    symbol,
+                    bar_timestamp.isoformat(),
+                    ctx.htf_cache.sealed_at.isoformat(),
+                )
+                features_df = self._feature_engineer.compute_base_features(history_df)
+                features_df = features_df.with_columns(
+                    [
+                        pl.lit(ctx.htf_cache.htf_rsi_14).alias("htf_rsi_14"),
+                        pl.lit(ctx.htf_cache.htf_trend_agreement)
+                        .cast(pl.Int8)
+                        .alias("htf_trend_agreement"),
+                        pl.lit(ctx.htf_cache.htf_vol_rel).alias("htf_vol_rel"),
+                        pl.lit(ctx.htf_cache.htf_bb_pct_b).alias("htf_bb_pct_b"),
+                    ]
+                )
 
             # V3.3: 14-feature set (10 base + 4 HTF 5m features)
             ml_feature_names = [
@@ -1638,6 +1777,74 @@ class LiveOrchestrator:
     # REST API warm-up — pre-fills aggregator rolling windows on boot
     # -----------------------------------------------------------------------
 
+    def _prime_htf_cache(self, symbol: str) -> None:
+        """
+        Run a one-time full compute_indicators() pass on the warmed-up
+        history buffer and populate ctx.htf_cache for the given symbol.
+
+        Called once per symbol after _warmup_aggregator() completes.
+        Ensures the first live bar never hits a None cache (cold-start safety).
+
+        If the history buffer is too shallow or indicators return NaN for
+        all HTF columns, logs a warning and leaves ctx.htf_cache = None
+        (the warm path in _run_inference will fall back to cold path safely).
+        """
+        ctx = self._contexts[symbol]
+        history_df = ctx.aggregator.history_df
+
+        if len(history_df) < MIN_HISTORY_BARS:
+            logger.warning(
+                "[%s] _prime_htf_cache: only %d bars in history (need %d) — "
+                "cache not primed; first inference will cold-path.",
+                symbol,
+                len(history_df),
+                MIN_HISTORY_BARS,
+            )
+            return
+
+        try:
+            features_df = self._feature_engineer.compute_indicators(history_df)
+
+            htf_cols = [
+                "htf_rsi_14",
+                "htf_trend_agreement",
+                "htf_vol_rel",
+                "htf_bb_pct_b",
+            ]
+            valid = features_df.filter(
+                pl.all_horizontal(pl.col(htf_cols).is_not_null())
+            )
+            if len(valid) == 0:
+                logger.warning(
+                    "[%s] _prime_htf_cache: all HTF rows null after compute — "
+                    "cache not primed.",
+                    symbol,
+                )
+                return
+
+            # Use the timestamp of the last valid bar as the seal anchor
+            last_ts = valid.tail(1)["timestamp"][0]
+            # Ensure UTC-aware Python datetime
+            if hasattr(last_ts, "tzinfo") and last_ts.tzinfo is None:
+                last_ts = last_ts.replace(tzinfo=timezone.utc)
+
+            ctx.htf_cache = HTFCache.from_features_df(valid, last_ts)
+            logger.info(
+                "[%s] HTF cache primed | next_available_at=%s | "
+                "htf_rsi_14=%.2f | htf_trend_agreement=%d",
+                symbol,
+                ctx.htf_cache.next_available_at.isoformat(),
+                ctx.htf_cache.htf_rsi_14,
+                ctx.htf_cache.htf_trend_agreement,
+            )
+
+        except Exception as exc:
+            logger.warning(
+                "[%s] _prime_htf_cache failed — cache not primed: %s",
+                symbol,
+                exc,
+            )
+
     async def _warmup_aggregator(self) -> None:
         """
         Pre-loads each symbol's LiveBarAggregator with the last ~480 one-minute
@@ -1746,6 +1953,10 @@ class LiveOrchestrator:
                 )
 
             logger.info("Aggregator warm-up complete.")
+            logger.info("Priming HTF caches for all symbols...")
+            for symbol in self._symbols:
+                self._prime_htf_cache(symbol)
+            logger.info("HTF cache priming complete.")
             return
 
         # ----------------------------------------------------------------------
@@ -1872,6 +2083,10 @@ class LiveOrchestrator:
                 progress.advance(overall_task)
 
         logger.info("Aggregator warm-up complete.")
+        logger.info("Priming HTF caches for all symbols...")
+        for symbol in self._symbols:
+            self._prime_htf_cache(symbol)
+        logger.info("HTF cache priming complete.")
 
     async def _fetch_crypto_history(
         self, end_time, progress: Optional[Progress] = None
