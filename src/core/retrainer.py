@@ -724,7 +724,9 @@ def refit_models(
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
         angel_acc = angel_model.score(X_base, y_angel, sample_weight=sample_weights)
-        devil_acc = devil_model.score(X_devil, y_devil, sample_weight=sample_weights)
+        devil_acc = devil_model.score(
+            X_devil, y_devil_train, sample_weight=devil_weights
+        )
 
     logger.info(f"\n{'=' * 70}")
     logger.info("META-LABELING TRAINING COMPLETE")
