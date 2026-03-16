@@ -402,8 +402,8 @@ class LiveOrchestrator:
         api_key: Optional[str] = None,
         secret_key: Optional[str] = None,
         paper: bool = True,
-        angel_model_path: str = "src/ml/models/angel_rf_model.joblib",
-        devil_model_path: str = "src/ml/models/devil_rf_model.joblib",
+        angel_model_path: str = "models/angel_latest.pkl",
+        devil_model_path: str = "models/devil_latest.pkl",
         daemon_mode: bool = False,
     ) -> None:
         # Configure logging before anything else so the very first logger call
