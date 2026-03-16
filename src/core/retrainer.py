@@ -95,6 +95,7 @@ DEVIL_PARAMS = {
 SL_ATR_MULTIPLIER = 0.5
 TP_ATR_MULTIPLIER = 3.0
 MAX_HOLD_BARS = 45
+SURVIVAL_BARS = 5  # Phase 5.5: Devil survival window (bars)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # INFERENCE THRESHOLDS (must match MLStrategy)
@@ -133,6 +134,11 @@ FEATURE_COLS: List[str] = [
     "htf_trend_agreement",
     "htf_vol_rel",
     "htf_bb_pct_b",
+    # Phase 5: Microstructure features
+    "range_coil_10",
+    "bar_body_pct",
+    "bar_upper_wick_pct",
+    "bar_lower_wick_pct",
 ]
 
 
@@ -324,6 +330,64 @@ def _compute_devil_targets_atr(
     return targets
 
 
+def _compute_devil_survival_target(
+    df: pl.DataFrame,
+    sl_mult: float = SL_ATR_MULTIPLIER,
+    survival_bars: int = SURVIVAL_BARS,
+) -> np.ndarray:
+    """
+    Compute Devil survival targets: whether price survives the SL for the
+    next `survival_bars` bars after each row.
+
+    Phase 5.5 — Temporal Realignment:
+        The Devil's 1m microstructure features (wick toxicity, range
+        compression) operate at a 1–5 minute horizon.  Asking the Devil
+        to predict 45-bar macro outcomes (the old devil_target) creates
+        an unlearnable temporal gap.  Asking it to predict 5-bar SL
+        survival aligns the learning objective with the feature horizon.
+
+    Survival definition:
+        target[i] = 1  if  low[j] > SL_price  for ALL j in [i+1, i+SURVIVAL_BARS]
+        target[i] = 0  if  low[j] <= SL_price  for ANY j in that window
+
+    SL price is computed identically to the live bracket:
+        SL = close[i] - sl_mult * ATR_abs[i]
+        ATR_abs = close[i] * natr_14[i] / 100.0
+
+    Args:
+        df:             DataFrame with 'close', 'low', 'natr_14' columns.
+        sl_mult:        ATR multiplier for stop-loss (default: SL_ATR_MULTIPLIER).
+        survival_bars:  Number of bars to check for SL breach (default: SURVIVAL_BARS).
+
+    Returns:
+        NumPy int8 array of length len(df).
+        1 = survived (no SL breach in window), 0 = stopped out.
+        Last `survival_bars` rows are always 0 (insufficient lookahead).
+    """
+    close = df["close"].to_numpy()
+    low = df["low"].to_numpy()
+    natr = df["natr_14"].to_numpy()
+    n = len(close)
+    targets = np.zeros(n, dtype=np.int8)
+
+    for i in range(n - 1):
+        atr_abs = close[i] * natr[i] / 100.0
+        if np.isnan(atr_abs) or atr_abs <= 0:
+            continue
+
+        sl_price = close[i] - sl_mult * atr_abs
+        survived = True
+
+        for j in range(i + 1, min(i + survival_bars + 1, n)):
+            if low[j] <= sl_price:
+                survived = False
+                break
+
+        targets[i] = np.int8(1) if survived else np.int8(0)
+
+    return targets
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # FEATURE ENGINEERING & LABEL GENERATION
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -381,20 +445,45 @@ def engineer_features_and_labels(df: pl.DataFrame) -> Tuple[pl.DataFrame, List[s
     logger.info("Generated angel_target (ATR-relative 3-bar momentum)")
 
     # ═══════════════════════════════════════════════════════════════════
-    # DEVIL TARGET: ATR-dynamic bracket resolution (bar-by-bar simulation)
-    # Must match evaluate_performance.py: SL=0.5×ATR, TP=3.0×ATR, max 45 bars
+    # DEVIL TARGETS (Phase 5.5 — Two-Target Architecture)
+    #
+    # devil_target_macro  — 45-bar bracket outcome (TP hit before SL).
+    #   Used ONLY during threshold calibration (_find_optimal_threshold).
+    #   Computes realized EV on Devil-approved trades using the actual
+    #   asymmetric R:R payload (0.5× SL / 3.0× TP).
+    #
+    # devil_target        — 5-bar SL survival.
+    #   Used to TRAIN the Devil. Aligns the learning objective with the
+    #   1m microstructure feature horizon.
+    #   1 = price did NOT breach SL in the next 5 bars (survived)
+    #   0 = price breached SL within 5 bars (stopped out immediately)
     # ═══════════════════════════════════════════════════════════════════
+
+    # -- Macro target (45-bar) — evaluation only -----------------------
     logger.info(
-        f"Computing devil_target via ATR bracket simulation "
+        f"Computing devil_target_macro via ATR bracket simulation "
         f"(SL={SL_ATR_MULTIPLIER}×ATR, TP={TP_ATR_MULTIPLIER}×ATR, "
         f"max_hold={MAX_HOLD_BARS} bars)..."
     )
-    devil_targets = _compute_devil_targets_atr(df)
-    df = df.with_columns(pl.Series("devil_target", devil_targets))
+    devil_targets_macro = _compute_devil_targets_atr(df)
+    df = df.with_columns(pl.Series("devil_target_macro", devil_targets_macro))
     logger.info(
-        f"Generated devil_target: "
-        f"{int(devil_targets.sum())} wins / {len(devil_targets)} total "
-        f"({devil_targets.mean():.1%} win rate)"
+        f"Generated devil_target_macro (45-bar bracket): "
+        f"{int(devil_targets_macro.sum())} wins / {len(devil_targets_macro)} total "
+        f"({devil_targets_macro.mean():.1%} macro win rate)"
+    )
+
+    # -- Survival target (5-bar) — Devil training ----------------------
+    logger.info(
+        f"Computing devil_target via {SURVIVAL_BARS}-bar SL survival "
+        f"(SL={SL_ATR_MULTIPLIER}×ATR)..."
+    )
+    devil_targets_survival = _compute_devil_survival_target(df)
+    df = df.with_columns(pl.Series("devil_target", devil_targets_survival))
+    logger.info(
+        f"Generated devil_target ({SURVIVAL_BARS}-bar survival): "
+        f"{int(devil_targets_survival.sum())} survived / {len(devil_targets_survival)} total "
+        f"({devil_targets_survival.mean():.1%} survival rate)"
     )
 
     # ═══════════════════════════════════════════════════════════════════
@@ -586,17 +675,46 @@ def refit_models(
 
     # ═══════════════════════════════════════════════════════════════════
     # STEP 3: Train the Devil (Meta Model - Conviction)
+    # Phase 5.5: Train ONLY on Angel-approved subpopulation.
     # ═══════════════════════════════════════════════════════════════════
     logger.info("\n[Step 3/4] Training Devil model (Conviction with meta-features)...")
 
     devil_features = feature_cols + ["angel_prob"]
-    X_devil = df[devil_features].to_numpy()
+    X_devil_full = df[devil_features].to_numpy()
 
+    # Phase 5.5 — Population Fix:
+    # The Devil is deployed exclusively on rows where angel_prob >= ANGEL_THRESHOLD.
+    # Training on the full global population (all ~117k rows) violates meta-labeling
+    # semantics: the Devil learns to discriminate across all market conditions, not
+    # within the Angel-approved subset where it actually operates.
+    # Solution: filter training data to only Angel-approved rows using the OOF
+    # angel_probs (already computed in Step 2 — zero leakage).
+    angel_approved_mask = angel_probs_oof >= ANGEL_THRESHOLD
+    n_approved = int(angel_approved_mask.sum())
+    n_total = len(X_devil_full)
+    logger.info(
+        f"Phase 5.5: Devil training filtered to Angel-approved subpopulation: "
+        f"{n_approved:,} / {n_total:,} rows ({n_approved / n_total:.1%})"
+    )
+
+    X_devil = X_devil_full[angel_approved_mask]
+    y_devil_train = y_devil[angel_approved_mask]
+    devil_weights = sample_weights[angel_approved_mask]
+
+    logger.info(
+        f"Devil survival target distribution (approved rows): "
+        f"survived={np.sum(y_devil_train == 1):,} | "
+        f"stopped={np.sum(y_devil_train == 0):,} | "
+        f"rate={np.mean(y_devil_train):.1%}"
+    )
     logger.info(f"Devil feature space: {devil_features}")
 
     devil_model = RandomForestClassifier(**DEVIL_PARAMS)
-    devil_model.fit(X_devil, y_devil, sample_weight=sample_weights)
-    logger.info(f"✓ Devil model trained on {len(devil_features)} features")
+    devil_model.fit(X_devil, y_devil_train, sample_weight=devil_weights)
+    logger.info(
+        f"✓ Devil model trained on {len(devil_features)} features "
+        f"(Angel-approved subpopulation, n={n_approved:,})"
+    )
 
     # ═══════════════════════════════════════════════════════════════════
     # STEP 4: Validation & Summary
@@ -606,7 +724,9 @@ def refit_models(
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
         angel_acc = angel_model.score(X_base, y_angel, sample_weight=sample_weights)
-        devil_acc = devil_model.score(X_devil, y_devil, sample_weight=sample_weights)
+        devil_acc = devil_model.score(
+            X_devil, y_devil_train, sample_weight=devil_weights
+        )
 
     logger.info(f"\n{'=' * 70}")
     logger.info("META-LABELING TRAINING COMPLETE")
@@ -625,7 +745,8 @@ def refit_models(
 
 def _find_optimal_threshold(
     devil_probs: np.ndarray,
-    targets: np.ndarray,
+    survival_targets: np.ndarray,
+    macro_targets: np.ndarray,
     sl_mult: float = SL_ATR_MULTIPLIER,
     tp_mult: float = TP_ATR_MULTIPLIER,
     min_trades: int = 5,
@@ -633,27 +754,36 @@ def _find_optimal_threshold(
     """
     Sweep thresholds to find the one that maximizes Expected Value.
 
-    For each candidate threshold, computes:
-      - Which trades are approved (devil_prob >= threshold)
-      - Win rate on approved trades
-      - EV = win_rate * tp_mult - (1 - win_rate) * sl_mult
+    Phase 5.5 — Two-Target EV Calibration:
+        The Devil is trained on `survival_targets` (5-bar SL survival).
+        EV calibration must use `macro_targets` (45-bar bracket outcome) to
+        reflect the actual asymmetric R:R payload delivered by the live system.
 
-    Without class_weight="balanced", the Devil's probabilities reflect the true
-    ~20% base rate, so predictions cluster in the 0.10–0.35 range. A hardcoded
-    0.50 threshold would reject everything. This sweep finds the actual optimal
-    decision boundary per fold.
+        Separating these two concerns is critical:
+        - Using survival_targets for EV would compute "expected value of not
+          getting stopped in 5 bars" — meaningless for bracket sizing.
+        - Using macro_targets for training would reintroduce the temporal
+          mismatch that caused the Devil to flatline.
+
+    For each candidate threshold:
+        1. Filter to approved trades: devil_prob >= threshold
+        2. Compute realized win rate from MACRO outcomes on approved trades
+        3. Compute EV = win_rate * (tp_mult / sl_mult) - (1 - win_rate)
 
     Args:
-        devil_probs: Array of Devil's predicted probabilities
-        targets: Array of ground truth devil_target (0 or 1)
-        sl_mult: Stop-loss ATR multiplier (for R-multiple EV calculation)
-        tp_mult: Take-profit ATR multiplier (for R-multiple EV calculation)
-        min_trades: Minimum approved trades for a threshold to be considered valid
+        devil_probs:      Array of Devil's predicted probabilities (survival).
+        survival_targets: 5-bar SL survival ground truth (Devil's training target).
+                          Passed for signature consistency; not used in EV sweep.
+        macro_targets:    45-bar bracket outcome ground truth (0/1).
+                          Used to compute realized win rate and EV.
+        sl_mult:          Stop-loss ATR multiplier.
+        tp_mult:          Take-profit ATR multiplier.
+        min_trades:       Minimum approved trades for a threshold to be valid.
 
     Returns:
         Tuple of (optimal_threshold, best_ev)
     """
-    thresholds = np.arange(0.10, 0.46, 0.02)  # 0.10, 0.12, 0.14, ..., 0.44
+    thresholds = np.arange(0.10, 0.66, 0.02)  # 0.10, 0.12, ..., 0.64
     best_threshold = 0.20  # fallback default
     best_ev = -float("inf")
 
@@ -664,10 +794,12 @@ def _find_optimal_threshold(
         if n_approved < min_trades:
             continue
 
-        approved_targets = targets[mask]
-        win_rate = float(approved_targets.mean())
+        # EV is computed from MACRO outcomes (45-bar bracket), not survival.
+        # This correctly prices the asymmetric R:R of the live bracket system.
+        approved_macro = macro_targets[mask]
+        win_rate = float(approved_macro.mean())
 
-        # EV in R-multiples: wins pay tp_mult/sl_mult R, losses pay -1R
+        # EV in R-multiples: wins pay (tp_mult / sl_mult) R, losses pay -1R
         rr_ratio = tp_mult / sl_mult
         ev = win_rate * rr_ratio - (1.0 - win_rate)
 
@@ -818,7 +950,8 @@ def validate_candidate(
         # ─────────────────────────────────────────────────────────────
         X_val_base = val_df[feature_cols].to_numpy()
         y_val_angel = val_df["angel_target"].to_numpy()
-        y_val_devil = val_df["devil_target"].to_numpy()
+        y_val_devil = val_df["devil_target"].to_numpy()  # survival (5-bar)
+        y_val_devil_macro = val_df["devil_target_macro"].to_numpy()  # macro (45-bar)
 
         # Stage 1: Angel inference
         with warnings.catch_warnings():
@@ -859,7 +992,8 @@ def validate_candidate(
 
         proposed_base_feats = X_val_base[signal_mask]
         proposed_angel_probs = angel_probs_val[signal_mask]
-        proposed_devil_targets = y_val_devil[signal_mask]
+        proposed_devil_targets = y_val_devil[signal_mask]  # survival — for Brier
+        proposed_devil_targets_macro = y_val_devil_macro[signal_mask]  # macro — for EV
 
         meta_df = pd.DataFrame(proposed_base_feats, columns=feature_cols)
         meta_df["angel_prob"] = proposed_angel_probs
@@ -949,7 +1083,8 @@ def validate_candidate(
         # ─────────────────────────────────────────────────────────────
         optimal_threshold, fold_ev_at_threshold = _find_optimal_threshold(
             devil_probs=devil_probs_val,
-            targets=proposed_devil_targets,
+            survival_targets=proposed_devil_targets,
+            macro_targets=proposed_devil_targets_macro,
         )
         logger.info(
             f"  [Fold {fold_number}] Dynamic threshold: {optimal_threshold:.2f} "
@@ -1039,19 +1174,27 @@ def validate_candidate(
             fold3_angel_feats = angel_feats
             fold3_devil_feats = devil_feats
 
-            wins = int(approved_targets.sum())
-            losses = n_devil_approved - wins
-            gross_profit = wins * TP_ATR_MULTIPLIER
-            gross_loss = losses * SL_ATR_MULTIPLIER
+            # Phase 5.5: Profit Factor and win rate computed from MACRO
+            # outcomes (45-bar bracket) on Devil-approved trades.
+            # approved_targets (survival) is used for Brier only — the PF
+            # gate must reflect actual bracket R:R, not survival rate.
+            approved_macro_targets = proposed_devil_targets_macro[approved_mask]
+            macro_wins = int(approved_macro_targets.sum())
+            macro_losses = n_devil_approved - macro_wins
+            gross_profit = macro_wins * TP_ATR_MULTIPLIER
+            gross_loss = macro_losses * SL_ATR_MULTIPLIER
             profit_factor = (
                 gross_profit / gross_loss if gross_loss > 0 else float("inf")
             )
-            final_win_rate = win_rate
+            final_win_rate = (
+                float(approved_macro_targets.mean()) if n_devil_approved > 0 else 0.0
+            )
             final_total_trades = n_devil_approved
 
             logger.info(
-                f"[Fold {fold_number}] Profit Factor = "
-                f"{gross_profit:.2f} / {gross_loss:.2f} = {profit_factor:.4f}"
+                f"[Fold {fold_number}] Profit Factor (macro) = "
+                f"{gross_profit:.2f} / {gross_loss:.2f} = {profit_factor:.4f} "
+                f"| Macro WR={final_win_rate:.1%} | Survival WR={win_rate:.1%}"
             )
 
     # ───────────────────────────────────────────────────────────────────

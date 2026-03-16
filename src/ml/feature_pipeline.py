@@ -53,6 +53,9 @@ _HTF_SMA_PERIOD = 50
 _HTF_BB_PERIOD = 20
 _HTF_BB_STD = 2
 
+# Microstructure configuration (Phase 5)
+_RANGE_COIL_PERIOD: int = 10  # bars for range compression rolling mean
+
 
 class FeatureEngineer:
     """Computes base 1m indicators plus optional higher-timeframe (HTF) features."""
@@ -137,7 +140,9 @@ class FeatureEngineer:
 
         Produces: rsi_14, ppo, natr_14, bb_pct_b, bb_width_pct,
                   price_sma50_ratio, log_return, hour_of_day,
-                  dist_sma50, vol_rel.
+                  dist_sma50, vol_rel,
+                  range_coil_10, bar_body_pct,
+                  bar_upper_wick_pct, bar_lower_wick_pct.
         Also adds intermediate columns bb_upper/middle/lower, sma_50
         (retained for derived calculations; dropped in train_model's EXCLUDE_COLS).
         """
@@ -198,6 +203,45 @@ class FeatureEngineer:
             .fill_nan(1.0)
             .fill_null(1.0)
             .alias("vol_rel")
+        )
+
+        # ── Phase 5: Microstructure features (pure Polars, no TA-Lib) ───────
+        # All four features are bounded and numerically stable.
+        # The 1e-6 guard on range denominators prevents zero-division on
+        # zero-range bars (locked-limit or data gaps).
+        df = df.with_columns(
+            # Range Compression — current bar's H-L as fraction of its 10-bar
+            # mean range. <1.0 = coiling/compression; >1.0 = expansion.
+            (
+                (pl.col("high") - pl.col("low"))
+                / (
+                    (pl.col("high") - pl.col("low"))
+                    .rolling_mean(window_size=_RANGE_COIL_PERIOD)
+                    .fill_null(1.0)
+                    + 1e-6
+                )
+            ).alias("range_coil_10"),
+            # Body Percentage — real body as fraction of total bar range.
+            # 0.0 = pure doji (all wick, no direction); 1.0 = marubozu
+            # (no wick, full conviction). Bounded [0, 1].
+            (
+                (pl.col("close") - pl.col("open")).abs()
+                / (pl.col("high") - pl.col("low") + 1e-6)
+            ).alias("bar_body_pct"),
+            # Upper Wick Toxicity — upper wick as fraction of total range.
+            # High value on a long signal = ceiling rejection / stop-hunt.
+            # Bounded [0, 1].
+            (
+                (pl.col("high") - pl.max_horizontal(pl.col("open"), pl.col("close")))
+                / (pl.col("high") - pl.col("low") + 1e-6)
+            ).alias("bar_upper_wick_pct"),
+            # Lower Wick Defense — lower wick as fraction of total range.
+            # High value = demand absorption / bullish stop-hunt zone.
+            # Bounded [0, 1].
+            (
+                (pl.min_horizontal(pl.col("open"), pl.col("close")) - pl.col("low"))
+                / (pl.col("high") - pl.col("low") + 1e-6)
+            ).alias("bar_lower_wick_pct"),
         )
 
         return df

@@ -62,8 +62,8 @@ class MLStrategy(Strategy):
 
     def __init__(
         self,
-        angel_path: str | Path = "src/ml/models/angel_rf_model.joblib",
-        devil_path: str | Path = "src/ml/models/devil_rf_model.joblib",
+        angel_path: str | Path = "models/angel_latest.pkl",
+        devil_path: str | Path = "models/devil_latest.pkl",
         angel_threshold: float = 0.40,
         devil_threshold: float = 0.50,
         warmup_period: int = 260,  # V3.3: expanded for 5m HTF SMA-50 warm-up
