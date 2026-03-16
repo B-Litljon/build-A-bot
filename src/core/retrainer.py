@@ -783,7 +783,7 @@ def _find_optimal_threshold(
     Returns:
         Tuple of (optimal_threshold, best_ev)
     """
-    thresholds = np.arange(0.10, 0.46, 0.02)  # 0.10, 0.12, 0.14, ..., 0.44
+    thresholds = np.arange(0.10, 0.66, 0.02)  # 0.10, 0.12, ..., 0.64
     best_threshold = 0.20  # fallback default
     best_ev = -float("inf")
 
