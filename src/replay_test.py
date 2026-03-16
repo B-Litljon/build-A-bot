@@ -1,5 +1,5 @@
 """
-Out-of-Sample (OOS) Replay Testing Harness for Universal Scalper v3.0.
+Out-of-Sample (OOS) Replay Testing Harness for Universal Scalper V3.4.
 
 Simulates live market firehose conditions using Parquet files for backtesting
 the Angel/Devil dual-model architecture.
@@ -44,8 +44,8 @@ logger = logging.getLogger(__name__)
 # Configuration
 DATA_PATH = Path("data/oos_bars.parquet")
 LEDGER_PATH = Path("data/signal_ledger.parquet")
-ANGEL_MODEL_PATH = Path("src/ml/models/angel_rf_model.joblib")
-DEVIL_MODEL_PATH = Path("src/ml/models/devil_rf_model.joblib")
+ANGEL_MODEL_PATH = Path("models/angel_latest.pkl")
+DEVIL_MODEL_PATH = Path("models/devil_latest.pkl")
 
 # Thresholds (must match training configuration)
 ANGEL_THRESHOLD = 0.40
@@ -69,6 +69,11 @@ FEATURE_NAMES = [
     "htf_trend_agreement",
     "htf_vol_rel",
     "htf_bb_pct_b",
+    # Phase 5: Microstructure features
+    "range_coil_10",
+    "bar_body_pct",
+    "bar_upper_wick_pct",
+    "bar_lower_wick_pct",
 ]
 
 

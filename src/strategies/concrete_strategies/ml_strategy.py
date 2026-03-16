@@ -119,7 +119,7 @@ class MLStrategy(Strategy):
         self.feature_engineer = FeatureEngineer()
 
         # Feature columns (excluding absolute price columns to prevent leakage)
-        # V3.3: expanded from 10 to 14 features with multi-timeframe (5m) additions
+        # V3.4: expanded from 14 to 18 features with Phase 5 microstructure additions
         self.feature_names = [
             "rsi_14",
             "ppo",
@@ -136,6 +136,11 @@ class MLStrategy(Strategy):
             "htf_trend_agreement",
             "htf_vol_rel",
             "htf_bb_pct_b",
+            # Phase 5: Microstructure features
+            "range_coil_10",
+            "bar_body_pct",
+            "bar_upper_wick_pct",
+            "bar_lower_wick_pct",
         ]
 
         self.order_params = OrderParams(
