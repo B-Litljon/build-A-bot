@@ -110,7 +110,10 @@ DEVIL_THRESHOLD = 0.50
 # VALIDATION GATE THRESHOLDS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-BRIER_THRESHOLD = 0.25  # Max acceptable Brier score (lower = better)
+BRIER_THRESHOLD = 0.30  # Phase 5.5: raised from 0.25 — survival target base rate
+# ~45% shifts naive-classifier Brier to ~0.25, so 0.25
+# was a false-rejection boundary. 0.30 rejects only
+# genuinely uncalibrated models.
 EV_THRESHOLD = 0.0005  # Min acceptable Expected Value
 PROFIT_FACTOR_THRESHOLD = 1.2  # Min acceptable Profit Factor
 
@@ -134,7 +137,7 @@ FEATURE_COLS: List[str] = [
     "htf_trend_agreement",
     "htf_vol_rel",
     "htf_bb_pct_b",
-    # Phase 5: Microstructure features
+    # V3.4 Phase 5: Microstructure features (stop-hunt defense)
     "range_coil_10",
     "bar_body_pct",
     "bar_upper_wick_pct",

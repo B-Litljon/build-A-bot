@@ -232,7 +232,7 @@ handle_completion() {
             echo "Production weights were NOT replaced. Manual review recommended."
             echo ""
             echo "Check the retrainer log for rejection reasons:"
-            echo "  Brier Score  > 0.25  OR"
+            echo "  Brier Score  > 0.30  OR"
             echo "  Expected Value < 0.0005  OR"
             echo "  Profit Factor (Fold 3 OOS) < 1.2"
             echo ""

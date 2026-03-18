@@ -1337,7 +1337,8 @@ class LiveOrchestrator:
         Submit a plain fractional market buy for any asset class (equity or crypto).
 
         All entries now use a simple ``MarketOrderRequest`` with
-        ``time_in_force=DAY`` and qty rounded to 4 decimal places (min
+        ``time_in_force=GTC`` (crypto) or ``time_in_force=DAY`` (equities),
+        qty rounded to 4 decimal places (min
         0.0001).  SL/TP are managed entirely by ``_universal_watchdog_loop``,
         eliminating Alpaca's ``order_class="bracket"`` which rejects for
         fractional equities and all crypto pairs.
@@ -1358,21 +1359,21 @@ class LiveOrchestrator:
             # After high slippage the fill price can move so close to one of
             # the targets that the TP is effectively <= entry or the SL is
             # effectively >= entry.  Reject the trade early.
-            if tp_price <= sig.price * 1.001:
+            if tp_price <= sig.price:
                 logger.warning(
-                    "[%s] Slippage guard: TP=%.4f <= entry*1.001=%.4f — aborting.",
+                    "[%s] Slippage guard: TP=%.4f <= entry=%.4f — aborting.",
                     symbol,
                     tp_price,
-                    sig.price * 1.001,
+                    sig.price,
                 )
                 return False
 
-            if sl_price >= sig.price * 0.999:
+            if sl_price >= sig.price:
                 logger.warning(
-                    "[%s] Slippage guard: SL=%.4f >= entry*0.999=%.4f — aborting.",
+                    "[%s] Slippage guard: SL=%.4f >= entry=%.4f — aborting.",
                     symbol,
                     sl_price,
-                    sig.price * 0.999,
+                    sig.price,
                 )
                 return False
 
@@ -1442,13 +1443,16 @@ class LiveOrchestrator:
             # ----------------------------------------------------------------
             # Universal fractional market buy — no bracket, no OTO legs.
             # SL/TP targets are enforced by _universal_watchdog_loop.
-            # time_in_force=DAY works for both equities and crypto on Alpaca.
+            # Alpaca crypto API rejects DAY orders — use GTC for crypto,
+            # DAY for equities.
             # ----------------------------------------------------------------
+            tif = TimeInForce.GTC if is_crypto else TimeInForce.DAY
+
             order_request = MarketOrderRequest(
                 symbol=symbol,
                 qty=qty,
                 side=OrderSide.BUY,
-                time_in_force=TimeInForce.DAY,
+                time_in_force=tif,
                 client_order_id=client_order_id,
             )
 
