@@ -184,6 +184,8 @@ def _load_devil_threshold() -> float:
 # Bracket ATR multipliers (V3.3 grid-search optimum: SL=0.5×, TP=3.0×, Hold=45)
 SL_ATR_MULTIPLIER: float = 0.5
 TP_ATR_MULTIPLIER: float = 3.0
+MIN_SL_PCT: float = 0.0015  # 0.15% floor — prevents denominator collapse on
+# low-volatility crypto (e.g. 0.5×ATR < spread)
 
 # Cooldown after any bracket resolves before re-entry is allowed (seconds)
 COOLING_SECONDS: int = 5 * 60  # 5 minutes
@@ -1386,7 +1388,36 @@ class LiveOrchestrator:
             cash: float = float(account.cash)
 
             risk_dollars: float = equity * ACCOUNT_RISK_PER_TRADE
-            risk_per_share: float = sig.price - sl_price
+
+            # ----------------------------------------------------------------
+            # SL Distance Floor (Hotfix 7)
+            # Prevents denominator collapse when 0.5×ATR is smaller than the
+            # bid/ask spread on low-volatility crypto regimes.
+            # Floor = max(ATR-derived distance, 0.15% of entry price).
+            # sl_price is recomputed from the floored distance and written
+            # back to ctx.sl_price so the watchdog monitors the same level
+            # the position was sized against.
+            # ----------------------------------------------------------------
+            raw_sl_distance: float = sig.price - sl_price
+            min_sl_distance: float = sig.price * MIN_SL_PCT
+            actual_sl_distance: float = max(raw_sl_distance, min_sl_distance)
+
+            if actual_sl_distance != raw_sl_distance:
+                sl_price = sig.price - actual_sl_distance
+                logger.info(
+                    "[%s] SL floor applied | raw_dist=%.4f < min_dist=%.4f "
+                    "| sl_price adjusted %.4f → %.4f",
+                    symbol,
+                    raw_sl_distance,
+                    min_sl_distance,
+                    sig.price - raw_sl_distance,
+                    sl_price,
+                )
+                # Sync watchdog — it must monitor the same SL we sized against
+                ctx_ref = self._contexts[symbol]
+                ctx_ref.sl_price = sl_price
+
+            risk_per_share: float = actual_sl_distance
 
             if risk_per_share <= 0:
                 logger.error(
