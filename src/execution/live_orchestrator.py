@@ -60,14 +60,18 @@ import signal
 import sys
 import time
 import traceback
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
 from pathlib import Path
-from typing import Dict, List, Optional, Set
-from collections import deque
+from typing import TYPE_CHECKING
 
 import warnings
+
+if TYPE_CHECKING:
+    from collections.abc import Coroutine
+    import pandas as pd
 
 import polars as pl
 from dotenv import load_dotenv
@@ -329,29 +333,29 @@ class SymbolContext:
         self.lock: asyncio.Lock = asyncio.Lock()
 
         # Deduplication — client_order_id for the most recent bracket entry
-        self.last_client_order_id: Optional[str] = None
+        self.last_client_order_id: str | None = None
 
         # Filled entry price used for bracket SL/TP calculation
-        self.entry_price: Optional[float] = None
-        self.entry_qty: Optional[float] = None
+        self.entry_price: float | None = None
+        self.entry_qty: float | None = None
 
         # Watchdog exit targets — set at signal time, consumed by
         # _crypto_watchdog_loop for crypto symbols (equities use native
         # Alpaca bracket legs).
-        self.sl_price: Optional[float] = None
-        self.tp_price: Optional[float] = None
+        self.sl_price: float | None = None
+        self.tp_price: float | None = None
 
         # Handle to the cooling timer so we can cancel it on shutdown
-        self._cooling_task: Optional[asyncio.Task] = None
+        self._cooling_task: asyncio.Task | None = None
 
         # Dashboard tracking
-        self.last_price: Optional[float] = None
-        self.last_atr: Optional[float] = None
-        self.last_conviction: Optional[float] = None
+        self.last_price: float | None = None
+        self.last_atr: float | None = None
+        self.last_conviction: float | None = None
 
         # Phase 6: HTF feature cache — None until _prime_htf_cache() fires
         # after warm-up. _run_inference() refreshes this on every cold path.
-        self.htf_cache: Optional[HTFCache] = None
+        self.htf_cache: HTFCache | None = None
 
     def __repr__(self) -> str:  # pragma: no cover
         asset = "CRYPTO" if self.is_crypto else "EQUITY"
@@ -368,11 +372,11 @@ class ActivityEntry:
 
     def __init__(
         self, timestamp: datetime, symbol: str, message: str, level: str = "info"
-    ):
-        self.timestamp = timestamp
-        self.symbol = symbol
-        self.message = message
-        self.level = level  # info, success, warning, error
+    ) -> None:
+        self.timestamp: datetime = timestamp
+        self.symbol: str = symbol
+        self.message: str = message
+        self.level: str = level  # info, success, warning, error
 
 
 # ---------------------------------------------------------------------------
@@ -400,9 +404,9 @@ class LiveOrchestrator:
 
     def __init__(
         self,
-        symbols: List[str],
-        api_key: Optional[str] = None,
-        secret_key: Optional[str] = None,
+        symbols: list[str],
+        api_key: str | None = None,
+        secret_key: str | None = None,
         paper: bool = True,
         angel_model_path: str = "models/angel_latest.pkl",
         devil_model_path: str = "models/devil_latest.pkl",
@@ -420,14 +424,14 @@ class LiveOrchestrator:
         self._api_key: str = api_key or os.environ["ALPACA_API_KEY"]
         self._secret_key: str = secret_key or os.environ["ALPACA_SECRET_KEY"]
         self._paper: bool = paper
-        self._symbols: List[str] = [s.upper() for s in symbols]
+        self._symbols: list[str] = [s.upper() for s in symbols]
 
         # -- Asset-class routing --
         # Crypto symbols contain '/' (e.g. "BTC/USD"); equities do not.
-        self._crypto_symbols: List[str] = [s for s in self._symbols if "/" in s]
-        self._stock_symbols: List[str] = [s for s in self._symbols if "/" not in s]
-        self._crypto_set: Set[str] = set(self._crypto_symbols)
-        self._stock_set: Set[str] = set(self._stock_symbols)
+        self._crypto_symbols: list[str] = [s for s in self._symbols if "/" in s]
+        self._stock_symbols: list[str] = [s for s in self._symbols if "/" not in s]
+        self._crypto_set: set[str] = set(self._crypto_symbols)
+        self._stock_set: set[str] = set(self._stock_symbols)
 
         # -- Dynamic Devil threshold (loaded from models/threshold.json) --
         self._devil_threshold: float = _load_devil_threshold()
@@ -447,15 +451,15 @@ class LiveOrchestrator:
         )
 
         # -- Per-symbol state --
-        self._contexts: Dict[str, SymbolContext] = {
+        self._contexts: dict[str, SymbolContext] = {
             sym: SymbolContext(sym, is_crypto=(sym in self._crypto_set))
             for sym in self._symbols
         }
 
         # -- Alpaca WebSocket clients (created fresh per run() call) --
-        self._crypto_stream: Optional[CryptoDataStream] = None
-        self._stock_stream: Optional[StockDataStream] = None
-        self._trade_stream: Optional[TradingStream] = None
+        self._crypto_stream: CryptoDataStream | None = None
+        self._stock_stream: StockDataStream | None = None
+        self._trade_stream: TradingStream | None = None
 
         # -- Market hours cache --
         self._market_open: bool = False
@@ -467,8 +471,8 @@ class LiveOrchestrator:
         # -- Dashboard state --
         # In daemon mode we never write to a Rich Console; create it only for
         # interactive runs so no ANSI/VT sequences leak into journald.
-        self._console: Optional[Console] = None if daemon_mode else Console()
-        self._activity_log: deque = deque(maxlen=MAX_ACTIVITY_LOG)
+        self._console: Console | None = None if daemon_mode else Console()
+        self._activity_log: deque[ActivityEntry] = deque(maxlen=MAX_ACTIVITY_LOG)
         self._start_time: datetime = datetime.now(timezone.utc)
         self._dashboard_running: bool = False
 
@@ -499,7 +503,7 @@ class LiveOrchestrator:
         this path must not hide the underlying trade activity.
         """
         try:
-            payload: Dict[str, dict] = {}
+            payload: dict[str, dict] = {}
             for sym, ctx in self._contexts.items():
                 if ctx.state == SymbolState.IN_TRADE:
                     payload[sym] = {
@@ -534,7 +538,7 @@ class LiveOrchestrator:
 
         try:
             with open(state_path, "r") as fh:
-                saved: Dict[str, dict] = json.load(fh)
+                saved: dict[str, dict] = json.load(fh)
         except Exception as exc:
             logger.warning(
                 "Could not parse state file %s: %s — ignoring.", STATE_FILE, exc
@@ -549,7 +553,7 @@ class LiveOrchestrator:
         # was down.
         try:
             open_positions = self._trading_client.get_all_positions()
-            open_symbols: Set[str] = {
+            open_symbols: set[str] = {
                 str(getattr(p, "symbol", "")).upper() for p in open_positions
             }
         except Exception as exc:
@@ -782,7 +786,7 @@ class LiveOrchestrator:
         await self._warmup_aggregator()
 
         # Build WebSocket clients
-        stream_tasks: List = []
+        stream_tasks: list[asyncio.Task | Coroutine] = []
 
         if self._crypto_symbols:
             self._crypto_stream = CryptoDataStream(self._api_key, self._secret_key)
@@ -1010,7 +1014,7 @@ class LiveOrchestrator:
             return
 
         # Offload CPU-bound inference — does NOT block the event loop
-        signal_result: Optional[Signal] = await asyncio.to_thread(
+        signal_result: Signal | None = await asyncio.to_thread(
             self._run_inference, symbol, history_snapshot
         )
 
@@ -1024,7 +1028,7 @@ class LiveOrchestrator:
     # Inference (runs in thread pool — must be pure / no asyncio calls)
     # -----------------------------------------------------------------------
 
-    def _run_inference(self, symbol: str, history_df: pl.DataFrame) -> Optional[Signal]:
+    def _run_inference(self, symbol: str, history_df: pl.DataFrame) -> Signal | None:
         """
         Execute Angel -> Devil two-stage inference on the latest bar.
 
@@ -1704,7 +1708,7 @@ class LiveOrchestrator:
 
         logger.info("Universal watchdog stopped.")
 
-    def _submit_manual_exit(self, symbol: str, qty: Optional[float]) -> bool:
+    def _submit_manual_exit(self, symbol: str, qty: float | None) -> bool:
         """
         Submit a market SELL to close a crypto position.
 
@@ -2129,8 +2133,8 @@ class LiveOrchestrator:
         logger.info("HTF cache priming complete.")
 
     async def _fetch_crypto_history(
-        self, end_time, progress: Optional[Progress] = None
-    ) -> object:
+        self, end_time: datetime, progress: Progress | None = None
+    ) -> pd.DataFrame | None:
         """Fetch historical 1-min bars for all crypto symbols."""
         hist_client = CryptoHistoricalDataClient(
             api_key=self._api_key,
@@ -2157,8 +2161,8 @@ class LiveOrchestrator:
             return None
 
     async def _fetch_stock_history(
-        self, end_time, progress: Optional[Progress] = None
-    ) -> object:
+        self, end_time: datetime, progress: Progress | None = None
+    ) -> pd.DataFrame | None:
         """Fetch historical 1-min bars for all stock symbols."""
         hist_client = StockHistoricalDataClient(
             api_key=self._api_key,
@@ -2305,7 +2309,7 @@ class LiveOrchestrator:
 # ---------------------------------------------------------------------------
 # Default combined trading basket — equities + crypto
 # ---------------------------------------------------------------------------
-DEFAULT_SYMBOLS: List[str] = [
+DEFAULT_SYMBOLS: list[str] = [
     "TSLA",
     "NVDA",
     "MARA",

@@ -17,11 +17,13 @@ Usage:
     )
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import os
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import TYPE_CHECKING
 
 import joblib
 import numpy as np
@@ -35,6 +37,9 @@ from strategies.strategy import Strategy
 
 # CRITICAL: Import FeatureEngineer to prevent training/inference skew
 from ml.feature_pipeline import FeatureEngineer
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -278,7 +283,7 @@ class MLStrategy(Strategy):
 
         return reloaded
 
-    def analyze(self, data: Dict[str, pl.DataFrame]) -> Tuple[List[Signal], float]:
+    def analyze(self, data: dict[str, pl.DataFrame]) -> tuple[list[Signal], float]:
         """
         Analyze market data using two-stage Meta-Labeling.
 
@@ -380,7 +385,7 @@ class MLStrategy(Strategy):
 
         return signals, highest_angel_prob
 
-    def _generate_features(self, df: pl.DataFrame) -> Optional[pl.DataFrame]:
+    def _generate_features(self, df: pl.DataFrame) -> pl.DataFrame | None:
         """
         Generate ML features using imported FeatureEngineer.
 

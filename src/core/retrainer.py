@@ -34,7 +34,7 @@ import warnings
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING
 
 import joblib
 import numpy as np
@@ -50,6 +50,9 @@ from sklearn.model_selection import cross_val_predict, TimeSeriesSplit
 from src.ml.feature_pipeline import FeatureEngineer
 from src.core.notification_manager import NotificationManager
 
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -61,7 +64,7 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 DAYS_BACK = 60
-TICKERS: List[str] = ["TSLA", "NVDA", "MARA", "COIN", "SMCI"]
+TICKERS: list[str] = ["TSLA", "NVDA", "MARA", "COIN", "SMCI"]
 TIMEFRAME = TimeFrame(1, TimeFrameUnit.Minute)
 DATA_FEED = DataFeed.IEX
 
@@ -121,7 +124,7 @@ PROFIT_FACTOR_THRESHOLD = 1.2  # Min acceptable Profit Factor
 # FEATURE COLUMNS (must match MLStrategy.feature_names and FeatureEngineer output)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-FEATURE_COLS: List[str] = [
+FEATURE_COLS: list[str] = [
     "rsi_14",
     "ppo",
     "natr_14",
@@ -168,14 +171,14 @@ class FoldMetrics:
 class ValidationReport:
     """Aggregated validation report across all walk-forward folds."""
 
-    fold_metrics: List[FoldMetrics]
+    fold_metrics: list[FoldMetrics]
     mean_brier: float
     mean_ev: float
     final_profit_factor: float
     final_win_rate: float
     final_total_trades: int
     gate_passed: bool
-    rejection_reasons: List[str] = field(default_factory=list)
+    rejection_reasons: list[str] = field(default_factory=list)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -221,7 +224,7 @@ def fetch_training_data(
     logger.info(f"Tickers: {', '.join(TICKERS)}")
     logger.info(f"Timeframe: 1-minute bars")
 
-    all_frames: List[pl.DataFrame] = []
+    all_frames: list[pl.DataFrame] = []
 
     for ticker in TICKERS:
         try:
@@ -396,7 +399,7 @@ def _compute_devil_survival_target(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def engineer_features_and_labels(df: pl.DataFrame) -> Tuple[pl.DataFrame, List[str]]:
+def engineer_features_and_labels(df: pl.DataFrame) -> tuple[pl.DataFrame, list[str]]:
     """
     Engineer technical features and generate ATR-dynamic target labels.
 
@@ -545,8 +548,8 @@ def generate_time_decay_weights(
 
 def refit_models(
     df: pl.DataFrame,
-    feature_cols: List[str],
-) -> Tuple[RandomForestClassifier, RandomForestClassifier, List[str], List[str]]:
+    feature_cols: list[str],
+) -> tuple[RandomForestClassifier, RandomForestClassifier, list[str], list[str]]:
     """
     Refit Angel and Devil models with time-decay weighting.
 
@@ -753,7 +756,7 @@ def _find_optimal_threshold(
     sl_mult: float = SL_ATR_MULTIPLIER,
     tp_mult: float = TP_ATR_MULTIPLIER,
     min_trades: int = 5,
-) -> Tuple[float, float]:
+) -> tuple[float, float]:
     """
     Sweep thresholds to find the one that maximizes Expected Value.
 
@@ -820,14 +823,14 @@ def _find_optimal_threshold(
 
 def validate_candidate(
     df: pl.DataFrame,
-    feature_cols: List[str],
+    feature_cols: list[str],
     n_folds: int = 3,
-) -> Tuple[
+) -> tuple[
     ValidationReport,
     RandomForestClassifier,
     RandomForestClassifier,
-    List[str],
-    List[str],
+    list[str],
+    list[str],
     float,
 ]:
     """
@@ -892,13 +895,13 @@ def validate_candidate(
         (50, 60),  # Fold 3: Train days 0–49, Val days 50–59
     ]
 
-    fold_metrics: List[FoldMetrics] = []
+    fold_metrics: list[FoldMetrics] = []
 
     # Placeholders for Fold 3 outputs (used for PF gate and fallback)
-    fold3_angel: Optional[RandomForestClassifier] = None
-    fold3_devil: Optional[RandomForestClassifier] = None
-    fold3_angel_feats: Optional[List[str]] = None
-    fold3_devil_feats: Optional[List[str]] = None
+    fold3_angel: [RandomForestClassifier] | None = None
+    fold3_devil: [RandomForestClassifier] | None = None
+    fold3_angel_feats: [list[str]] | None = None
+    fold3_devil_feats: [list[str]] | None = None
     profit_factor: float = 0.0
     final_win_rate: float = 0.0
     final_total_trades: int = 0
@@ -1206,7 +1209,7 @@ def validate_candidate(
     mean_brier = float(np.mean([fm.brier_score for fm in fold_metrics]))
     mean_ev = float(np.mean([fm.expected_value for fm in fold_metrics]))
 
-    rejection_reasons: List[str] = []
+    rejection_reasons: list[str] = []
     if mean_brier > BRIER_THRESHOLD:
         rejection_reasons.append(
             f"Brier {mean_brier:.4f} > {BRIER_THRESHOLD} threshold"
