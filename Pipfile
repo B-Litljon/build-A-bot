@@ -20,6 +20,8 @@ polygon-api-client = "*"
 yfinance = "*"
 pyarrow = "*"
 rich = "*"
+joblib = "*"
+psutil = "*"
 
 [dev-packages]
 
