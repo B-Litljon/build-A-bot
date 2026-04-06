@@ -17,10 +17,10 @@ from typing import Any, Dict, List, Optional, Set
 import polars as pl
 
 # Phase 1 & Phase 2 SDK imports
-from src.data.feed import MarketDataFeed
-from src.strategies.base import BaseStrategy, Signal
-from src.execution.risk_manager import RiskManager, AssetClass, RiskValidatedSignal
-from src.utils.bar_aggregator import LiveBarAggregator
+from data.feed import MarketDataFeed
+from strategies.base import BaseStrategy, Signal
+from execution.risk_manager import RiskManager, AssetClass, RiskValidatedSignal
+from utils.bar_aggregator import LiveBarAggregator
 
 
 logger = logging.getLogger(__name__)

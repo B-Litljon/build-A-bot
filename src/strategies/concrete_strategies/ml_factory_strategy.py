@@ -14,8 +14,8 @@ import numpy as np
 import polars as pl
 import pandas as pd
 
-from src.strategies.base import BaseStrategy, Signal
-from src.ml.feature_pipeline import FeatureEngineer
+from strategies.base import BaseStrategy, Signal
+from ml.feature_pipeline import FeatureEngineer
 
 
 logger = logging.getLogger(__name__)

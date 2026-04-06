@@ -4,19 +4,20 @@
 Executes the SDK-decoupled trading bot on Alpaca paper trading with crypto pairs.
 """
 
+import sys
+import os
+
+# Inject src/ into path before any other imports
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "src")))
+
 import asyncio
 import logging
-import os
-import sys
 
 from dotenv import load_dotenv
 
-# Ensure src/ is on path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from src.execution.risk_manager import RiskManager
-from src.strategies.concrete_strategies.ml_factory_strategy import MLFactoryStrategy
-from src.execution.factory_orchestrator import FactoryOrchestrator
+from execution.risk_manager import RiskManager
+from strategies.concrete_strategies.ml_factory_strategy import MLFactoryStrategy
+from execution.factory_orchestrator import FactoryOrchestrator
 
 
 # Simple MarketDataFeed implementation for Alpaca crypto
@@ -61,7 +62,7 @@ except ImportError:
 
         def __init__(self, api_key: str, secret_key: str, symbols: list[str]) -> None:
             self.symbols = symbols
-            logger.warning("Alpaca SDK not installed — using mock feed")
+            logger.warning("Alpaca SDK not installed - using mock feed")
 
         async def run(self, callback: callable) -> None:
             """Mock stream with synthetic bars."""
@@ -114,7 +115,7 @@ async def main() -> None:
     secret_key = os.getenv("ALPACA_SECRET_KEY", "")
 
     if not api_key or not secret_key:
-        logger.warning("ALPACA_API_KEY or ALPACA_SECRET_KEY not set — using mock mode")
+        logger.warning("ALPACA_API_KEY or ALPACA_SECRET_KEY not set - using mock mode")
 
     # Trading symbols (crypto pairs)
     symbols = ["BTC/USD", "ETH/USD"]
@@ -133,12 +134,12 @@ async def main() -> None:
         paper=True,
     )
 
-    logger.info("Starting orchestrator — press Ctrl+C to exit")
+    logger.info("Starting orchestrator - press Ctrl+C to exit")
 
     try:
         await orchestrator.run()
     except KeyboardInterrupt:
-        logger.info("Keyboard interrupt received — shutting down gracefully")
+        logger.info("Keyboard interrupt received - shutting down gracefully")
     except Exception as exc:
         logger.error("Fatal error: %s", exc, exc_info=True)
         raise
