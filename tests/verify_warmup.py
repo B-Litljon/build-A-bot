@@ -19,11 +19,13 @@ class TestWarmupSequence(unittest.IsolatedAsyncioTestCase):
 
         # Setup Orchestrator
         with patch('execution.factory_orchestrator.TradingClient'), \
-             patch('execution.factory_orchestrator.AlpacaCryptoFeed') as MockFeed:
+             patch('run_factory.AlpacaCryptoFeed') as MockFeed:
 
             # Setup mock feed behavior
             mock_feed_instance = MockFeed.return_value
             mock_feed_instance.warmup_history = AsyncMock()
+            mock_feed_instance.subscribe = AsyncMock()
+            mock_feed_instance.stop = AsyncMock()
 
             # Create dummy historical data
             now = datetime.now(timezone.utc)
@@ -42,7 +44,8 @@ class TestWarmupSequence(unittest.IsolatedAsyncioTestCase):
                 api_key="fake",
                 secret_key="fake",
                 strategy=mock_strategy,
-                risk_manager=mock_risk
+                risk_manager=mock_risk,
+                feed=mock_feed_instance
             )
 
             # Trigger run but stop early using the shutdown event
@@ -57,8 +60,8 @@ class TestWarmupSequence(unittest.IsolatedAsyncioTestCase):
 
             # VERIFY: Aggregator has the data
             agg = orchestrator.aggregators["BTC/USD"]
-            self.assertEqual(len(agg.history_df), 1)
-            self.assertEqual(agg.history_df["close"][0], 100.5)
+            self.assertEqual(len(agg.buffer), 1)
+            self.assertEqual(agg.buffer[0]["close"], 100.5)
             print("\n✅ Verification Success: Warmup data correctly injected into Aggregator.")
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ if str(_SRC_DIR) not in sys.path:
 from execution.factory_orchestrator import FactoryOrchestrator
 from strategies.concrete_strategies.ml_factory_strategy import MLFactoryStrategy
 from execution.risk_manager import RiskManager
+from data.feed import AlpacaCryptoFeed
 
 # Configure logging
 logging.basicConfig(
@@ -34,6 +35,7 @@ async def main():
     # Initialize components
     strategy = MLFactoryStrategy()
     risk_manager = RiskManager()
+    feed = AlpacaCryptoFeed(api_key, secret_key)
 
     symbols = ["BTC/USD", "ETH/USD"]
 
@@ -43,6 +45,7 @@ async def main():
         secret_key=secret_key,
         strategy=strategy,
         risk_manager=risk_manager,
+        feed=feed,
         paper=True
     )
 
