@@ -1,6 +1,10 @@
 data/
+!src/data/
 *.joblib
 *.parquet
+*.csv
+*.db
+*.sqlite
 .env
 venv/
 __pycache__/

@@ -9,7 +9,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
-from data.feed import AlpacaCryptoFeed
+from data.feed import MarketDataFeed
 from execution.risk_manager import RiskManager
 from strategies.concrete_strategies.ml_strategy import MLStrategy
 from utils.bar_aggregator import LiveBarAggregator
@@ -29,10 +29,11 @@ class FactoryOrchestrator:
         secret_key: str,
         strategy: MLStrategy,
         risk_manager: RiskManager,
+        feed: MarketDataFeed,
         paper: bool = True
     ):
         self.symbols = symbols
-        self.feed = AlpacaCryptoFeed(api_key, secret_key)
+        self.feed = feed
         self.strategy = strategy
         self.risk_manager = risk_manager
         self.trading_client = TradingClient(api_key, secret_key, paper=paper)
