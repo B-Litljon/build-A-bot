@@ -23,7 +23,6 @@ import os
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
-import joblib
 import numpy as np
 import polars as pl
 import pandas as pd
@@ -36,6 +35,7 @@ from strategies.strategy import Strategy
 # CRITICAL: Import FeaturePipeline to prevent training/inference skew
 from ml.feature_pipeline import FeaturePipeline
 from ml.features.v3_features import V3BaseFeatures, V3HTFFeatures
+from ml.trainers.v3_rf_trainer import V3RandomForestTrainer
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +68,8 @@ class MLStrategy(Strategy):
         angel_threshold: float = 0.40,
         devil_threshold: float = 0.50,
         warmup_period: int = 260,  # V3.3: expanded for 5m HTF SMA-50 warm-up
+        angel_trainer=None,
+        devil_trainer=None,
     ):
         super().__init__()
 
@@ -94,23 +96,25 @@ class MLStrategy(Strategy):
 
         # Load models and track modification times
         logger.info(f"Loading Angel model from {angel_file}")
-        self.angel_model = joblib.load(angel_file)
-        self.angel_model.n_jobs = (
-            1  # Prevent joblib IPC overhead on single-row inference
-        )
+        self.angel_trainer = angel_trainer if angel_trainer is not None else V3RandomForestTrainer()
+        self.angel_trainer.load(str(angel_file))
+        if hasattr(self.angel_trainer, "model") and hasattr(self.angel_trainer.model, "n_jobs"):
+            self.angel_trainer.model.n_jobs = 1  # Prevent joblib IPC overhead on single-row inference
+
         self.angel_mtime = os.path.getmtime(angel_file)
         logger.info(
-            f"Angel model loaded: {type(self.angel_model).__name__} (mtime: {self.angel_mtime})"
+            f"Angel model loaded via trainer (mtime: {self.angel_mtime})"
         )
 
         logger.info(f"Loading Devil model from {devil_file}")
-        self.devil_model = joblib.load(devil_file)
-        self.devil_model.n_jobs = (
-            1  # Prevent joblib IPC overhead on single-row inference
-        )
+        self.devil_trainer = devil_trainer if devil_trainer is not None else V3RandomForestTrainer()
+        self.devil_trainer.load(str(devil_file))
+        if hasattr(self.devil_trainer, "model") and hasattr(self.devil_trainer.model, "n_jobs"):
+            self.devil_trainer.model.n_jobs = 1  # Prevent joblib IPC overhead on single-row inference
+
         self.devil_mtime = os.path.getmtime(devil_file)
         logger.info(
-            f"Devil model loaded: {type(self.devil_model).__name__} (mtime: {self.devil_mtime})"
+            f"Devil model loaded via trainer (mtime: {self.devil_mtime})"
         )
 
         # Initialize notification manager for hot-reload alerts
@@ -225,11 +229,9 @@ class MLStrategy(Strategy):
                         f"[HOT-RELOAD] Detected new Angel model: {self.angel_path}"
                     )
                     try:
-                        new_angel_model = joblib.load(self.angel_path)
-                        self.angel_model = new_angel_model
-                        self.angel_model.n_jobs = (
-                            1  # Prevent joblib IPC overhead on single-row inference
-                        )
+                        self.angel_trainer.load(str(self.angel_path))
+                        if hasattr(self.angel_trainer, "model") and hasattr(self.angel_trainer.model, "n_jobs"):
+                            self.angel_trainer.model.n_jobs = 1
                         self.angel_mtime = current_angel_mtime
                         logger.info(f"[HOT-RELOAD] Angel model updated successfully")
                         reloaded = True
@@ -244,11 +246,9 @@ class MLStrategy(Strategy):
                         f"[HOT-RELOAD] Detected new Devil model: {self.devil_path}"
                     )
                     try:
-                        new_devil_model = joblib.load(self.devil_path)
-                        self.devil_model = new_devil_model
-                        self.devil_model.n_jobs = (
-                            1  # Prevent joblib IPC overhead on single-row inference
-                        )
+                        self.devil_trainer.load(str(self.devil_path))
+                        if hasattr(self.devil_trainer, "model") and hasattr(self.devil_trainer.model, "n_jobs"):
+                            self.devil_trainer.model.n_jobs = 1
                         self.devil_mtime = current_devil_mtime
                         logger.info(f"[HOT-RELOAD] Devil model updated successfully")
                         reloaded = True
@@ -324,7 +324,7 @@ class MLStrategy(Strategy):
                 # ═══════════════════════════════════════════════════════════
                 # STAGE 1: THE ANGEL (DIRECTION)
                 # ═══════════════════════════════════════════════════════════
-                angel_prob = self.angel_model.predict_proba(latest_features)[0, 1]
+                angel_prob = self.angel_trainer.predict_proba(latest_features)[0, 1]
                 highest_angel_prob = max(highest_angel_prob, angel_prob)
 
                 if angel_prob < self.angel_threshold:
@@ -348,7 +348,7 @@ class MLStrategy(Strategy):
                 )
                 meta_features["angel_prob"] = angel_prob
 
-                devil_prob = self.devil_model.predict_proba(meta_features)[0, 1]
+                devil_prob = self.devil_trainer.predict_proba(meta_features)[0, 1]
 
                 if devil_prob < self.devil_threshold:
                     logger.debug(

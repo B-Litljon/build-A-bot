@@ -22,6 +22,12 @@ class MLFactoryStrategy(MLStrategy):
     def __init__(self, **kwargs):
         # Ensure warmup is set to at least 260 for 5m SMA-50 support
         kwargs.setdefault("warmup_period", 260)
+
+        # Inject framework-agnostic V3 Random Forest trainers
+        from ml.trainers.v3_rf_trainer import V3RandomForestTrainer
+        kwargs.setdefault("angel_trainer", V3RandomForestTrainer())
+        kwargs.setdefault("devil_trainer", V3RandomForestTrainer())
+
         super().__init__(**kwargs)
         self.pipeline = FeaturePipeline(
             feature_generators=[V3BaseFeatures(), V3HTFFeatures(timeframe="5m")]
