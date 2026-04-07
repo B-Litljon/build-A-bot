@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from src.ml.feature_pipeline import FeaturePipeline
 from src.ml.features.v3_features import V3BaseFeatures, V3HTFFeatures
+from src.ml.trainers.v3_rf_trainer import V3RandomForestTrainer
 from src.strategies.concrete_strategies.ml_strategy import MLStrategy
 
 logging.basicConfig(
@@ -192,15 +193,16 @@ class ReplayHarness:
 
         # Load models
         logger.info("Loading Angel model...")
-        self.angel_model = joblib.load(angel_model_path)
-        self.angel_model.n_jobs = (
-            1  # Prevent joblib IPC overhead on single-row inference
-        )
+        self.angel_trainer = V3RandomForestTrainer()
+        self.angel_trainer.load(str(angel_model_path))
+        if hasattr(self.angel_trainer, "model") and hasattr(self.angel_trainer.model, "n_jobs"):
+            self.angel_trainer.model.n_jobs = 1
+
         logger.info("Loading Devil model...")
-        self.devil_model = joblib.load(devil_model_path)
-        self.devil_model.n_jobs = (
-            1  # Prevent joblib IPC overhead on single-row inference
-        )
+        self.devil_trainer = V3RandomForestTrainer()
+        self.devil_trainer.load(str(devil_model_path))
+        if hasattr(self.devil_trainer, "model") and hasattr(self.devil_trainer.model, "n_jobs"):
+            self.devil_trainer.model.n_jobs = 1
 
         # ═══════════════════════════════════════════════════════════════════
         # Dynamic Devil threshold — read from models/threshold.json so replay
@@ -237,8 +239,8 @@ class ReplayHarness:
         # IRONCLAD ALIGNMENT: Capture official feature order from models
         # This ensures NumPy arrays match the exact column order from training
         # ═══════════════════════════════════════════════════════════════════
-        self.angel_features = list(self.angel_model.feature_names_in_)
-        self.devil_features = list(self.devil_model.feature_names_in_)
+        self.angel_features = list(self.angel_trainer.feature_names_in_)
+        self.devil_features = list(self.devil_trainer.feature_names_in_)
         logger.info(f"Angel expects features: {self.angel_features}")
         logger.info(f"Devil expects features: {self.devil_features}")
 
@@ -335,7 +337,7 @@ class ReplayHarness:
         # Suppress sklearn warning after alignment is guaranteed
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
-            angel_prob = self.angel_model.predict_proba(angel_input)[0, 1]
+            angel_prob = self.angel_trainer.predict_proba(angel_input)[0, 1]
 
         if angel_prob < ANGEL_THRESHOLD:
             return None  # Rejection - not appended to ledger
@@ -362,7 +364,7 @@ class ReplayHarness:
         # Suppress sklearn warning after alignment is guaranteed
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
-            devil_prob = self.devil_model.predict_proba(devil_input)[0, 1]
+            devil_prob = self.devil_trainer.predict_proba(devil_input)[0, 1]
 
         if devil_prob < self.devil_threshold:
             return None  # Rejection - not appended to ledger
