@@ -33,8 +33,9 @@ from core.signal import Signal, SignalType
 from core.notification_manager import NotificationManager
 from strategies.strategy import Strategy
 
-# CRITICAL: Import FeatureEngineer to prevent training/inference skew
-from ml.feature_pipeline import FeatureEngineer
+# CRITICAL: Import FeaturePipeline to prevent training/inference skew
+from ml.feature_pipeline import FeaturePipeline
+from ml.features.v3_features import V3BaseFeatures, V3HTFFeatures
 
 logger = logging.getLogger(__name__)
 
@@ -115,8 +116,10 @@ class MLStrategy(Strategy):
         # Initialize notification manager for hot-reload alerts
         self.notification_manager = NotificationManager()
 
-        # Initialize feature engineer (imported, not duplicated!)
-        self.feature_engineer = FeatureEngineer()
+        # Initialize feature pipeline (imported, not duplicated!)
+        self.pipeline = FeaturePipeline(
+            feature_generators=[V3BaseFeatures(), V3HTFFeatures(timeframe="5m")]
+        )
 
         # Feature columns (excluding absolute price columns to prevent leakage)
         # V3.4: expanded from 14 to 18 features with Phase 5 microstructure additions
@@ -382,7 +385,7 @@ class MLStrategy(Strategy):
 
     def _generate_features(self, df: pl.DataFrame) -> Optional[pl.DataFrame]:
         """
-        Generate ML features using imported FeatureEngineer.
+        Generate ML features using imported FeaturePipeline.
 
         This method ensures zero training/inference skew by using the exact
         same feature computation logic as the training pipeline.
@@ -394,8 +397,8 @@ class MLStrategy(Strategy):
             DataFrame with computed features, or None if insufficient data.
         """
         try:
-            # Use imported FeatureEngineer.compute_indicators()
-            features_df = self.feature_engineer.compute_indicators(df)
+            # Use imported FeaturePipeline.run()
+            features_df = self.pipeline.run(df)
 
             # Handle NaN values that may exist in warmup period
             feature_cols = [c for c in features_df.columns if c in self.feature_names]

@@ -32,7 +32,8 @@ import polars as pl
 # Add src to path for imports
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from src.ml.feature_pipeline import FeatureEngineer
+from src.ml.feature_pipeline import FeaturePipeline
+from src.ml.features.v3_features import V3BaseFeatures, V3HTFFeatures
 from src.strategies.concrete_strategies.ml_strategy import MLStrategy
 
 logging.basicConfig(
@@ -185,7 +186,9 @@ class ReplayHarness:
             devil_model_path: Path to Devil model joblib file.
         """
         self.provider = provider
-        self.feature_engineer = FeatureEngineer()
+        self.feature_engineer = FeaturePipeline(
+            feature_generators=[V3BaseFeatures(), V3HTFFeatures(timeframe="5m")]
+        )
 
         # Load models
         logger.info("Loading Angel model...")
@@ -288,7 +291,7 @@ class ReplayHarness:
             # Build DataFrame from the deque once per inference call (O(n))
             df = pl.DataFrame(list(history_deque))
 
-            features_df = self.feature_engineer.compute_indicators(df)
+            features_df = self.feature_engineer.run(df)
 
             # Filter to feature columns only
             feature_cols = [c for c in features_df.columns if c in FEATURE_NAMES]

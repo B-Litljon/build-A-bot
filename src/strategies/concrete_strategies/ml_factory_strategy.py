@@ -9,6 +9,8 @@ from typing import Dict, List, Tuple, Optional
 import polars as pl
 from strategies.concrete_strategies.ml_strategy import MLStrategy
 from core.signal import Signal
+from ml.feature_pipeline import FeaturePipeline
+from ml.features.v3_features import V3BaseFeatures, V3HTFFeatures
 
 logger = logging.getLogger(__name__)
 
@@ -21,12 +23,15 @@ class MLFactoryStrategy(MLStrategy):
         # Ensure warmup is set to at least 260 for 5m SMA-50 support
         kwargs.setdefault("warmup_period", 260)
         super().__init__(**kwargs)
+        self.pipeline = FeaturePipeline(
+            feature_generators=[V3BaseFeatures(), V3HTFFeatures(timeframe="5m")]
+        )
 
     def analyze(self, data: Dict[str, pl.DataFrame]) -> Tuple[List[Signal], float]:
         """
         Performs inference. The warm-up sequence ensures 'data' already contains
         the necessary historical depth.
         """
-        # Base MLStrategy.analyze already uses FeatureEngineer which handles
+        # Base MLStrategy.analyze already uses FeaturePipeline which handles
         # the 18-feature set and HTF indicators.
         return super().analyze(data)
