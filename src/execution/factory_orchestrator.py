@@ -108,6 +108,7 @@ class FactoryOrchestrator:
         # Get account for sizing
         account = await asyncio.to_thread(self.trading_client.get_account)
         equity = float(account.equity)
+        buying_power = float(account.buying_power)
 
         # Retrieve ATR for bracket calculation (assumes strategy includes it in metadata)
         # In current MLStrategy, it's calculated during feature extraction.
@@ -115,7 +116,7 @@ class FactoryOrchestrator:
         atr = sig.metadata.get("atr_abs", sig.price * 0.001)
 
         sl, tp = self.risk_manager.calculate_bracket(sig.price, atr)
-        qty = self.risk_manager.calculate_quantity(equity, sig.price, sl)
+        qty = self.risk_manager.calculate_quantity(equity, buying_power, sig.price, sl)
 
         if qty <= 0:
             return
