@@ -10,6 +10,7 @@ class RiskProfile:
     tp_atr_multiplier: float = 3.0
     min_sl_pct: float = 0.0015  # 0.15% absolute floor
     risk_per_trade: float = 0.02 # 2% of account
+    max_notional_per_order: float = 90000.0 # Clear Alpaca limits safely
 
 class RiskManager:
     """
@@ -46,4 +47,13 @@ class RiskManager:
             return 0.0
 
         qty = risk_dollars / risk_per_share
+
+        proposed_notional = qty * entry_price
+        if proposed_notional > self.profile.max_notional_per_order:
+            adjusted_qty = self.profile.max_notional_per_order / entry_price
+            logger.warning(
+                f"Quantity scaled down from {qty:.4f} to {adjusted_qty:.4f} to meet notional limits."
+            )
+            qty = adjusted_qty
+
         return max(round(qty, 4), 0.0001)
