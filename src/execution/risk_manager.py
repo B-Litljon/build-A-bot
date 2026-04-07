@@ -10,6 +10,7 @@ class RiskProfile:
     tp_atr_multiplier: float = 3.0
     min_sl_pct: float = 0.0015  # 0.15% absolute floor
     risk_per_trade: float = 0.02 # 2% of account
+    max_notional_cap: float = 100000.0
 
 class RiskManager:
     """
@@ -35,7 +36,7 @@ class RiskManager:
 
         return sl_price, tp_price
 
-    def calculate_quantity(self, equity: float, entry_price: float, sl_price: float) -> float:
+    def calculate_quantity(self, equity: float, buying_power: float, entry_price: float, sl_price: float) -> float:
         """
         Calculates fractional position size based on risk-per-trade.
         """
@@ -45,5 +46,15 @@ class RiskManager:
         if risk_per_share <= 0:
             return 0.0
 
-        qty = risk_dollars / risk_per_share
-        return max(round(qty, 4), 0.0001)
+        risk_qty = risk_dollars / risk_per_share
+        notional_qty = self.profile.max_notional_cap / entry_price
+        bp_qty = (buying_power * 0.95) / entry_price
+
+        final_qty = min(risk_qty, notional_qty, bp_qty)
+
+        if final_qty < risk_qty:
+            logger.warning(
+                f"Quantity scaled down from {risk_qty:.4f} to {final_qty:.4f} to meet notional/bp limits."
+            )
+
+        return max(round(final_qty, 4), 0.0001)
