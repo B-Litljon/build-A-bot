@@ -119,7 +119,8 @@ from alpaca.trading.stream import TradingStream
 # so bare module names resolve correctly inside the src/ tree.
 from core.notification_manager import NotificationManager
 from core.signal import Signal, SignalType
-from ml.feature_pipeline import FeatureEngineer
+from ml.feature_pipeline import FeaturePipeline
+from ml.features.v3_features import V3BaseFeatures, V3HTFFeatures
 from strategies.concrete_strategies.ml_strategy import MLStrategy
 from utils.bar_aggregator import LiveBarAggregator
 
@@ -440,7 +441,9 @@ class LiveOrchestrator:
             devil_threshold=self._devil_threshold,
             warmup_period=MIN_HISTORY_BARS,
         )
-        self._feature_engineer = FeatureEngineer()
+        self._feature_engineer = FeaturePipeline(
+            feature_generators=[V3BaseFeatures(), V3HTFFeatures(timeframe="5m")]
+        )
         self._notifier = NotificationManager()
         self._trading_client = TradingClient(
             self._api_key, self._secret_key, paper=self._paper
@@ -1071,7 +1074,7 @@ class LiveOrchestrator:
                     else "None",
                 )
                 # Full recompute — TA-Lib resample on all 400 1m bars
-                features_df = self._feature_engineer.compute_indicators(history_df)
+                features_df = self._feature_engineer.run(history_df)
 
                 # Refresh cache from the newly computed features
                 valid_htf = features_df.filter(
@@ -1098,7 +1101,8 @@ class LiveOrchestrator:
                     bar_timestamp.isoformat(),
                     ctx.htf_cache.sealed_at.isoformat(),
                 )
-                features_df = self._feature_engineer.compute_base_features(history_df)
+                # Since V3BaseFeatures is the first generator in the pipeline, we use it directly for warm path.
+                features_df = self._feature_engineer.feature_generators[0].generate(history_df)
                 features_df = features_df.with_columns(
                     [
                         pl.lit(ctx.htf_cache.htf_rsi_14).alias("htf_rsi_14"),
@@ -1843,7 +1847,7 @@ class LiveOrchestrator:
             return
 
         try:
-            features_df = self._feature_engineer.compute_indicators(history_df)
+            features_df = self._feature_engineer.run(history_df)
 
             htf_cols = [
                 "htf_rsi_14",
