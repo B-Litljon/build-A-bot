@@ -5,12 +5,18 @@ Target Labeling — Universal Scalper V4.0
 Implements the End-of-Day (EOD) Angel/Devil meta-labeling targets.
 
     Angel Target  — Was the Max Favorable Excursion (MFE) from entry to EOD
-                    ≥ 1.0 × daily_atr_abs?
+                    ≥ 0.6 × daily_atr_abs?
                     (Was the move large enough to be a real intraday trend leg?)
+                    ENTRY WINDOW: Only bars within the first 90 minutes of the
+                    RTH session (09:30–11:00 ET, session_progress ≤ 0.2308) can
+                    receive a positive label.  Bars outside this window are
+                    forced to 0 — not null — so they remain as negative training
+                    examples and the TA-Lib feature warmup is preserved.
 
     Devil Target  — Did the trade survive from entry to EOD without the
-                    session low breaching  close − 1.5 × daily_atr_abs?
-                    (Would a wide intraday stop have held until the bell?)
+                    session low breaching  close − 0.75 × daily_atr_abs?
+                    (A tighter stop forces the Devil to learn microstructure
+                    defence; fixes the 99% degeneracy of the 1.5× stop.)
 
     Macro Target  — Angel AND Devil both satisfied.
                     Used ONLY for EV calibration and threshold sweep.
@@ -117,16 +123,29 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 
 #: Angel fires when MFE ≥ ANGEL_MFE_MULT × daily_atr_abs
-ANGEL_MFE_MULT: float = 1.0
+#: Reduced from 1.0 → 0.6: a 0.6× ATR move from the opening 90-min window
+#: is achievable on 15–30% of bars, producing a trainable class balance.
+ANGEL_MFE_MULT: float = 0.6
 
 #: Devil survives when session never breaches close − DEVIL_SL_MULT × daily_atr_abs
-DEVIL_SL_MULT: float = 1.5
+#: Tightened from 1.5 → 0.75 → 0.4:
+#:   0.4× daily ATR is tight enough that 25–40% of entry-window bars get stopped out
+#:   intraday, pushing devil_target into the 60–75% survival range.
+#:   For SPY (~0.7% daily ATR): stop ≈ 0.28% below entry — breached on ~30% of days.
+#:   For TSLA (~2.5% daily ATR): stop ≈ 1.0% below entry — breached on ~35–45% of days.
+DEVIL_SL_MULT: float = 0.4
 
 #: Used for EV calculation in the validation gate only
 #: EV = win_rate × (TP_MULT / SL_MULT) − (1 − win_rate)
-#: R:R = 1.0 / 1.5 = 0.667  (compensated by higher trend-day win rate)
-TP_MULT: float = 1.0
-SL_MULT: float = 1.5
+#: R:R = 0.6 / 0.4 = 1.5  break-even win-rate = 0.4 / (0.6 + 0.4) = 40.0%
+#: Favourable R:R — wins pay 1.5× what losses cost.
+TP_MULT: float = 0.6
+SL_MULT: float = 0.4
+
+#: Entry window: only bars within the first 90 minutes of the RTH session
+#: (09:30–11:00 ET) can receive angel_target = 1.
+#: session_progress at 11:00 ET = (660 − 570) / 390 = 90 / 390 ≈ 0.2308
+ENTRY_WINDOW_MAX_PROGRESS: float = 90.0 / 390.0  # ≈ 0.2308
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -264,28 +283,47 @@ class DayTradeTargets(BaseTargetGenerator):
         # ── Angel Target ──────────────────────────────────────────────────────
         #
         # MFE[i] = _future_high_max[i] − close[i]
-        # angel_target[i] = 1  if  MFE[i] ≥ angel_mfe_mult × daily_atr_abs[i]
-        #                  = 0  otherwise
-        #                  = null  if  _future_high_max[i] is null (EOD bar)
+        #
+        # Entry-window mask (v3 — DROP strategy):
+        #   Bars outside the first 90 minutes (session_progress > 0.2308) receive
+        #   null — not 0.  drop_nulls() in clean_data() then removes them entirely.
+        #
+        #   Why null not 0:
+        #   When non-window bars were forced to 0, the labeled universe was 143K rows
+        #   with only 8% positive — diluted by 77% structurally-negative rows that
+        #   the model cannot learn meaningful signal from.  With null, only the 23%
+        #   of bars that are inside the entry window survive clean_data(), and within
+        #   that subset ~35% are angel_target=1, which lands cleanly in the 15–30%
+        #   target range.  Devil and Macro are also nulled outside the window so all
+        #   three targets drop together — no row survives with a mix of valid/null targets.
+        #
+        # Decision order (highest priority first):
+        #   1. null — EOD bar (no lookahead window)
+        #   2. null — outside 09:30–11:00 ET entry window → row is dropped
+        #   3. 1    — inside window AND MFE ≥ 0.6 × daily_atr_abs
+        #   4. 0    — inside window but MFE < threshold
         session = session.with_columns(
             (pl.col("_future_high_max") - pl.col("close")).alias("_mfe")
         )
         session = session.with_columns(
             pl.when(pl.col("_mfe").is_null())
-            .then(pl.lit(None, dtype=pl.Int8))
+            .then(pl.lit(None, dtype=pl.Int8))  # EOD bar
+            .when(pl.col("session_progress") > ENTRY_WINDOW_MAX_PROGRESS)
+            .then(pl.lit(None, dtype=pl.Int8))  # outside window → DROP
             .when(pl.col("_mfe") >= self.angel_mfe_mult * pl.col("daily_atr_abs"))
-            .then(pl.lit(1, dtype=pl.Int8))
-            .otherwise(pl.lit(0, dtype=pl.Int8))
+            .then(pl.lit(1, dtype=pl.Int8))  # MFE target hit
+            .otherwise(pl.lit(0, dtype=pl.Int8))  # MFE target missed
             .alias("angel_target")
         )
 
         # ── Devil Target ──────────────────────────────────────────────────────
         #
         # sl_price[i] = close[i] − devil_sl_mult × daily_atr_abs[i]
-        # devil_target[i] = 1  if  _future_low_min[i] > sl_price[i]
-        #                        (SL never breached from i+1 to EOD)
-        #                  = 0  if  _future_low_min[i] ≤ sl_price[i]
-        #                  = null  if  _future_low_min is null (EOD bar)
+        # devil_target[i] = 1    if  _future_low_min[i] > sl_price[i]
+        #                           (SL never breached from i+1 to EOD)
+        #                 = 0    if  _future_low_min[i] ≤ sl_price[i]
+        #                 = null if  _future_low_min is null (EOD bar)
+        #                 = null if  outside entry window (aligned with Angel — row is dropped)
         session = session.with_columns(
             (pl.col("close") - self.devil_sl_mult * pl.col("daily_atr_abs")).alias(
                 "_sl_price"
@@ -293,10 +331,12 @@ class DayTradeTargets(BaseTargetGenerator):
         )
         session = session.with_columns(
             pl.when(pl.col("_future_low_min").is_null())
-            .then(pl.lit(None, dtype=pl.Int8))
+            .then(pl.lit(None, dtype=pl.Int8))  # EOD bar
+            .when(pl.col("session_progress") > ENTRY_WINDOW_MAX_PROGRESS)
+            .then(pl.lit(None, dtype=pl.Int8))  # outside window → DROP
             .when(pl.col("_future_low_min") > pl.col("_sl_price"))
-            .then(pl.lit(1, dtype=pl.Int8))
-            .otherwise(pl.lit(0, dtype=pl.Int8))
+            .then(pl.lit(1, dtype=pl.Int8))  # survived
+            .otherwise(pl.lit(0, dtype=pl.Int8))  # stopped out
             .alias("devil_target")
         )
 
@@ -315,15 +355,16 @@ class DayTradeTargets(BaseTargetGenerator):
             .alias("devil_target_macro")
         )
 
-        # Drop internal staging columns
+        # Drop internal staging columns.
+        # NOTE: _high_shifted and _low_shifted lived only in session_desc
+        # (the descending working copy) and were never merged into session,
+        # so they must not be listed here.
         session = session.drop(
             [
                 "_future_high_max",
                 "_future_low_min",
                 "_mfe",
                 "_sl_price",
-                "_high_shifted",
-                "_low_shifted",
             ]
         )
 
@@ -358,6 +399,7 @@ class DayTradeTargets(BaseTargetGenerator):
         high = session["high"].to_numpy()
         low = session["low"].to_numpy()
         daily_atr = session["daily_atr_abs"].to_numpy()
+        sess_prog = session["session_progress"].to_numpy()
 
         angel_arr = np.full(n, np.nan, dtype=np.float32)
         devil_arr = np.full(n, np.nan, dtype=np.float32)
@@ -370,17 +412,21 @@ class DayTradeTargets(BaseTargetGenerator):
 
             entry = close[i]
             sl = entry - self.devil_sl_mult * atr
-            mfe_t = entry + self.angel_mfe_mult * atr
+            in_window = sess_prog[i] <= ENTRY_WINDOW_MAX_PROGRESS
+
+            # Outside entry window: all three targets stay NaN → dropped by clean_data
+            if not in_window:
+                continue
 
             # Lookahead window: bars i+1 … n-1 (remainder of session)
             future_highs = high[i + 1 :]
             future_lows = low[i + 1 :]
 
-            # Angel: did the session-high ever reach MFE target?
+            # Angel: MFE ≥ 0.6× daily ATR (already in-window, checked above)
             mfe = float(np.max(future_highs)) - entry
-            angel_hit = mfe >= (self.angel_mfe_mult * atr)
+            angel_hit = mfe >= self.angel_mfe_mult * atr
 
-            # Devil: did the session-low ever breach the SL?
+            # Devil: did the session-low breach close − 0.4× daily ATR by EOD?
             sl_hit = bool(np.any(future_lows <= sl))
             devil_surv = not sl_hit
 
