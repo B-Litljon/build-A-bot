@@ -203,3 +203,72 @@ A  src/strategies/base.py
 ---
 
 **End of Report**
+
+---
+
+## Tier 1 Completion — Alpaca Streaming Port + Unified ABC
+
+**Date:** 2026-04-29
+**Agent:** Claude Sonnet 4.6
+**Trigger:** The previous ABC (`market_provider.py`) defined three abstract methods — `get_historical_bars(symbols: List[str], timeframe: TimeFrame, ...)`, `get_latest_bar`, and `is_market_open` — that none of the three concrete providers implemented. Polygon and Yahoo implemented a completely different 4-method shape; AlpacaProvider had no streaming at all and did not inherit from the ABC. All three concrete classes were failing instantiation with `TypeError: Can't instantiate abstract class`. The streaming logic for Alpaca existed in `feed.py`'s `AlpacaCryptoFeed` in async form but had never been ported to `AlpacaProvider`.
+
+**Architectural decision:** Port AlpacaCryptoFeed's async streaming logic into AlpacaProvider with a sync interface (asyncio.run-bridged), add equity streaming via StockDataStream alongside crypto, add get_active_symbols via TradingClient, then rewrite the unified ABC against the three matching concrete implementations.
+
+**Files modified:**
+- `src/data/alpaca_provider.py` — added inheritance from MarketDataProvider; added `get_active_symbols`, `subscribe`, `run_stream`; extended `__init__` to store api_key/secret_key, instantiate TradingClient, and initialize streaming state
+- `src/data/market_provider.py` — rewritten entirely: replaced the mismatched 3-method ABC (with TimeFrame dependency, get_latest_bar, is_market_open) with the 4-method unified contract matching what Polygon and Yahoo already implement
+
+**Files NOT modified:**
+- `feed.py` — AlpacaCryptoFeed is now functionally redundant but left in place; deletion is a separate decision (Tier 2)
+- `polygon_provider.py`, `yahoo_provider.py` — source of truth for the contract shape; untouched
+- `factory.py`, `live_orchestrator.py`, `factory_orchestrator.py`, `strategies/base.py`, `execution/enums.py`, `data/timeframe.py` — all untouched
+
+### Contract resolution
+
+Polygon and Yahoo agree exactly on all four method signatures. No conflicts or shape mismatches were found:
+
+| Method | Signature |
+|--------|-----------|
+| `get_active_symbols` | `(self, limit: int = 10) -> List[str]` |
+| `get_historical_bars` | `(self, symbol: str, timeframe_minutes: int, start: datetime, end: datetime) -> pl.DataFrame` |
+| `subscribe` | `(self, symbols: List[str], callback: Callable) -> None` |
+| `run_stream` | `(self) -> None` |
+
+The old ABC had `get_historical_bars(symbols: List[str], timeframe: TimeFrame, start, end=None)` — plural symbols, TimeFrame type, optional end. The concrete classes used singular symbol, int minutes, required end. The old ABC also declared `get_latest_bar` and `is_market_open` which no concrete class implemented. The new ABC drops all three of those deviations and matches the concrete implementations exactly.
+
+### Equity vs. crypto streaming
+
+`AlpacaProvider.subscribe()` sniffs symbols by `/` and routes to `CryptoDataStream` or `StockDataStream` accordingly. Both streams are initialized during `subscribe()` but not started — `run_stream()` calls `asyncio.run(_run_all())` where `_run_all` uses `asyncio.gather` to run both streams concurrently. This makes AlpacaProvider the only provider that natively handles both asset classes in one instance.
+
+The `_bar_handler` is defined as an inner `async def` inside `subscribe()` and registered with Alpaca's `subscribe_bars()`. It emits a provider-agnostic dict `{symbol, timestamp, open, high, low, close, volume}` and calls `await self._callback(...)`. This matches the pattern in `feed.py`'s `AlpacaCryptoFeed.subscribe`.
+
+### Verification results
+
+```
+AlpacaProvider: OK
+PolygonDataProvider: OK
+YahooDataProvider: OK
+
+PASS: all three providers satisfy MarketDataProvider.
+```
+
+Note: verification was performed using `unittest.mock` to stub all vendor SDKs (`polars`, `alpaca`, `polygon`, `yfinance`) since the project's virtualenv packages are not installed in the CI/shell environment. All three classes instantiated without `TypeError`; the ABC compliance check is a Python runtime structural check independent of package availability.
+
+Syntax checks (AST parse):
+```
+market_provider.py: OK
+alpaca_provider.py: OK
+```
+
+### Still deferred (do not let this rot)
+
+- `feed.py`'s `MarketDataFeed` ABC and `AlpacaCryptoFeed` class are now redundant. Deletion is a deliberate Tier 2 task — leave for now.
+- `core/order_management.py` is still missing on disk.
+- `factory.py` still uses the older provider interface; verify it still works after this change.
+- No call sites migrated yet (factory_orchestrator, retrainer, etc. still import Alpaca enums directly).
+- The contract uses `int` minutes for timeframe; `data/timeframe.TimeFrame` exists but is not yet wired in. Tier 2 decision.
+- `data/timeframe.py` is now orphaned from the ABC — nothing imports it in the provider layer. Tier 2 decision on whether to wire it in or remove it.
+
+### Final commit hash
+
+See `git log` (cannot self-reference).
