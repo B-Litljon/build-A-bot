@@ -312,3 +312,99 @@ factory.py: import OK
 ### Final commit hash
 
 See `git log` (cannot self-reference).
+
+---
+
+## Order Management Cleanup, Act 1 — V1 Deletes (STOPPED)
+
+**Date:** 2026-04-29
+**Time:** 2026-04-29 12:47:22 PDT
+**Agent:** Kimi K2.6
+**Trigger:** Hybrid order-management decision (rewrite OrderParams clean + delete V1 dependents). This is the delete half; Act 2 (Sonnet) will write the new OrderParams.
+
+**Status:** STOPPED — pre-deletion audit discovered unexpected dependents and an unresolved ABC inheritance chain. No files were deleted. No commit made.
+
+**Files slated for deletion (none deleted yet):**
+- `src/strategies/concrete_strategies/rsi_bbands.py` — V1 strategy, deprecated
+- `src/strategies/concrete_strategies/sma_crossover.py` — V1 strategy, deprecated
+- `src/strategies/strategy.py` — legacy Strategy ABC, superseded by BaseStrategy in base.py
+- `tests/test_order_management.py` — tested a module that no longer exists
+
+**Files NOT modified:**
+- All source files untouched
+
+### Pre-deletion dependency audit
+
+```
+=== rsi_bbands ===
+./src/strategies/concrete_strategies/rsi_bbands.py:11:class RSIBBands(Strategy):
+./src/strategies/concrete_strategies/__init__.py:1:from .rsi_bbands import RSIBBands
+./src/strategies/concrete_strategies/__init__.py:6:    "rsi_bollinger": RSIBBands,
+./src/strategies/strategy_factory.py:1:from strategies.concrete_strategies.rsi_bbands import RSIBBands
+./src/strategies/strategy_factory.py:6:    "rsi_bollinger": RSIBBands,
+./tests/test_live_simulation.py:17:from strategies.concrete_strategies.rsi_bbands import RSIBBands
+./tests/test_live_simulation.py:110:    # Initialize RSIBBands with LOOSE parameters for testing
+./tests/test_live_simulation.py:111:    strategy = RSIBBands(
+./tests/test_strategy_logic.py:10:from strategies.concrete_strategies.rsi_bbands import RSIBBands
+./tests/test_strategy_logic.py:110:def replay_and_collect(strategy: RSIBBands, symbol: str, df: pl.DataFrame):
+./tests/test_strategy_logic.py:131:    strategy_positive = RSIBBands()
+./tests/test_strategy_logic.py:144:    strategy_negative = RSIBBands()
+
+=== sma_crossover ===
+./src/strategies/concrete_strategies/sma_crossover.py:12:class SMACrossover(Strategy):
+./src/strategies/concrete_strategies/__init__.py:2:from .sma_crossover import SMACrossover
+./src/strategies/concrete_strategies/__init__.py:7:    "sma_crossover": SMACrossover,
+./src/strategies/strategy_factory.py:2:from strategies.concrete_strategies.sma_crossover import SMACrossover
+./src/strategies/strategy_factory.py:7:    "sma_crossover": SMACrossover,
+
+=== legacy Strategy ABC ===
+./src/strategies/concrete_strategies/rsi_bbands.py:3:from strategies.strategy import Strategy
+./src/strategies/concrete_strategies/sma_crossover.py:9:from strategies.strategy import Strategy
+./src/strategies/concrete_strategies/ml_strategy.py:33:from strategies.strategy import Strategy
+
+=== test_order_management ===
+(no output — file is truly orphaned)
+```
+
+### Strategy ABC inheritance check
+
+```
+=== ml_strategy.py inheritance ===
+43:class MLStrategy(Strategy):
+33:from strategies.strategy import Strategy
+```
+
+**Conclusion:** `ml_strategy.py` inherits from the OLD `Strategy` ABC (`strategies.strategy.Strategy`), NOT from `BaseStrategy` (`strategies.base.BaseStrategy`). Deleting `strategy.py` would break `ml_strategy.py` and, by extension, `ml_factory_strategy.py` (which inherits from `MLStrategy`).
+
+### Surviving consumers of `core.order_management`
+
+Files still importing from the missing `core.order_management` module:
+- `src/strategies/concrete_strategies/ml_strategy.py` (`OrderParams`)
+- `src/strategies/strategy.py` (`OrderParams`) — this file is also slated for deletion
+- `grid_search_backtest.py` (`OrderParams`)
+- `grid_search_backtest_q1.py` (`OrderParams`)
+- `tests/test_order_management.py` (`OrderManager`, `OrderParams`) — slated for deletion
+
+### Unexpected dependents discovered
+
+| File | Imports | Impact |
+|------|---------|--------|
+| `src/strategies/concrete_strategies/__init__.py` | `RSIBBands`, `SMACrossover` | Will break if V1 strategies deleted without updating `__init__.py` |
+| `src/strategies/strategy_factory.py` | `RSIBBands`, `SMACrossover` | Will break if V1 strategies deleted without updating `strategy_factory.py` |
+| `grid_search_backtest.py` | `OrderParams` from `core.order_management` | Still depends on missing module; not in scope but worth flagging |
+| `grid_search_backtest_q1.py` | `OrderParams` from `core.order_management` | Still depends on missing module; not in scope but worth flagging |
+
+### Test files flagged for follow-up
+
+- `tests/test_live_simulation.py` — imports `RSIBBands`
+- `tests/test_strategy_logic.py` — imports `RSIBBands`
+
+### Required decisions before Act 1 can proceed
+
+1. **Migrate `ml_strategy.py` to `BaseStrategy` first?** The old `Strategy` ABC cannot be deleted until `ml_strategy.py` stops inheriting from it. Should Act 2 (Sonnet) handle this migration as part of OrderParams design, or should it be a separate pre-Act-1 task?
+2. **Update `__init__.py` and `strategy_factory.py`?** These are source files that import the V1 strategies. Should they be updated in Act 1 to remove V1 references, or are they also slated for deletion?
+3. **Handle `grid_search_backtest.py` and `grid_search_backtest_q1.py`?** These files import `OrderParams` from the missing module. Are they also dead code to be deleted, or do they need to be preserved and fixed?
+
+### Final commit hash
+
+N/A — no commit made (Act 1 stopped at audit phase).
