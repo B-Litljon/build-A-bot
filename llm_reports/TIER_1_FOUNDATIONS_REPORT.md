@@ -408,3 +408,90 @@ Files still importing from the missing `core.order_management` module:
 ### Final commit hash
 
 N/A — no commit made (Act 1 stopped at audit phase).
+
+---
+
+## Order Management Cleanup, Act 1 (Revised) — V1 Deletion + Registry/Test Cleanup
+
+**Date:** 2026-04-29
+**Time:** 2026-04-29 13:12:35 PDT
+**Agent:** Kimi K2.6
+**Trigger:** Revised Act 1 after the previous attempt halted on unexpected dependents. Recon (`GRID_SEARCH_RECON_2026-04-29_1255.md`) classified grid-search backtests as stale-but-live ML tooling — not deleted here. Legacy `strategy.py` ABC also retained because `MLStrategy` still inherits from it (handled in Act 2).
+
+**Files edited:**
+- `src/strategies/concrete_strategies/__init__.py` — removed V1 registry entries (`RSIBBands`, `SMACrossover`)
+- `src/strategies/strategy_factory.py` — removed V1 imports and registry entries, left empty `STRATEGY_REGISTRY` and `create_strategy` function
+- `tests/test_strategy_logic.py` — removed entire V1-specific test body (RSIBBands signal/replay tests); replaced with placeholder docstring
+- `tests/test_live_simulation.py` — removed entire V1-specific test body (RSIBBands live simulation with mocks); replaced with placeholder docstring
+
+**Files deleted:**
+- `src/strategies/concrete_strategies/rsi_bbands.py` — V1 strategy, deprecated
+- `src/strategies/concrete_strategies/sma_crossover.py` — V1 strategy, deprecated
+- `tests/test_order_management.py` — orphaned, tested missing module
+
+**Files NOT modified (deliberately):**
+- `src/strategies/strategy.py` — still in use by `MLStrategy`, deleted in Act 2
+- `src/strategies/concrete_strategies/ml_strategy.py`, `ml_factory_strategy.py` — Act 2 targets
+- `grid_search_backtest.py`, `grid_search_backtest_q1.py` — stale-but-live, fixed in Act 2
+
+### Edits applied to each registry/test file
+
+**`src/strategies/concrete_strategies/__init__.py`**
+- Removed: `from .rsi_bbands import RSIBBands`, `from .sma_crossover import SMACrossover`
+- Removed: `"rsi_bollinger": RSIBBands`, `"sma_crossover": SMACrossover` from `STRATEGIES` dict
+- Retained: `from .ml_strategy import MLStrategy` and `"ml_strategy": MLStrategy`
+
+**`src/strategies/strategy_factory.py`**
+- Removed: both V1 imports (`RSIBBands`, `SMACrossover`)
+- Removed: both V1 entries from `STRATEGY_REGISTRY`
+- Retained: empty `STRATEGY_REGISTRY = {}` and `create_strategy` function
+
+**`tests/test_strategy_logic.py`**
+- Removed: `from strategies.concrete_strategies.rsi_bbands import RSIBBands`
+- Removed: `build_synthetic_df`, `replay_and_collect`, `run_test`, and `if __name__ == "__main__"` block (all exclusively tested RSIBBands)
+- Replaced with: module-level placeholder docstring
+
+**`tests/test_live_simulation.py`**
+- Removed: `from strategies.concrete_strategies.rsi_bbands import RSIBBands`
+- Removed: `MockTradingClient`, `MockProvider`, `run_simulation`, and `if __name__ == "__main__"` block (all exclusively tested RSIBBands live simulation)
+- Replaced with: module-level placeholder docstring
+
+### Post-deletion verification
+
+```
+=== No remaining references to V1 strategy classes ===
+(no output — clean)
+
+=== No remaining imports of V1 strategy modules ===
+(no output — clean)
+
+=== ml_strategy.py and ml_factory_strategy.py still parse ===
+ml_strategy.py: syntax OK
+ml_factory_strategy.py: syntax OK
+
+=== Surviving consumers of core.order_management (Act 2 targets) ===
+./src/strategies/concrete_strategies/ml_strategy.py:30:from core.order_management import OrderParams
+./src/strategies/strategy.py:6:from core.order_management import OrderParams
+./grid_search_backtest_q1.py:16:from core.order_management import OrderParams
+./grid_search_backtest.py:16:from core.order_management import OrderParams
+```
+
+**Result:** All checks passed. No RSIBBands/SMACrossover references remain. Both ML strategies parse. Surviving `core.order_management` consumers match the expected Act 2 input set.
+
+### Surviving consumers of `core.order_management` (Act 2 input)
+
+| File | Import | Notes |
+|------|--------|-------|
+| `src/strategies/concrete_strategies/ml_strategy.py` | `OrderParams` | Primary target — new OrderParams designed against this file's needs |
+| `src/strategies/strategy.py` | `OrderParams` | Legacy ABC; will be deleted once `MLStrategy` migrates to `BaseStrategy` |
+| `grid_search_backtest.py` | `OrderParams` | Stale ML backtest; needs constructor update + new OrderParams import |
+| `grid_search_backtest_q1.py` | `OrderParams` | Stale ML backtest; same fixes as above |
+
+### Test files that became stubs (need Act 2 re-targeting)
+
+- `tests/test_strategy_logic.py` — now a placeholder; was entirely RSIBBands-specific
+- `tests/test_live_simulation.py` — now a placeholder; was entirely RSIBBands-specific
+
+### Final commit hash
+
+See `git log` (cannot self-reference).
