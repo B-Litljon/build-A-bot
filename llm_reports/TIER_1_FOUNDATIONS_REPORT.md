@@ -272,3 +272,43 @@ alpaca_provider.py: OK
 ### Final commit hash
 
 See `git log` (cannot self-reference).
+
+---
+
+## Tier 1 Housekeeping
+
+**Date:** 2026-04-29
+**Time:** 2026-04-29 12:36:21 PDT
+**Agent:** Kimi K2.6
+**Trigger:** Loose ends from yesterday's Tier 1 completion — orphaned report file, unidentified Modelfile, and untested factory.py post-ABC-rewrite.
+
+**Files modified:**
+- `STOP_REPORT.md` → moved to `llm_reports/STOP_REPORT_2026-04-27.md`
+
+**Files NOT modified:**
+- `Modelfile.gemma` (deleted by operator before inspection; see investigation below)
+- All `.py` source files
+
+### STOP_REPORT.md investigation
+The file documented a contract inconsistency discovered by Gemini 3.1 during an attempted fix on 2026-04-27: `AlpacaProvider` only implemented `get_historical_bars` while `PolygonDataProvider` and `YahooDataProvider` implemented four methods (`get_active_symbols`, `get_historical_bars`, `subscribe`, `run_stream`). The report was a halt-and-report because the three concrete providers did not implement the same contract at that time. It is being archived in `llm_reports/` as part of the audit trail because the inconsistency was subsequently resolved in commit `8e6d26d` (Tier 1 completion) by porting streaming logic into `AlpacaProvider` and rewriting the unified `MarketDataProvider` ABC.
+
+### Modelfile.gemma investigation
+- **File size:** N/A (deleted by operator before agent inspection)
+- **File type (per `file` command):** N/A
+- **Contents:** N/A
+- **Assessment:** The file was deleted by the operator before this agent could inspect it. No data available for Captain B's decision.
+
+### factory.py sanity check
+```
+factory.py: syntax OK
+factory.py: import OK
+  alpaca: returned AlpacaProvider
+  polygon: returned PolygonDataProvider
+  yahoo: returned YahooDataProvider
+```
+
+**Result:** No ABC violations. All three provider types instantiate correctly through `get_market_provider()`.
+
+### Final commit hash
+
+See `git log` (cannot self-reference).
