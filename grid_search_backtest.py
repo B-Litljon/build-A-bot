@@ -42,7 +42,16 @@ for profile_name, sl_mult, tp_mult in risk_profiles:
     )
 
     # Create strategy with threshold 0.50
-    strategy = MLStrategy(model_path="src/ml/models/rf_model.joblib", threshold=0.50)
+    # NOTE: old constructor used a single model_path + threshold.
+    # Mapped to angel_path=devil_path (same file) and devil_threshold=0.50
+    # with angel_threshold at its default 0.40. This is a small semantic
+    # change from the stale backtest code.
+    strategy = MLStrategy(
+        angel_path="src/ml/models/rf_model.joblib",
+        devil_path="src/ml/models/rf_model.joblib",
+        angel_threshold=0.40,
+        devil_threshold=0.50,
+    )
 
     order_params = OrderParams(
         risk_percentage=0.02,
@@ -58,15 +67,15 @@ for profile_name, sl_mult, tp_mult in risk_profiles:
             self.active_orders = {}
             self.trades = []
 
-        def place_order(self, sig, cap, bar_idx):
+        def place_order(self, signal, cap, bar_idx):
             risk = cap * self.order_params.risk_percentage
-            qty = risk / sig.price
-            sl = sig.price * self.order_params.sl_multiplier
-            tp = sig.price * self.order_params.tp_multiplier
+            qty = risk / signal.entry_price
+            sl = signal.entry_price * self.order_params.sl_multiplier
+            tp = signal.entry_price * self.order_params.tp_multiplier
             oid = f"o{len(self.trades)}"
             self.active_orders[oid] = {
-                "symbol": sig.symbol,
-                "entry_price": sig.price,
+                "symbol": signal.metadata.get("symbol"),
+                "entry_price": signal.entry_price,
                 "quantity": qty,
                 "stop_loss": sl,
                 "take_profit": tp,
@@ -128,12 +137,16 @@ for profile_name, sl_mult, tp_mult in risk_profiles:
         if is_new:
             hist = lba.history_df
             if len(hist) >= strategy.warmup_period:
-                sigs = strategy.analyze({symbol: hist})
-                for sig in sigs:
-                    if sig.type == "BUY" and not any(
+                hist = hist.with_columns(pl.lit(symbol).alias("symbol"))
+                signal = strategy.generate_signals(hist)
+                if (
+                    signal is not None
+                    and signal.direction == "long"
+                    and not any(
                         d["symbol"] == symbol for d in bom.active_orders.values()
-                    ):
-                        bom.place_order(sig, bom.capital, i)
+                    )
+                ):
+                    bom.place_order(signal, bom.capital, i)
 
     # Calculate results
     trades = bom.trades

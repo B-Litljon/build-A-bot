@@ -16,6 +16,7 @@ from utils.bar_aggregator import LiveBarAggregator
 
 logger = logging.getLogger(__name__)
 
+
 class FactoryOrchestrator:
     """
     The Router: Async event loop wiring Feed, Strategy, and Risk Manager.
@@ -30,7 +31,7 @@ class FactoryOrchestrator:
         strategy: MLStrategy,
         risk_manager: RiskManager,
         feed: MarketDataFeed,
-        paper: bool = True
+        paper: bool = True,
     ):
         self.symbols = symbols
         self.feed = feed
@@ -41,7 +42,7 @@ class FactoryOrchestrator:
         self.aggregators = {
             s: LiveBarAggregator(timeframe=1, history_size=400) for s in symbols
         }
-        self.active_positions = {} # symbol -> {sl, tp, qty}
+        self.active_positions = {}  # symbol -> {sl, tp, qty}
         self._shutdown_event = asyncio.Event()
 
     async def run(self):
@@ -60,10 +61,14 @@ class FactoryOrchestrator:
             logger.info(f"Injecting {len(df)} historical bars for {symbol}...")
             for row in df.iter_rows(named=True):
                 agg.add_bar(row)
-            logger.info(f"Aggregator for {symbol} primed. History size: {len(agg.history_df)}")
+            logger.info(
+                f"Aggregator for {symbol} primed. History size: {len(agg.history_df)}"
+            )
 
         # 3. Start Data Pipe
-        feed_task = asyncio.create_task(self.feed.subscribe(self.symbols, self._on_tick))
+        feed_task = asyncio.create_task(
+            self.feed.subscribe(self.symbols, self._on_tick)
+        )
 
         # 4. Universal Watchdog (1s poll)
         watchdog_task = asyncio.create_task(self._watchdog_loop())
@@ -84,59 +89,58 @@ class FactoryOrchestrator:
 
         # logical clock alignment and aggregation
         if not agg.add_bar(tick):
-            return # Wait for bar to seal
+            return  # Wait for bar to seal
 
         # Bar sealed (1m candle complete). Snapshot for inference.
         history = agg.history_df.clone()
+        history = history.with_columns(pl.lit(symbol).alias("symbol"))
 
         # Offload CPU-bound ML inference to thread
-        signal_result = await asyncio.to_thread(self.strategy.analyze, {symbol: history})
+        signal = await asyncio.to_thread(self.strategy.generate_signals, history)
 
-        # analyze returns (List[Signal], highest_prob)
-        signals, _ = signal_result
-        if not signals:
+        if signal is None:
             return
 
         # Execute if FLAT
         if symbol not in self.active_positions:
-            await self._execute_buy(signals[0])
+            await self._execute_buy(signal, symbol)
 
-    async def _execute_buy(self, sig):
+    async def _execute_buy(self, signal, symbol):
         """Calculates risk, submits order, and enters watchdog state."""
-        symbol = sig.symbol
-
         # Get account for sizing
         account = await asyncio.to_thread(self.trading_client.get_account)
         equity = float(account.equity)
         buying_power = float(account.buying_power)
 
-        # Retrieve ATR for bracket calculation (assumes strategy includes it in metadata)
-        # In current MLStrategy, it's calculated during feature extraction.
-        # For brevity, let's assume metadata contains 'atr_abs'
-        atr = sig.metadata.get("atr_abs", sig.price * 0.001)
+        # Signal now carries bracket distances directly — no ATR fallback needed
+        entry = signal.entry_price
+        sl_distance = signal.raw_sl_distance
+        tp_distance = signal.raw_tp_distance
+        sl_price = entry - sl_distance
+        tp_price = entry + tp_distance
 
-        sl, tp = self.risk_manager.calculate_bracket(sig.price, atr)
-        qty = self.risk_manager.calculate_quantity(equity, buying_power, sig.price, sl)
+        qty = self.risk_manager.calculate_quantity(
+            equity, buying_power, entry, sl_price
+        )
 
         if qty <= 0:
             return
 
-        logger.info(f"Executing BUY for {symbol} | Qty: {qty} | SL: {sl} | TP: {tp}")
+        logger.info(
+            f"Executing BUY for {symbol} | Qty: {qty} | SL: {sl_price} | TP: {tp_price}"
+        )
 
         req = MarketOrderRequest(
-            symbol=symbol,
-            qty=qty,
-            side=OrderSide.BUY,
-            time_in_force=TimeInForce.GTC
+            symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC
         )
 
         try:
             order = await asyncio.to_thread(self.trading_client.submit_order, req)
             self.active_positions[symbol] = {
-                "sl": sl,
-                "tp": tp,
+                "sl": sl_price,
+                "tp": tp_price,
                 "qty": qty,
-                "order_id": order.id
+                "order_id": order.id,
             }
         except Exception as e:
             logger.error(f"Entry failed for {symbol}: {e}")
@@ -162,10 +166,7 @@ class FactoryOrchestrator:
     async def _execute_sell(self, symbol: str, qty: float):
         """Market close of a position."""
         req = MarketOrderRequest(
-            symbol=symbol,
-            qty=qty,
-            side=OrderSide.SELL,
-            time_in_force=TimeInForce.GTC
+            symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC
         )
         try:
             await asyncio.to_thread(self.trading_client.submit_order, req)

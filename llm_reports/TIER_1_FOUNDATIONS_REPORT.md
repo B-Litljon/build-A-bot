@@ -202,6 +202,99 @@ A  src/strategies/base.py
 
 ---
 
+## Order Management Cleanup, Act 2 — Strategy Migration to BaseStrategy
+
+**Date:** 2026-04-29
+**Time:** 23:32:12 PDT
+**Agent:** Claude Sonnet 4.6
+**Trigger:** Pre-Act-2 inspection (MLSTRATEGY_INTERPRETATION_2026-04-29_1332.md) revealed that get_order_params() was dead code and the existing analyze() flow needed to migrate to BaseStrategy.generate_signals() with embedded bracket distances. This commit performs that migration on the factory path only; live_orchestrator.py is left with a known-broken state pending Tier 3 rewrite.
+
+**Files created:**
+- `src/core/order_management.py` — minimal OrderParams dataclass for backtest scenarios only
+
+**Files modified:**
+- `src/strategies/concrete_strategies/ml_strategy.py` — migrated to BaseStrategy; analyze() → generate_signals(); ATR bracket distances now computed in strategy; removed dead OrderParams / get_order_params code
+- `src/strategies/concrete_strategies/ml_factory_strategy.py` — removed unused core.signal import, removed redundant self.pipeline override, removed analyze() passthrough method
+- `src/execution/factory_orchestrator.py` — consumes new Signal shape; ATR fallback bug fixed; symbol added as DataFrame literal before strategy invocation
+- `grid_search_backtest.py` — constructor args updated (angel_path/devil_path/angel_threshold/devil_threshold); adapted to single-signal generate_signals() return; signal field access updated for base.Signal
+- `grid_search_backtest_q1.py` — same changes as grid_search_backtest.py
+
+**Files deleted:**
+- `src/strategies/strategy.py` — legacy Strategy ABC, no surviving inheritors
+- `src/strategies/strategy_factory.py` — empty registry, no consumers
+- `tests/test_strategy_logic.py` — placeholder stub, no real tests
+- `tests/test_live_simulation.py` — placeholder stub, no real tests
+
+**Files NOT modified (deliberately):**
+- `live_orchestrator.py` logic — known broken (angel_model attribute bug); deferred to Tier 3 rewrite as its own project. No import changes were needed because it only imports MLStrategy (same module path) and does not import the deleted Strategy ABC.
+- `factory_orchestrator.py` Alpaca enum imports — separate Tier 2 broker abstraction task
+- All Tier 1 foundation files (base.py, enums.py, timeframe.py, market_provider.py)
+
+### ATR sourcing
+- `SL_ATR_MULTIPLIER = 0.5` — sourced from live_orchestrator.py line 186
+- `TP_ATR_MULTIPLIER = 3.0` — sourced from live_orchestrator.py line 187
+- `MIN_SL_PCT = 0.0015` — sourced from live_orchestrator.py line 188 (HF7 hotfix floor)
+- `natr_14` (percentage-form ATR) is computed by `V3BaseFeatures` as part of the 18-feature vector. Absolute ATR is derived in-strategy as `(natr_14 / 100.0) * current_price`.
+
+### Symbol handoff design
+**Option A** — callers add a `symbol` column to the DataFrame as a Polars literal before invoking `generate_signals()`. This keeps `BaseStrategy.generate_signals(df: pl.DataFrame)` signature unchanged and avoids modifying base.py (which is locked under Tier 1). The strategy reads `df["symbol"].tail(1)[0]` and passes it through `metadata["symbol"]`.
+
+Callers updated:
+- `factory_orchestrator.py` — `history = history.with_columns(pl.lit(symbol).alias("symbol"))`
+- `grid_search_backtest.py` / `grid_search_backtest_q1.py` — `hist = hist.with_columns(pl.lit(symbol).alias("symbol"))`
+
+### Decisions made on the open questions
+- `strategy_factory.py`: **deleted (Option B)** — empty `STRATEGY_REGISTRY = {}` with zero consumers across the codebase. Cleaner to delete than maintain dead infrastructure.
+- Placeholder tests: **deleted (Option B)** — real ML strategy tests need model files or mocks; out of scope for Act 2. The stubs were not testing anything meaningful.
+- `MLFactoryStrategy.pipeline` override: **removed** — it was a byte-for-byte duplicate of the pipeline already constructed in `MLStrategy.__init__`. Removing it eliminates confusion and defensive-code noise.
+
+### Verification results
+```
+# Syntax checks
+src/core/order_management.py: syntax OK
+src/strategies/concrete_strategies/ml_strategy.py: syntax OK
+src/strategies/concrete_strategies/ml_factory_strategy.py: syntax OK
+src/execution/factory_orchestrator.py: syntax OK
+src/execution/live_orchestrator.py: syntax OK
+grid_search_backtest.py: syntax OK
+grid_search_backtest_q1.py: syntax OK
+
+# Structural AST checks (numpy/polars not installed in shell env)
+MLStrategy bases: ['BaseStrategy']
+MLStrategy is BaseStrategy subclass: OK
+MLFactoryStrategy bases: ['MLStrategy']
+MLFactoryStrategy is MLStrategy subclass: OK
+MLStrategy has generate_signals: OK
+MLStrategy lacks analyze: OK
+MLStrategy lacks get_order_params: OK
+All structural checks passed.
+
+# OrderParams import
+cd src && python -c "from core.order_management import OrderParams; print('OrderParams import OK')"
+→ OrderParams import OK
+
+# No surviving legacy Strategy imports
+No legacy Strategy imports found
+
+# No surviving deleted method references
+No deleted method references found
+
+# live_orchestrator parse check
+live_orchestrator parses OK
+```
+
+### Known unresolved issues (flagged for future work)
+- `live_orchestrator.py` still has the `angel_model` / `devil_model` attribute bug (would crash on first inference). Tier 3 rewrite required.
+- Other live_orchestrator.py logic still references `Strategy` ABC patterns and constructs `core.signal.Signal` directly; full rewrite needed.
+- `MLStrategy.generate_signals` only emits long signals (no short logic, matching the original code). Future enhancement.
+- `OrderParams` percentage-multiplier risk model is not unified with ATR-based live execution. Backtests use one, live uses the other. Reconciling them is a future architectural decision.
+- Grid-search backtests use a single model file for both Angel and Devil (`angel_path=devil_path="src/ml/models/rf_model.joblib"`) because the stale code only specified one `model_path`. This is a semantic change; if real backtests are run, separate Angel/Devil model files should be provided.
+
+### Final commit hash
+See `git log` (cannot self-reference).
+
+---
+
 **End of Report**
 
 ---

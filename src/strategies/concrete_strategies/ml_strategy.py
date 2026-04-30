@@ -21,16 +21,14 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Optional
 
 import numpy as np
 import polars as pl
 import pandas as pd
 
-from core.order_management import OrderParams
-from core.signal import Signal, SignalType
+from strategies.base import BaseStrategy, Signal
 from core.notification_manager import NotificationManager
-from strategies.strategy import Strategy
 
 # CRITICAL: Import FeaturePipeline to prevent training/inference skew
 from ml.feature_pipeline import FeaturePipeline
@@ -39,8 +37,15 @@ from ml.trainers.v3_rf_trainer import V3RandomForestTrainer
 
 logger = logging.getLogger(__name__)
 
+# Bracket computation constants (sourced from V3.4 production values in
+# src/execution/live_orchestrator.py — copied by value to avoid depending
+# on the broken file).
+SL_ATR_MULTIPLIER = 0.5  # SL distance = SL_ATR_MULTIPLIER * atr_abs
+TP_ATR_MULTIPLIER = 3.0  # TP distance = TP_ATR_MULTIPLIER * atr_abs
+MIN_SL_PCT = 0.0015  # Floor: SL distance / entry_price >= 0.15% (HF7 hotfix)
 
-class MLStrategy(Strategy):
+
+class MLStrategy(BaseStrategy):
     """
     Meta-Labeling ML strategy using two-stage Angel/Devil architecture.
 
@@ -58,7 +63,7 @@ class MLStrategy(Strategy):
     devil_threshold : float
         Probability threshold for Devil to approve a trade (default: 0.50).
     warmup_period : int
-        Minimum candles required before trading (default: 60).
+        Minimum candles required before trading (default: 260).
     """
 
     def __init__(
@@ -70,8 +75,9 @@ class MLStrategy(Strategy):
         warmup_period: int = 260,  # V3.3: expanded for 5m HTF SMA-50 warm-up
         angel_trainer=None,
         devil_trainer=None,
+        **kwargs,
     ):
-        super().__init__()
+        super().__init__(**kwargs)
 
         self.timeframe = 1  # 1-minute bars
         self.warmup = warmup_period
@@ -96,26 +102,34 @@ class MLStrategy(Strategy):
 
         # Load models and track modification times
         logger.info(f"Loading Angel model from {angel_file}")
-        self.angel_trainer = angel_trainer if angel_trainer is not None else V3RandomForestTrainer()
+        self.angel_trainer = (
+            angel_trainer if angel_trainer is not None else V3RandomForestTrainer()
+        )
         self.angel_trainer.load(str(angel_file))
-        if hasattr(self.angel_trainer, "model") and hasattr(self.angel_trainer.model, "n_jobs"):
-            self.angel_trainer.model.n_jobs = 1  # Prevent joblib IPC overhead on single-row inference
+        if hasattr(self.angel_trainer, "model") and hasattr(
+            self.angel_trainer.model, "n_jobs"
+        ):
+            self.angel_trainer.model.n_jobs = (
+                1  # Prevent joblib IPC overhead on single-row inference
+            )
 
         self.angel_mtime = os.path.getmtime(angel_file)
-        logger.info(
-            f"Angel model loaded via trainer (mtime: {self.angel_mtime})"
-        )
+        logger.info(f"Angel model loaded via trainer (mtime: {self.angel_mtime})")
 
         logger.info(f"Loading Devil model from {devil_file}")
-        self.devil_trainer = devil_trainer if devil_trainer is not None else V3RandomForestTrainer()
+        self.devil_trainer = (
+            devil_trainer if devil_trainer is not None else V3RandomForestTrainer()
+        )
         self.devil_trainer.load(str(devil_file))
-        if hasattr(self.devil_trainer, "model") and hasattr(self.devil_trainer.model, "n_jobs"):
-            self.devil_trainer.model.n_jobs = 1  # Prevent joblib IPC overhead on single-row inference
+        if hasattr(self.devil_trainer, "model") and hasattr(
+            self.devil_trainer.model, "n_jobs"
+        ):
+            self.devil_trainer.model.n_jobs = (
+                1  # Prevent joblib IPC overhead on single-row inference
+            )
 
         self.devil_mtime = os.path.getmtime(devil_file)
-        logger.info(
-            f"Devil model loaded via trainer (mtime: {self.devil_mtime})"
-        )
+        logger.info(f"Devil model loaded via trainer (mtime: {self.devil_mtime})")
 
         # Initialize notification manager for hot-reload alerts
         self.notification_manager = NotificationManager()
@@ -149,13 +163,6 @@ class MLStrategy(Strategy):
             "bar_upper_wick_pct",
             "bar_lower_wick_pct",
         ]
-
-        self.order_params = OrderParams(
-            risk_percentage=0.02,
-            tp_multiplier=1.005,  # 0.5% take profit
-            sl_multiplier=0.998,  # 0.2% stop loss
-            use_trailing_stop=False,
-        )
 
         # Override devil_threshold with the value persisted by the retrainer
         # (models/threshold.json).  Must be called AFTER self.devil_threshold is
@@ -230,7 +237,9 @@ class MLStrategy(Strategy):
                     )
                     try:
                         self.angel_trainer.load(str(self.angel_path))
-                        if hasattr(self.angel_trainer, "model") and hasattr(self.angel_trainer.model, "n_jobs"):
+                        if hasattr(self.angel_trainer, "model") and hasattr(
+                            self.angel_trainer.model, "n_jobs"
+                        ):
                             self.angel_trainer.model.n_jobs = 1
                         self.angel_mtime = current_angel_mtime
                         logger.info(f"[HOT-RELOAD] Angel model updated successfully")
@@ -247,7 +256,9 @@ class MLStrategy(Strategy):
                     )
                     try:
                         self.devil_trainer.load(str(self.devil_path))
-                        if hasattr(self.devil_trainer, "model") and hasattr(self.devil_trainer.model, "n_jobs"):
+                        if hasattr(self.devil_trainer, "model") and hasattr(
+                            self.devil_trainer.model, "n_jobs"
+                        ):
                             self.devil_trainer.model.n_jobs = 1
                         self.devil_mtime = current_devil_mtime
                         logger.info(f"[HOT-RELOAD] Devil model updated successfully")
@@ -281,107 +292,119 @@ class MLStrategy(Strategy):
 
         return reloaded
 
-    def analyze(self, data: Dict[str, pl.DataFrame]) -> Tuple[List[Signal], float]:
+    def generate_signals(self, df: pl.DataFrame) -> Optional[Signal]:
         """
-        Analyze market data using two-stage Meta-Labeling.
+        Analyze single-symbol market data using two-stage Meta-Labeling.
 
         Stage 1: Angel proposes trades (high recall, low threshold).
         Stage 2: Devil filters false positives (high precision).
 
         Args:
-            data: Dict mapping symbol -> Polars DataFrame with OHLCV data.
+            df: Polars DataFrame with OHLCV data for a single symbol.
+                Must contain a 'symbol' column (added by callers) so the
+                strategy can tag emitted signals with their instrument.
 
         Returns:
-            Tuple of (List of BUY signals where both Angel & Devil agree, highest Angel probability).
+            base.Signal on joint Angel & Devil approval, or None.
         """
         # Check for model updates at the start of each bar processing cycle
         self._check_model_updates()
 
-        signals = []
-        highest_angel_prob = 0.0
+        self.validate_input(df)
 
-        for symbol, df in data.items():
-            if len(df) < self.warmup_period:
+        if len(df) < self.warmup_period:
+            logger.debug(f"Insufficient data ({len(df)} < {self.warmup_period})")
+            return None
+
+        try:
+            # Generate features using imported FeatureEngineer
+            features_df = self._generate_features(df)
+
+            if features_df is None or len(features_df) == 0:
+                return None
+
+            # Get latest bar's features for prediction
+            latest_features_df = features_df[self.feature_names].tail(1)
+            latest_features = latest_features_df.to_numpy()
+
+            # Get current price for signal
+            current_price = float(df["close"].tail(1)[0])
+
+            # Resolve symbol — callers add this as a literal column before
+            # invoking generate_signals (Option A design).
+            symbol = str(df["symbol"].tail(1)[0]) if "symbol" in df.columns else None
+
+            # ═══════════════════════════════════════════════════════════
+            # STAGE 1: THE ANGEL (DIRECTION)
+            # ═══════════════════════════════════════════════════════════
+            angel_prob = self.angel_trainer.predict_proba(latest_features)[0, 1]
+
+            if angel_prob < self.angel_threshold:
                 logger.debug(
-                    f"{symbol}: Insufficient data ({len(df)} < {self.warmup_period})"
+                    f"[{symbol}] Angel rejected | Prob: {angel_prob:.4f} < {self.angel_threshold}"
                 )
-                continue
+                return None
 
-            try:
-                # Generate features using imported FeatureEngineer
-                features_df = self._generate_features(df)
+            logger.debug(f"[{symbol}] Angel proposed trade | Prob: {angel_prob:.4f}")
 
-                if features_df is None or len(features_df) == 0:
-                    continue
+            # ═══════════════════════════════════════════════════════════
+            # STAGE 2: THE DEVIL (CONVICTION)
+            # ═══════════════════════════════════════════════════════════
+            # Build meta-feature set: original features + Angel's probability
+            meta_features = pd.DataFrame(
+                latest_features_df.to_numpy(), columns=self.feature_names
+            )
+            meta_features["angel_prob"] = angel_prob
 
-                # Get latest bar's features for prediction
-                latest_features_df = features_df[self.feature_names].tail(1)
-                latest_features = latest_features_df.to_numpy()
+            devil_prob = self.devil_trainer.predict_proba(meta_features)[0, 1]
 
-                # Get current price for signal
-                current_price = float(df["close"].tail(1)[0])
-
-                # ═══════════════════════════════════════════════════════════
-                # STAGE 1: THE ANGEL (DIRECTION)
-                # ═══════════════════════════════════════════════════════════
-                angel_prob = self.angel_trainer.predict_proba(latest_features)[0, 1]
-                highest_angel_prob = max(highest_angel_prob, angel_prob)
-
-                if angel_prob < self.angel_threshold:
-                    logger.debug(
-                        f"[{symbol}] Angel rejected | Prob: {angel_prob:.4f} < {self.angel_threshold}"
-                    )
-                    continue
-
+            if devil_prob < self.devil_threshold:
                 logger.debug(
-                    f"[{symbol}] Angel proposed trade | Prob: {angel_prob:.4f}"
+                    f"[{symbol}] Devil veto | Angel: {angel_prob:.2f}, Devil: {devil_prob:.2f} < {self.devil_threshold}"
                 )
+                return None
 
-                # ═══════════════════════════════════════════════════════════
-                # STAGE 2: THE DEVIL (CONVICTION)
-                # ═══════════════════════════════════════════════════════════
-                # Build meta-feature set: original features + Angel's probability
-                import pandas as pd
+            # Both Angel and Devil agree — compute ATR-based brackets
+            natr_value = float(latest_features_df["natr_14"].to_numpy()[0])
+            # TA-Lib NATR is a percentage; convert to absolute ATR
+            atr_abs = (natr_value / 100.0) * current_price
 
-                meta_features = pd.DataFrame(
-                    latest_features_df.to_numpy(), columns=self.feature_names
+            sl_distance = SL_ATR_MULTIPLIER * atr_abs
+            tp_distance = TP_ATR_MULTIPLIER * atr_abs
+
+            # Apply HF7 SL floor
+            min_sl_distance = current_price * MIN_SL_PCT
+            if sl_distance < min_sl_distance:
+                logger.debug(
+                    f"[{symbol}] SL floor applied | raw={sl_distance:.4f} < min={min_sl_distance:.4f}"
                 )
-                meta_features["angel_prob"] = angel_prob
+                sl_distance = min_sl_distance
 
-                devil_prob = self.devil_trainer.predict_proba(meta_features)[0, 1]
+            logger.info(
+                f"[{symbol}] ANGEL & DEVIL AGREEMENT | "
+                f"Price={current_price:.2f} | "
+                f"Angel Prob: {angel_prob:.2f} | "
+                f"Devil Prob: {devil_prob:.2f} | "
+                f"ATR={atr_abs:.4f} | SL={sl_distance:.4f} | TP={tp_distance:.4f}"
+            )
 
-                if devil_prob < self.devil_threshold:
-                    logger.debug(
-                        f"[{symbol}] Devil veto | Angel: {angel_prob:.2f}, Devil: {devil_prob:.2f} < {self.devil_threshold}"
-                    )
-                    continue
+            return Signal(
+                direction="long",
+                entry_price=current_price,
+                raw_sl_distance=sl_distance,
+                raw_tp_distance=tp_distance,
+                metadata={
+                    "symbol": symbol,
+                    "angel_prob": float(angel_prob),
+                    "devil_prob": float(devil_prob),
+                    "atr_abs": atr_abs,
+                    "timestamp": df["timestamp"].tail(1)[0],
+                },
+            )
 
-                # Both Angel and Devil agree - emit BUY signal
-                logger.info(
-                    f"[{symbol}] ANGEL & DEVIL AGREEMENT | "
-                    f"Price={current_price:.2f} | "
-                    f"Angel Prob: {angel_prob:.2f} | "
-                    f"Devil Prob: {devil_prob:.2f}"
-                )
-
-                signal = Signal(
-                    symbol=symbol,
-                    type=SignalType.BUY,
-                    price=current_price,
-                    confidence=devil_prob,
-                    timestamp=df["timestamp"].tail(1)[0],
-                    metadata={
-                        "angel_prob": float(angel_prob),
-                        "devil_prob": float(devil_prob),
-                    },
-                )
-                signals.append(signal)
-
-            except Exception as e:
-                logger.error(f"[{symbol}] Error in ML analysis: {e}", exc_info=True)
-                continue
-
-        return signals, highest_angel_prob
+        except Exception as e:
+            logger.error(f"[{symbol}] Error in ML analysis: {e}", exc_info=True)
+            return None
 
     def _generate_features(self, df: pl.DataFrame) -> Optional[pl.DataFrame]:
         """
@@ -409,7 +432,3 @@ class MLStrategy(Strategy):
         except Exception as e:
             logger.error(f"Feature generation failed: {e}")
             return None
-
-    def get_order_params(self) -> OrderParams:
-        """Returns order parameters for this strategy."""
-        return self.order_params
