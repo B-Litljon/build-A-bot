@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import signal
+from collections import defaultdict
 from datetime import datetime, timezone
 from typing import List, Dict, Optional
 
@@ -44,6 +45,7 @@ class FactoryOrchestrator:
         }
         self.active_positions = {}  # symbol -> {sl, tp, qty}
         self._shutdown_event = asyncio.Event()
+        self._locks: defaultdict = defaultdict(asyncio.Lock)
 
     async def run(self):
         """Main lifecycle entry point."""
@@ -107,43 +109,55 @@ class FactoryOrchestrator:
 
     async def _execute_buy(self, signal, symbol):
         """Calculates risk, submits order, and enters watchdog state."""
-        # Get account for sizing
+        entry = signal.entry_price
+
+        # Path Alpha: delegate multipliers and A3 chop filter to RiskManager
+        bracket = self.risk_manager.calculate_bracket(entry, signal.raw_sl_distance)
+        if bracket is None:
+            logger.info(f"[{symbol}] Volatility too low, skipping trade")
+            return
+
+        sl_dist, tp_dist = bracket
+        sl_price = entry - sl_dist
+        tp_price = entry + tp_dist
+
         account = await asyncio.to_thread(self.trading_client.get_account)
         equity = float(account.equity)
         buying_power = float(account.buying_power)
-
-        # Signal now carries bracket distances directly — no ATR fallback needed
-        entry = signal.entry_price
-        sl_distance = signal.raw_sl_distance
-        tp_distance = signal.raw_tp_distance
-        sl_price = entry - sl_distance
-        tp_price = entry + tp_distance
+        cash = float(account.cash)
+        is_crypto = "/" in symbol
 
         qty = self.risk_manager.calculate_quantity(
-            equity, buying_power, entry, sl_price
+            equity, buying_power, entry, sl_price, cash=cash, is_crypto=is_crypto
         )
 
-        if qty <= 0:
+        if qty == 0.0:
+            logger.info(f"[{symbol}] Trade size below $50 min notional, skipping")
             return
 
-        logger.info(
-            f"Executing BUY for {symbol} | Qty: {qty} | SL: {sl_price} | TP: {tp_price}"
-        )
+        async with self._locks[symbol]:
+            # Re-check inside lock: another coroutine may have entered while sizing
+            if symbol in self.active_positions:
+                return
 
-        req = MarketOrderRequest(
-            symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC
-        )
+            logger.info(
+                f"Executing BUY for {symbol} | Qty: {qty} | SL: {sl_price} | TP: {tp_price}"
+            )
 
-        try:
-            order = await asyncio.to_thread(self.trading_client.submit_order, req)
-            self.active_positions[symbol] = {
-                "sl": sl_price,
-                "tp": tp_price,
-                "qty": qty,
-                "order_id": order.id,
-            }
-        except Exception as e:
-            logger.error(f"Entry failed for {symbol}: {e}")
+            req = MarketOrderRequest(
+                symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC
+            )
+
+            try:
+                order = await asyncio.to_thread(self.trading_client.submit_order, req)
+                self.active_positions[symbol] = {
+                    "sl": sl_price,
+                    "tp": tp_price,
+                    "qty": qty,
+                    "order_id": order.id,
+                }
+            except Exception as e:
+                logger.error(f"Entry failed for {symbol}: {e}")
 
     async def _watchdog_loop(self):
         """Polls active symbols and enforces SL/TP targets."""
@@ -168,9 +182,10 @@ class FactoryOrchestrator:
         req = MarketOrderRequest(
             symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC
         )
-        try:
-            await asyncio.to_thread(self.trading_client.submit_order, req)
-            del self.active_positions[symbol]
-            logger.info(f"Position closed for {symbol}")
-        except Exception as e:
-            logger.error(f"Exit failed for {symbol}: {e}")
+        async with self._locks[symbol]:
+            try:
+                await asyncio.to_thread(self.trading_client.submit_order, req)
+                del self.active_positions[symbol]
+                logger.info(f"Position closed for {symbol}")
+            except Exception as e:
+                logger.error(f"Exit failed for {symbol}: {e}")

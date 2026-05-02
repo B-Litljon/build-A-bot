@@ -20,12 +20,15 @@ Usage:
 import json
 import logging
 import os
+import warnings
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import polars as pl
 import pandas as pd
+
+warnings.filterwarnings("ignore", message=".*join_asof.*")
 
 from strategies.base import BaseStrategy, Signal
 from core.notification_manager import NotificationManager
@@ -36,13 +39,6 @@ from ml.features.v3_features import V3BaseFeatures, V3HTFFeatures
 from ml.trainers.v3_rf_trainer import V3RandomForestTrainer
 
 logger = logging.getLogger(__name__)
-
-# Bracket computation constants (sourced from V3.4 production values in
-# src/execution/live_orchestrator.py — copied by value to avoid depending
-# on the broken file).
-SL_ATR_MULTIPLIER = 0.5  # SL distance = SL_ATR_MULTIPLIER * atr_abs
-TP_ATR_MULTIPLIER = 3.0  # TP distance = TP_ATR_MULTIPLIER * atr_abs
-MIN_SL_PCT = 0.0015  # Floor: SL distance / entry_price >= 0.15% (HF7 hotfix)
 
 
 class MLStrategy(BaseStrategy):
@@ -364,35 +360,25 @@ class MLStrategy(BaseStrategy):
                 )
                 return None
 
-            # Both Angel and Devil agree — compute ATR-based brackets
+            # Both Angel and Devil agree — emit raw ATR volatility.
+            # RiskManager applies multipliers and floor checks (Path Alpha).
             natr_value = float(latest_features_df["natr_14"].to_numpy()[0])
             # TA-Lib NATR is a percentage; convert to absolute ATR
             atr_abs = (natr_value / 100.0) * current_price
-
-            sl_distance = SL_ATR_MULTIPLIER * atr_abs
-            tp_distance = TP_ATR_MULTIPLIER * atr_abs
-
-            # Apply HF7 SL floor
-            min_sl_distance = current_price * MIN_SL_PCT
-            if sl_distance < min_sl_distance:
-                logger.debug(
-                    f"[{symbol}] SL floor applied | raw={sl_distance:.4f} < min={min_sl_distance:.4f}"
-                )
-                sl_distance = min_sl_distance
 
             logger.info(
                 f"[{symbol}] ANGEL & DEVIL AGREEMENT | "
                 f"Price={current_price:.2f} | "
                 f"Angel Prob: {angel_prob:.2f} | "
                 f"Devil Prob: {devil_prob:.2f} | "
-                f"ATR={atr_abs:.4f} | SL={sl_distance:.4f} | TP={tp_distance:.4f}"
+                f"raw_ATR={atr_abs:.4f}"
             )
 
             return Signal(
                 direction="long",
                 entry_price=current_price,
-                raw_sl_distance=sl_distance,
-                raw_tp_distance=tp_distance,
+                raw_sl_distance=atr_abs,
+                raw_tp_distance=atr_abs,
                 metadata={
                     "symbol": symbol,
                     "angel_prob": float(angel_prob),

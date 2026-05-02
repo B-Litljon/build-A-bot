@@ -1,11 +1,16 @@
 """
-src/execution — Live forward-trading orchestration layer.
+src/execution — Factory trading orchestration layer.
 
 Exports:
-    LiveOrchestrator  — async daemon that bridges Alpaca WebSocket data
-                        to the synchronous Angel/Devil ML inference engine.
+    FactoryOrchestrator  — async trade lifecycle manager (factory path)
+    RiskManager          — bracket sizing, position sizing, A3 chop filter
+
+Note: LiveOrchestrator (legacy monolith) is intentionally excluded.
+      It lives in live_orchestrator.py and is quarantined until Tier 3
+      decoupling is complete.
 """
 
-#from execution.live_orchestrator import LiveOrchestrator
-from .live_orchestrator import LiveOrchestrator
-__all__ = ["LiveOrchestrator"]
+from .factory_orchestrator import FactoryOrchestrator
+from .risk_manager import RiskManager
+
+__all__ = ["FactoryOrchestrator", "RiskManager"]

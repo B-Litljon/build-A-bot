@@ -1,6 +1,6 @@
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -19,26 +19,37 @@ class RiskManager:
     def __init__(self, profile: RiskProfile = RiskProfile()):
         self.profile = profile
 
-    def calculate_bracket(self, entry_price: float, atr: float) -> tuple[float, float]:
+    def calculate_bracket(self, entry_price: float, raw_atr: float) -> Optional[Tuple[float, float]]:
         """
-        Calculates SL and TP with an absolute floor for SL distance.
+        Applies multipliers and A3 chop filter to raw ATR volatility.
+
+        Returns (sl_distance, tp_distance) or None if A3 filter rejects the trade
+        (volatility too low — 0.5x ATR stop would sit below the 0.15% floor).
         """
-        # Dynamic 0.5x ATR sizing (multiplier from profile)
-        raw_sl_dist = atr * self.profile.sl_atr_multiplier
+        sl_dist = raw_atr * self.profile.sl_atr_multiplier
+        tp_dist = raw_atr * self.profile.tp_atr_multiplier
 
-        # 0.15% absolute Stop Loss floor
-        min_sl_dist = entry_price * self.profile.min_sl_pct
+        # A3 chop filter: if the stop floor would override the ATR stop, skip entirely
+        if sl_dist < (entry_price * self.profile.min_sl_pct):
+            return None
 
-        actual_sl_dist = max(raw_sl_dist, min_sl_dist)
+        return round(sl_dist, 4), round(tp_dist, 4)
 
-        sl_price = round(entry_price - actual_sl_dist, 4)
-        tp_price = round(entry_price + (atr * self.profile.tp_atr_multiplier), 4)
-
-        return sl_price, tp_price
-
-    def calculate_quantity(self, equity: float, buying_power: float, entry_price: float, sl_price: float) -> float:
+    def calculate_quantity(
+        self,
+        equity: float,
+        buying_power: float,
+        entry_price: float,
+        sl_price: float,
+        cash: float = 0.0,
+        is_crypto: bool = False,
+    ) -> float:
         """
         Calculates fractional position size based on risk-per-trade.
+
+        For crypto, uses cash * 0.95 as the buying-power cap (Alpaca reports
+        crypto available funds in the cash field, not buying_power).
+        Returns 0.0 if the resulting notional is below the $50 zombie-trade floor.
         """
         risk_dollars = equity * self.profile.risk_per_trade
         risk_per_share = entry_price - sl_price
@@ -48,7 +59,8 @@ class RiskManager:
 
         risk_qty = risk_dollars / risk_per_share
         notional_qty = self.profile.max_notional_cap / entry_price
-        bp_qty = (buying_power * 0.95) / entry_price
+        bp_source = cash if is_crypto else buying_power
+        bp_qty = (bp_source * 0.95) / entry_price
 
         final_qty = min(risk_qty, notional_qty, bp_qty)
 
@@ -56,5 +68,9 @@ class RiskManager:
             logger.warning(
                 f"Quantity scaled down from {risk_qty:.4f} to {final_qty:.4f} to meet notional/bp limits."
             )
+
+        # $50 minimum notional — prevents zombie fractional-share trades
+        if final_qty * entry_price < 50.0:
+            return 0.0
 
         return max(round(final_qty, 4), 0.0001)

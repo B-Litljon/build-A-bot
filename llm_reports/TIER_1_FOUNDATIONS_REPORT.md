@@ -588,3 +588,96 @@ ml_factory_strategy.py: syntax OK
 ### Final commit hash
 
 See `git log` (cannot self-reference).
+
+---
+
+## Act 3 — Blocker Resolution, Path Alpha Final Commit
+
+**Date:** 2026-05-02
+**Time:** 15:26:47 PDT
+**Agent:** Claude Sonnet 4.6
+**Trigger:** Act 3 — Sever eager imports, verify Path Alpha, and commit
+**Prior HEAD:** `323bf09` (feat(sdk): Act 2 — migrate MLStrategy to BaseStrategy, fix ATR fallback)
+
+### Files Modified
+
+| File | Change |
+|------|--------|
+| `src/execution/__init__.py` | Severed eager `LiveOrchestrator` import; now exports `FactoryOrchestrator` and `RiskManager` |
+| `src/execution/factory_orchestrator.py` | Path Alpha delegation, per-symbol asyncio.Lock, crypto cash field, A3 None guard |
+| `src/execution/risk_manager.py` | A3 chop filter (returns None), crypto buying-power fix, $50 min notional |
+| `src/strategies/concrete_strategies/ml_strategy.py` | Removed bracket constants; emits raw ATR; Polars warning suppressed |
+
+### Pre-flight Results
+
+```
+git status --short:
+ M src/execution/factory_orchestrator.py
+ M src/execution/risk_manager.py
+ M src/strategies/concrete_strategies/ml_strategy.py
+
+git rev-parse --abbrev-ref HEAD: main
+git log -1 --oneline: 323bf09 feat(sdk): Act 2 — migrate MLStrategy to BaseStrategy, fix ATR fallback
+```
+
+All 3 expected modified files confirmed. HEAD matches. Tree not clean — proceeding.
+
+### Task 1 — Eager Import Severed
+
+`src/execution/__init__.py` before:
+```python
+from .live_orchestrator import LiveOrchestrator
+__all__ = ["LiveOrchestrator"]
+```
+
+After:
+```python
+from .factory_orchestrator import FactoryOrchestrator
+from .risk_manager import RiskManager
+__all__ = ["FactoryOrchestrator", "RiskManager"]
+```
+
+`LiveOrchestrator` is no longer reachable via `from execution import ...`. `live_orchestrator.py` remains on disk, quarantined.
+
+### Task 2 — Sanity Check Results
+
+**A3 floor logic** — `self.profile.min_sl_pct = 0.0015` confirmed at `risk_manager.py:11`. A3 filter at line 33:
+```python
+if sl_dist < (entry_price * self.profile.min_sl_pct):
+    return None
+```
+Status: PRESENT ✓
+
+**Crypto cash logic** — diff confirms:
+```python
+bp_source = cash if is_crypto else buying_power
+bp_qty = (bp_source * 0.95) / entry_price
+```
+Status: PRESENT ✓
+
+**asyncio.Lock logic** — `defaultdict(asyncio.Lock)` in `__init__`; `async with self._locks[symbol]` wrapping both entry and exit order submission.
+Status: PRESENT ✓
+
+### Task 3 — Verification Results (verbatim)
+
+```
+$ python -c "import ast; ast.parse(open('src/execution/__init__.py').read())" && echo "Init Syntax: OK"
+Init Syntax: OK
+
+$ python -c "import sys; sys.path.append('src'); from execution import FactoryOrchestrator, RiskManager; print('Factory Imports: OK')"
+Factory Imports: OK
+```
+
+### Smoke Test Gate Status
+
+Previously blocked by: `ModuleNotFoundError: No module named 'polars'` triggered by eager `LiveOrchestrator` import in `__init__.py`.
+
+After this act: factory path import succeeds cleanly. `polars` is still required to run `MLStrategy` inference — Captain B must run `pipenv install polars` (or `pipenv sync`) before executing a live smoke test.
+
+### Architectural Invariants Carried Forward
+
+- `Signal.raw_sl_distance` and `raw_tp_distance` carry **raw ATR** — `RiskManager` owns all multipliers
+- Crypto symbols contain `"/"` — used to switch buying-power source to `account.cash`
+- `RiskManager.calculate_bracket()` returning `None` = skip trade (A3 chop / low volatility)
+- `$50` minimum notional — `calculate_quantity()` returns `0.0` below this threshold
+- Per-symbol `asyncio.Lock` must wrap both entry and exit order submission
