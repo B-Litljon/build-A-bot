@@ -4,7 +4,6 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
-polars = "*"
 numpy = "<2.0"
 typer = "*"
 matplotlib = "*"
@@ -20,6 +19,7 @@ polygon-api-client = "*"
 yfinance = "*"
 pyarrow = "*"
 rich = "*"
+polars = "*"
 
 [dev-packages]
 
