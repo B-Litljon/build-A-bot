@@ -681,3 +681,62 @@ After this act: factory path import succeeds cleanly. `polars` is still required
 - `RiskManager.calculate_bracket()` returning `None` = skip trade (A3 chop / low volatility)
 - `$50` minimum notional — `calculate_quantity()` returns `0.0` below this threshold
 - Per-symbol `asyncio.Lock` must wrap both entry and exit order submission
+
+---
+
+## Act 3 Validation Smoke Test
+
+**Date:** 2026-05-02
+**Time:** 17:07:30 PDT
+**Agent:** Claude Sonnet 4.6
+**Trigger:** Act 3 Validation Smoke Test — dry-run proof that A3 Chop Filter and $50 Crypto Notional Floor are active. No orders submitted.
+
+### Verification Results (verbatim)
+
+```
+2026-05-02 17:07:23  INFO  Loading Angel model from models/angel_latest.pkl
+2026-05-02 17:07:23  INFO  Angel model loaded via trainer (mtime: 1773647226.1470108)
+2026-05-02 17:07:23  INFO  Loading Devil model from models/devil_latest.pkl
+2026-05-02 17:07:23  INFO  Devil model loaded via trainer (mtime: 1773647226.1540687)
+2026-05-02 17:07:23  INFO  _load_threshold: loaded production threshold=0.5200
+
+============================================================
+  Act 3 Validation Smoke Test Runner
+============================================================
+
+--- Instantiation ---
+  FactoryOrchestrator, RiskManager, MLStrategy: instantiated OK
+  RiskProfile → sl_mult=0.5, tp_mult=3.0, min_sl_pct=0.0015, max_notional=$100,000
+
+--- Test 1: A3 Chop Filter ---
+  Scenario: entry=2000.0, raw_atr=0.5
+    sl_dist = 0.5 * 0.5 = 0.25
+    floor   = 2000.0 * 0.0015 = 3.00
+    0.25 < 3.00 → expect None (trade skipped)
+  [PASS] calculate_bracket returns None (A3 chop filter fires)
+
+  Sanity: entry=2000.0, raw_atr=10.0
+    sl_dist = 0.5 * 10.0 = 5.0
+    floor   = 2000.0 * 0.0015 = 3.0
+    5.0 > 3.0 → expect (sl_dist, tp_dist) tuple
+  [PASS] calculate_bracket returns (sl, tp) tuple for healthy ATR
+         got: sl_dist=5.0, tp_dist=30.0
+
+--- Test 2: $50 Crypto Notional Floor ---
+  Tighter scenario: equity=$30, cash=$30
+    risk_qty  = (30*0.02)/10 = 0.06
+    bp_qty    = (30*0.95)/2000 = 0.01425
+    notional  = 0.01425 * 2000 = $28.50 < $50 → expect 0.0
+  [PASS] calculate_quantity returns 0.0 (notional $28.50 < $50 floor)
+
+  Sanity: equity=$10,000, cash=$10,000
+  [PASS] calculate_quantity returns > 0.0 for healthy account
+         got: qty=4.75 (notional=$9,500.00)
+
+============================================================
+  SMOKE TEST PASS: Act 3 Defenses Verified.
+============================================================
+```
+
+### Runner Script
+`scripts/smoke_test_runner.py` — deleted after successful run (scope: local verification only, never committed).
