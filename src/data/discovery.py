@@ -2,9 +2,10 @@ import logging
 from typing import List
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import GetAssetsRequest
-from alpaca.trading.enums import AssetClass, AssetStatus
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockSnapshotRequest
+
+from data.enums import AssetClass, AssetStatus
 
 logger = logging.getLogger(__name__)
 

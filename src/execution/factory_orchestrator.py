@@ -8,9 +8,9 @@ from typing import List, Dict, Optional
 import polars as pl
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
 
 from data.feed import MarketDataFeed
+from execution.enums import OrderSide, TimeInForce
 from execution.risk_manager import RiskManager
 from strategies.concrete_strategies.ml_strategy import MLStrategy
 from utils.bar_aggregator import LiveBarAggregator

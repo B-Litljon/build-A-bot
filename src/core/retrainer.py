@@ -41,14 +41,30 @@ import numpy as np
 import polars as pl
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
-from alpaca.data.enums import DataFeed
+from alpaca.data.timeframe import (
+    TimeFrame as _AlpacaTimeFrame,
+    TimeFrameUnit as _AlpacaTimeFrameUnit,
+)
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import brier_score_loss
 from sklearn.model_selection import cross_val_predict, TimeSeriesSplit
 
+from src.data.timeframe import TimeFrame, TimeFrameUnit
+from src.data.enums import DataFeed
 from src.ml.feature_pipeline import FeatureEngineer
 from src.core.notification_manager import NotificationManager
+
+_ALPACA_TFU = {
+    TimeFrameUnit.MINUTE: _AlpacaTimeFrameUnit.Minute,
+    TimeFrameUnit.HOUR: _AlpacaTimeFrameUnit.Hour,
+    TimeFrameUnit.DAY: _AlpacaTimeFrameUnit.Day,
+    TimeFrameUnit.WEEK: _AlpacaTimeFrameUnit.Week,
+    TimeFrameUnit.MONTH: _AlpacaTimeFrameUnit.Month,
+}
+
+
+def _to_alpaca_timeframe(tf: TimeFrame) -> _AlpacaTimeFrame:
+    return _AlpacaTimeFrame(tf.amount, _ALPACA_TFU[tf.unit])
 
 logging.basicConfig(
     level=logging.INFO,
@@ -62,7 +78,7 @@ logger = logging.getLogger(__name__)
 
 DAYS_BACK = 60
 TICKERS: List[str] = ["TSLA", "NVDA", "MARA", "COIN", "SMCI"]
-TIMEFRAME = TimeFrame(1, TimeFrameUnit.Minute)
+TIMEFRAME = TimeFrame(1, TimeFrameUnit.MINUTE)
 DATA_FEED = DataFeed.IEX
 
 # Model Paths
@@ -227,7 +243,7 @@ def fetch_training_data(
         try:
             request = StockBarsRequest(
                 symbol_or_symbols=ticker,
-                timeframe=TIMEFRAME,
+                timeframe=_to_alpaca_timeframe(TIMEFRAME),
                 start=start_date,
                 end=end_date,
                 feed=DATA_FEED,
