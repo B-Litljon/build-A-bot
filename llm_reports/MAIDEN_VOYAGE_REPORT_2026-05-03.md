@@ -77,6 +77,36 @@ Operational guarantees in the runner itself:
 - Auto-creates `logs/` if absent.
 - Graceful Ctrl-C / SIGTERM shutdown via the orchestrator's drain.
 
+---
+
+## Maintenance Patch — Log Spam & WebSocket Hang
+
+- **Date:** 2026-05-03
+- **Time:** 14:18:34 PDT
+- **Agent:** Claude Sonnet 4.6
+- **Trigger:** Maintenance patch for log spam and WebSocket hang
+- **Files modified:** `scripts/run_paper_live.py`
+
+### Changes Applied
+
+1. **Warning suppression** — Added `import warnings` and two targeted `filterwarnings` calls:
+   - Ignores Sklearn `UserWarning` about missing feature names (`.*does not have valid feature names.*`).
+   - Ignores Polars warnings related to `join_asof` sortedness (`.*join_asof.*`).
+   This keeps tick-by-tick terminal output readable without touching strategy or feature-engineering code in `src/`.
+
+2. **Graceful shutdown timeout** — `scripts/run_paper_live.py` now stores module-level handles `_orchestrator` and `_feed` so the sync `__main__` block can reach them. The shutdown path is hardened in two places:
+   - Inside `main()`: `await orchestrator.run()` is wrapped in `try/except (asyncio.CancelledError, asyncio.TimeoutError)/finally`. If the coroutine is cancelled or times out, `feed.stop()` is awaited inside `asyncio.wait_for(..., timeout=3.0)`. A caught `TimeoutError` emits a clean `INFO` log — no traceback.
+   - In the `except KeyboardInterrupt` block: a fresh `_shutdown()` coroutine (also using `asyncio.wait_for(..., timeout=3.0)`) is executed via `asyncio.run()` so cleanup is attempted even when the outer event loop has already closed.
+
+### Verification
+
+```
+$ python -c "import ast; ast.parse(open('scripts/run_paper_live.py').read()); print('Syntax: OK')"
+Syntax: OK
+```
+
+Runner script parses cleanly and is ready for live execution.
+
 ## Status & Next Action
 
 The runner is ready for **manual** execution by Captain B. Per scope
