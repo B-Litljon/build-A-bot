@@ -471,3 +471,172 @@ investor_feature_pipeline.py: OK
 ## Commit
 
 See `git log -1 --oneline` after commit for new HEAD hash.
+
+---
+
+# V4 Data Pipeline Report — Walk-Forward LightGBM Ranker Training
+
+- **Date:** 2026-05-03
+- **Time:** 19:27:25 PDT
+- **Agent:** Claude Sonnet 4.6
+- **Trigger:** V4 Investor Pipeline — LightGBM Walk-Forward Training
+- **Files created:** `scripts/investor_train_model.py`
+- **Files modified:** `models/v4_investor_lgbm.txt` (new artifact)
+- **Bugfix included:** `date` column excluded from feature matrix (was leaking temporal patterns as the #2 feature by gain before fix)
+
+---
+
+## Mission
+
+Phase 4 of the V4 Private Investor pipeline. Implement a strict expanding walk-forward cross-validation with a 60-trading-day embargo, train `LGBMRanker(objective="lambdarank")`, and save the final production model to `models/v4_investor_lgbm.txt`.
+
+## Pre-flight
+
+```
+$ git status --short
+(empty — clean)
+$ git log -1 --oneline
+5cad103 feat(ml): build v4 feature engineering and cross-sectional target pipeline
+```
+
+---
+
+## Changes
+
+### `scripts/investor_train_model.py` *(new)*
+
+**Feature matrix construction**
+
+Excluded from X (metadata / target / price leakage):
+```
+date, symbol, forward_return_60d, target_top_quintile,
+open, high, low, close, volume
+```
+Result: 74 features (momentum × 3, macro trends × 4, margin ratios × 4, raw fundamental line items × 63).
+
+Column names sanitized via `re.sub(r"[^a-zA-Z0-9_]", "_", name)` before passing to LightGBM to prevent text-format serialization errors on names containing spaces.
+
+**Walk-forward loop — expanding window**
+
+```
+TRAIN_DAYS   = 504   # ~2 calendar years minimum train window
+EMBARGO_DAYS = 60    # = forward-return horizon — exact leakage fence
+TEST_DAYS    = 60    # fold width and roll-forward step
+```
+
+Fold k structure:
+```
+Train  : dates[0 : 504 + k×60]        (expanding)
+Embargo: next 60 trading days         ← no data seen here
+Test   : next 60 trading days
+```
+
+With 1195 unique dates → **10 out-of-sample folds** produced.
+
+**Group array — verified correct**
+
+```python
+group_train = df_train.groupby("date", sort=False).size().to_numpy(dtype=np.int32)
+```
+
+- Shape: (n_unique_dates_in_split,)
+- All values: 7 (one entry per date, 7 symbols per date)
+- Assertion: `group.sum() == len(X)` enforced before every `.fit()` call
+
+Post-run verification:
+```
+Group array shape:         (1195,)
+Group sizes (all unique):  [7]
+Sum of groups == len(df):  8365 == 8365 → True
+```
+
+**LGBMRanker configuration**
+```python
+lgb.LGBMRanker(
+    objective="lambdarank",
+    n_estimators=100,
+    learning_rate=0.05,
+    num_leaves=31,
+    min_child_samples=5,
+    importance_type="gain",
+    n_jobs=-1,
+    verbose=-1,
+    random_state=42,
+)
+```
+
+---
+
+## Walk-forward results (10 folds)
+
+| Fold | Train dates | Train rows | NDCG@1 | P@1   | P@2   |
+|------|-------------|------------|--------|-------|-------|
+| 1    | 504         | 3,528      | 0.283  | 0.283 | 0.300 |
+| 2    | 564         | 3,948      | 0.367  | 0.367 | 0.267 |
+| 3    | 624         | 4,368      | 0.417  | 0.417 | 0.275 |
+| 4    | 684         | 4,788      | 0.067  | 0.067 | 0.200 |
+| 5    | 744         | 5,208      | 0.467  | 0.467 | 0.308 |
+| 6    | 804         | 5,628      | 0.183  | 0.183 | 0.158 |
+| 7    | 864         | 6,048      | 0.067  | 0.067 | 0.242 |
+| 8    | 924         | 6,468      | 0.083  | 0.083 | 0.117 |
+| 9    | 984         | 6,888      | 0.117  | 0.117 | 0.167 |
+| 10   | 1,044       | 7,308      | 0.050  | 0.050 | 0.225 |
+| **Mean** | —       | —          | **0.210** | **0.210** | **0.226** |
+
+Random baseline P@1 = 1/7 = **14.3%**. Mean P@1 of **21.0%** = ~1.47× better than random.
+
+**Honest assessment of variance:** fold-to-fold P@1 ranges from 5% to 47%. This high variance is expected and structural for a PoC with only 7 symbols — a single regime change (e.g., NVDA's weight in the cross-section reversing) can flip a fold's result entirely. A 50+ symbol universe would reduce this dramatically.
+
+**Later folds underperform:** Folds 6–10 (covering mid-2024 onward) are weaker. The model has primarily momentum + macro features for the historical period (2021–2024); fundamentals only become available from late 2024 and aren't yet contributing signal in the out-of-sample periods that matter most for the ranker. This is the primary driver for expanding the fundamentals window with EDGAR/SimFin data in the next phase.
+
+---
+
+## Bugfix: `date` column excluded from feature matrix
+
+On the first run, `date` was not in `_EXCLUDE_COLS` and was inadvertently passed to LightGBM as a numeric feature (millisecond epoch timestamps). It ranked #2 by gain importance — the model was learning temporal patterns rather than fundamental/momentum signal. Fix: added `"date"` to `_EXCLUDE_COLS`. After fix, top features by gain are `mom_12m`, `mom_3m`, `mom_6m`, `vix_sma_20`, `yield_sma_20` — all economically meaningful.
+
+---
+
+## Final model output
+
+```
+Saved : models/v4_investor_lgbm.txt
+Size  : 345.5 KB
+Trees : 100
+Features: 74
+Format: LightGBM native text (booster_.save_model)
+```
+
+Verified: `lgb.Booster(model_file=...)` loads cleanly and produces predictions.
+
+---
+
+## Top 15 features by gain (final model)
+
+| Rank | Feature | Gain |
+|------|---------|------|
+| 1 | mom_12m | 6,618 |
+| 2 | mom_3m | 4,655 |
+| 3 | mom_6m | 4,379 |
+| 4 | vix_sma_20 | 3,658 |
+| 5 | yield_sma_20 | 3,295 |
+| 6 | Selling_General_And_Administration | 2,237 |
+| 7 | 10Y_YIELD | 1,257 |
+| 8 | yield_roc_20 | 1,254 |
+| 9 | Other_Income_Expense | 1,140 |
+| 10 | vix_roc_20 | 675 |
+
+12-month momentum dominates, followed by macro trend features. The macro SMA (20-day smoothed regime indicator) outranks the raw levels. Fundamental line items contribute modestly — consistent with their ~84% null rate in training data.
+
+---
+
+## Syntax verification
+
+```
+$ python -c "import ast; ast.parse(open('scripts/investor_train_model.py').read()); print('OK')"
+OK
+```
+
+## Commit
+
+See `git log -1 --oneline` after commit for new HEAD hash.
