@@ -158,6 +158,11 @@ def _align_fundamentals(
         .sort_values("date")
     )
 
+    # pandas 3.x requires identical datetime64 units on the merge key.
+    # yfinance / tz_localize may produce different resolutions (s vs us).
+    # Cast right to match left's exact dtype to avoid MergeError.
+    right["date"] = right["date"].astype(left["date"].dtype)
+
     merged = pd.merge_asof(left, right, on="date", direction="backward")
     return merged.set_index("date")
 

@@ -361,3 +361,113 @@ Expected runtime: ~2–4 minutes (7 symbols × network I/O for fundamentals).
 ## Commit
 
 See `git log -1 --oneline` after commit for new HEAD hash.
+
+---
+
+# V4 Data Pipeline Report — Feature Engineering & Cross-Sectional Target
+
+- **Date:** 2026-05-03
+- **Time:** 18:54:42 PDT
+- **Agent:** Claude Sonnet 4.6
+- **Trigger:** V4 Investor Pipeline — Feature Engineering & Top Quintile Target
+- **Files created:** `scripts/investor_feature_pipeline.py`
+- **Bugfix included:** `scripts/investor_data_miner.py` — datetime64 unit mismatch in `_align_fundamentals` resolved by casting right merge key to match left key dtype.
+
+---
+
+## Mission
+
+Phase 3 of the V4 Private Investor pipeline. Ingest the aligned daily Parquet, engineer momentum / macro / fundamental features, calculate the 60-day cross-sectional forward return, and produce a binary top-quintile target label. Output is a single training-ready Parquet file.
+
+## Pre-flight
+
+```
+$ git status --short
+(empty — clean)
+$ git log -1 --oneline
+390f3c6 feat(data): build v4 investor data miner with point-in-time fundamental alignment
+```
+
+---
+
+## Bugfix: datetime64 unit mismatch in investor_data_miner.py
+
+First run raised `pandas.errors.MergeError: incompatible merge keys [0] datetime64[s, UTC] and datetime64[us, UTC]`.
+
+Root cause: `yf.download(interval="1d")` produces `datetime64[ms, UTC]`; `fundamentals_df.index.tz_localize("UTC")` produced `datetime64[s, UTC]`. pandas 3.x requires identical units on `merge_asof` keys.
+
+Fix:
+```python
+right["date"] = right["date"].astype(left["date"].dtype)
+```
+
+---
+
+## Changes
+
+### `scripts/investor_feature_pipeline.py` *(new)*
+
+**Stage 1 — Momentum** (`groupby("symbol")["close"].pct_change`)
+
+| Feature | Window | Null rate |
+|---------|--------|-----------|
+| mom_3m  | 63d    | 5.3%      |
+| mom_6m  | 126d   | 10.5%     |
+| mom_12m | 252d   | 21.1%     |
+
+**Stage 2 — Macro trends** (20-day SMA and pct_change on VIX and 10Y_YIELD)
+
+| Feature      | Null rate |
+|--------------|-----------|
+| vix_sma_20   | 1.6%      |
+| vix_roc_20   | 1.7%      |
+| yield_sma_20 | 1.6%      |
+| yield_roc_20 | 1.7%      |
+
+**Stage 3 — Fundamental ratios** (gross/operating/net/ebitda margin from quarterly data)
+
+~84% null — yfinance only returns recent quarters (2024–2026 coverage). LightGBM handles natively.
+
+**Stage 4 — Target construction**
+
+```python
+# 60-day forward return
+df["forward_return_60d"] = df.groupby("symbol")["close"].transform(
+    lambda x: x.shift(-60) / x - 1
+)
+# Cross-sectional top-quintile label
+df["target_top_quintile"] = df.groupby("date")["forward_return_60d"].transform(_top_quintile_label)
+```
+
+420 embargo rows dropped. 8,365 labelled rows retained.
+
+---
+
+## Output: data/processed/v4_training_features.parquet
+
+```
+Shape : 8365 rows × 82 columns  (0.80 MB)
+Index : date  datetime64[ms, UTC]
+```
+
+| Label | Count | Rate  |
+|-------|-------|-------|
+| 0 (not Q5) | 5,975 | 71.4% |
+| 1 (Q5)     | 2,390 | 28.6% |
+
+**Note on 28.6% vs 20%:** With only 7 symbols, qcut(5) gives ~1–2 symbols per bin. 2/7 = 28.6%, 1/7 = 14.3%. NVDA's 51.9% positive rate (dominant outperformer 2021–2026) pulls the universe average up. A 50+ symbol universe converges to ~20%.
+
+Per-symbol positive rates: NVDA 51.9% | XOM 34.6% | AAPL 24.8% | WMT 24.4% | JNJ 24.1% | MSFT 21.3% | JPM 19.1%
+
+---
+
+## Syntax verification
+
+```
+$ python -c "import ast; ast.parse(open('scripts/investor_feature_pipeline.py').read()); print('...: OK')"
+investor_feature_pipeline.py: OK
+```
+
+## Commit
+
+See `git log -1 --oneline` after commit for new HEAD hash.
