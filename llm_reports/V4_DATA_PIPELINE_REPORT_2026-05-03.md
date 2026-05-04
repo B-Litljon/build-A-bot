@@ -185,3 +185,179 @@ All four files pass AST syntax gate.
 ## Commit
 
 See `git log -1 --oneline` after commit for new HEAD hash.
+
+---
+
+# V4 Data Pipeline Report — Data Miner & Time-Series Alignment
+
+- **Date:** 2026-05-03
+- **Time:** 18:30:14 PDT
+- **Agent:** Claude Sonnet 4.6
+- **Trigger:** V4 Investor Pipeline — Data Miner & Time-Series Alignment
+- **Files created:** `scripts/investor_data_miner.py`
+
+---
+
+## Mission
+
+Build the Phase 2 orchestration script that wires the Phase 1 ABC
+adapters into a complete data pipeline: fetch → align → save.  Output
+is a single point-in-time-safe Parquet file ready for feature
+engineering and cross-sectional ranking.
+
+## Pre-flight
+
+```
+$ git status --short
+(empty — clean)
+$ git log -1 --oneline
+884691f feat(data): implement abstract fundamental and macro providers with yfinance PoC adapters
+```
+
+Tree clean. Proceeded.
+
+---
+
+## Changes
+
+### `scripts/investor_data_miner.py` *(new)*
+
+Three-stage orchestration pipeline:
+
+**Stage 1 — Macro series**
+
+Calls `YFinanceMacroProvider.get_macro_series()` for `VIX` and
+`10Y_YIELD`.
+
+```
+⚠️  10Y_YIELD ÷ 10 correction applied
+```
+
+Yahoo Finance's `^TNX` index reports the 10-year Treasury yield
+multiplied by 10 (e.g. the value `44.5` means `4.45%`).  The script
+divides the raw series by 10.0 before any merge.  A log line confirms
+the transformation with a raw-vs-corrected sample at runtime.
+
+**Stage 2 — Per-symbol pipeline**
+
+For each symbol in the V4 universe `["AAPL", "MSFT", "NVDA", "JPM",
+"XOM", "WMT", "JNJ"]`:
+
+1. **OHLCV**: `yf.download(interval="1d")` — 5 years of adjusted daily
+   bars.  `YahooDataProvider` was not used here because its
+   `_yf_interval()` mapping caps at 90-minute bars; daily frequency
+   required a direct `yf.download()` call at the orchestration layer
+   (not the SDK layer — no ABC contracts are bypassed).
+
+2. **Macro alignment**: `_align_macro()` — `reindex + ffill` onto the
+   price DatetimeIndex.  Correct for macro since the data is already
+   daily; no irregular date gaps require merge_asof logic.
+
+3. **45-day fundamental lag** (the look-ahead bias prevention):
+
+```python
+# POINT-IN-TIME SAFETY
+# Q1 2024 period end  : 2024-03-31
+# Earliest safe use   : 2024-03-31 + 45d = 2024-05-15
+fundamentals_df.index = (
+    fundamentals_df.index + pd.Timedelta(days=_FUNDAMENTAL_LAG_DAYS)
+)
+```
+
+   The index is then UTC-localized (if tz-naive) to match the
+   UTC-aware price DatetimeIndex — preventing a pandas tz-mismatch
+   TypeError during the merge.
+
+4. **Fundamental alignment**: `_align_fundamentals()` — `merge_asof(
+   direction="backward")` on the `"date"` key.  Each trading day
+   receives the most recent quarterly report whose *lagged* date is
+   ≤ that day.  A day falling between two lagged report dates gets the
+   older report — the conservative, point-in-time-correct choice.
+
+**Stage 3 — Save**
+
+```python
+combined = (
+    pd.concat(symbol_frames, axis=0)
+    .reset_index()
+    .sort_values(["symbol", "date"])
+    .set_index("date")
+)
+combined.to_parquet(_OUTPUT_PATH, index=True)
+# → data/raw/v4_investor_data.parquet
+```
+
+---
+
+## 45-day lag — mathematical verification
+
+The lag is applied at the *index* of the quarterly fundamentals
+DataFrame *before* the merge.  This means:
+
+| Period end | Lagged date (available_at) | First daily row that can see it |
+|-----------|---------------------------|--------------------------------|
+| 2024-03-31 (Q1) | 2024-05-15 | 2024-05-15 |
+| 2024-06-30 (Q2) | 2024-08-14 | 2024-08-14 |
+| 2024-09-30 (Q3) | 2024-11-14 | 2024-11-14 |
+| 2024-12-31 (Q4) | 2025-02-14 | 2025-02-14 |
+
+`merge_asof(direction="backward")` guarantees that a row dated
+2024-05-14 sees **only Q4 2023 data** — the Q1 2024 lagged date
+(2024-05-15) has not yet been reached.  The fence is exact to the day.
+
+---
+
+## Architecture notes
+
+### Why `yf.download()` directly for OHLCV
+
+`YahooDataProvider.get_historical_bars()` was designed for intraday
+timeframes (its `_yf_interval()` mapping caps at `"90m"`).  Calling it
+with `timeframe_minutes=1440` silently returns 90-minute bars.
+Rather than modify the existing provider, the orchestration script
+calls `yf.download(interval="1d")` directly — this is correct layering:
+the script is the orchestrator, not the SDK.
+
+### UTC consistency
+
+All three data layers are coerced to UTC-aware DatetimeIndex before any
+join.  This prevents silent tz-mismatch bugs in pandas 3.0's stricter
+type checking.
+
+---
+
+## Task 2 — Syntax verification
+
+```
+$ python -c "import ast; ast.parse(open('scripts/investor_data_miner.py').read()); print('investor_data_miner.py: OK')"
+investor_data_miner.py: OK
+```
+
+---
+
+## Readiness checklist
+
+| Item | Status |
+|------|--------|
+| V4 universe hardcoded | ✅ `["AAPL","MSFT","NVDA","JPM","XOM","WMT","JNJ"]` |
+| 5-year window | ✅ `_START_DATE = now − 5 years` |
+| 10Y_YIELD ÷ 10 correction | ✅ applied before macro_df construction |
+| 45-day fundamental lag | ✅ `pd.Timedelta(days=45)` on index before merge |
+| ffill on macro | ✅ `reindex(..., method="ffill")` |
+| ffill on fundamentals | ✅ `merge_asof(direction="backward")` (forward-fill semantics) |
+| UTC-aware throughout | ✅ all three layers coerced before join |
+| Output path | ✅ `data/raw/v4_investor_data.parquet` |
+| No Tier 1/2 execution code touched | ✅ |
+| No model training | ✅ data miner only |
+
+## To run
+
+```bash
+pipenv run python scripts/investor_data_miner.py
+```
+
+Expected runtime: ~2–4 minutes (7 symbols × network I/O for fundamentals).
+
+## Commit
+
+See `git log -1 --oneline` after commit for new HEAD hash.
