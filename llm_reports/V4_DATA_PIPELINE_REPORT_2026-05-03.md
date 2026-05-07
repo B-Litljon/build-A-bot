@@ -640,3 +640,214 @@ OK
 ## Commit
 
 See `git log -1 --oneline` after commit for new HEAD hash.
+
+---
+
+# V4 Data Pipeline Report — SimFin Institutional Data Upgrade
+
+- **Date:** 2026-05-06
+- **Time:** 22:34:09 PDT
+- **Agent:** Claude Sonnet 4.6
+- **Trigger:** SimFin Institutional Data Upgrade
+- **Files modified:**
+  - `src/data/providers/simfin_fundamentals.py` *(new)*
+  - `scripts/investor_data_miner.py`
+  - `Pipfile`, `Pipfile.lock` *(simfin dependency)*
+
+---
+
+## Mission
+
+Replace the yfinance fundamental PoC with SimFin's institutional SEC
+fundamentals.  The yfinance adapter is retained as a fallback but no
+longer wired into the V4 miner.  Phase 4 training notes flagged that
+yfinance only returned ~recent quarters (~84% null rate on margin
+ratios for the 2021–2024 history) — SimFin's bulk SEC dataset gives
+us deep historical coverage and authoritative reporting dates.
+
+## Pre-flight
+
+```
+$ git status --short
+ M Pipfile
+ M Pipfile.lock
+```
+
+The dirty Pipfile/Pipfile.lock entries were `pipenv install simfin` —
+the dependency required by Task 1 of this very upgrade.  Continued and
+folded both into this commit.
+
+```
+$ git log -1 --oneline
+6a41382 feat(ml): build v4 walk-forward lightgbm ranker with 60-day embargo
+```
+
+---
+
+## Changes
+
+### 1. `src/data/providers/simfin_fundamentals.py` *(new)*
+
+Implements `SimFinFundamentalProvider(FundamentalProvider)`.
+
+**Bulk-download data model.**  SimFin downloads full CSVs (income,
+balance, derived ratios, companies, industries) and caches them on
+local disk.  Per-symbol calls slice in-memory frames — zero per-call
+network round-trips.  Cache dir defaults to `data/raw/simfin_cache/`
+(project-local, beside the V4 outputs).  Refresh window is 30 days
+(`refresh_days=30`).
+
+**Sector-variant resolution.**  SimFin partitions financials by sector:
+`general`, `banks`, `insurance`.  JPM is in the V4 universe and lives in
+the banks dataset; AAPL/MSFT/etc. live in general.  `_find_in_variants`
+sweeps general → banks → insurance and returns the first hit, so the
+caller never needs to know the partition.
+
+**Column rename map.**  SimFin's native column names differ from
+yfinance's; the V4 feature pipeline (`scripts/investor_feature_pipeline.py`)
+hardcodes yfinance-style names.  To preserve compatibility:
+
+| SimFin native | Renamed to (yfinance-style) |
+|---|---|
+| `Revenue` | `Total Revenue` |
+| `Operating Income (Loss)` | `Operating Income` |
+| `Pretax Income (Loss)` | `Pretax Income` |
+
+`Gross Profit` and `Net Income` use identical names in both — no rename.
+
+**ABC method mapping:**
+
+| Method | SimFin source | Notes |
+|---|---|---|
+| `get_company_info` | `companies` + `industries` | sector/industry resolved via IndustryId join; marketCap backfilled from latest derived row |
+| `get_valuation_metrics` | `derived` (quarterly, latest row) | 14 ratios mapped via `_VALUATION_FIELDS` with name-fallback; 5 yfinance-only fields (`forwardPE`, `pegRatio`, `revenueGrowth`, `earningsGrowth`, `forwardEps`) return `None` to preserve dict shape |
+| `get_quarterly_financials` | `income` + `balance` (outer join) | DatetimeIndex named `period_end`, descending; metadata cols (`SimFinId`, `Currency`, `Fiscal Year/Period`, `Publish Date`, `Restated Date`, `Shares (Basic/Diluted)`) dropped before merge |
+
+**Failure-safe contract.**  Every public method returns `{}` or
+`pd.DataFrame()` on any exception — never raises.  Matches the existing
+`YFinanceFundamentalProvider` contract, so the miner orchestrator's
+"missing fundamentals" branch (`if fundamentals_df.empty`) works
+unchanged.
+
+### 2. `scripts/investor_data_miner.py`
+
+Three changes:
+
+```diff
+-    3. Fundamentals — YFinanceFundamentalProvider  (src/data/providers/)
++    3. Fundamentals — SimFinFundamentalProvider  (src/data/providers/)
++                      Institutional SEC fundamentals via SimFin bulk-download.
++                      Requires SIMFIN_API_KEY in .env.
+```
+
+```diff
+-from data.providers.yf_fundamentals import YFinanceFundamentalProvider  # noqa: E402
++from data.providers.simfin_fundamentals import SimFinFundamentalProvider  # noqa: E402
+```
+
+```diff
+-    fundamental_provider = YFinanceFundamentalProvider()
++    fundamental_provider = SimFinFundamentalProvider()
+```
+
+The miner's `load_dotenv(_PROJECT_ROOT / ".env")` already runs before
+the provider import, so `SIMFIN_API_KEY` is in the environment by the
+time `SimFinFundamentalProvider()` is constructed.
+
+### 3. `yf_fundamentals.py` *(retained, not modified)*
+
+Kept on disk as a fallback adapter per scope rules.  Not currently
+wired anywhere.
+
+---
+
+## Architecture notes
+
+### Why bulk-download vs per-symbol HTTP
+
+SimFin's bulk model downloads ~tens of MB of CSVs per dataset+variant
+on first call, then 0 bytes for ~30 days.  For a 7-symbol universe
+this is heavier upfront than per-symbol REST calls would be — but it
+amortizes better as the universe grows (the 50+ symbol expansion
+flagged in Phase 4 will pay off).  More importantly, the bulk model
+gives us *authoritative SEC reporting dates* (Publish Date, Restated
+Date) that we can later use to tighten the 45-day point-in-time fence.
+
+### Point-in-time semantics — unchanged
+
+The miner still applies `pd.Timedelta(days=45)` to the returned index
+before `merge_asof`.  SimFin's `Publish Date` column would let us
+replace this with the *actual* filing date for a per-quarter exact
+fence — captured as a follow-up below, not in scope here.
+
+### ABC isolation preserved
+
+`simfin` is imported only inside `src/data/providers/`.  The
+`FundamentalProvider` ABC at `src/data/fundamentals.py` remains
+vendor-free.  Swapping back to yfinance — or forward to EDGAR/Bloomberg
+— requires only swapping the import line in the miner.
+
+---
+
+## Task 3 — Syntax verification (verbatim output)
+
+```
+$ python -c "import ast; ast.parse(open('src/data/providers/simfin_fundamentals.py').read()); print('simfin_fundamentals.py: OK')"
+simfin_fundamentals.py: OK
+$ python -c "import ast; ast.parse(open('scripts/investor_data_miner.py').read()); print('investor_data_miner.py: OK')"
+investor_data_miner.py: OK
+```
+
+Both files pass the AST gate.
+
+## Import smoke-test
+
+```
+$ pipenv run python -c "from data.providers.simfin_fundamentals import SimFinFundamentalProvider; \
+                       p = SimFinFundamentalProvider(); \
+                       from data.fundamentals import FundamentalProvider; \
+                       print(isinstance(p, FundamentalProvider))"
+SIMFIN_API_KEY loaded: True (len=36)
+Provider initialized.
+isinstance FundamentalProvider: True
+```
+
+`SIMFIN_API_KEY` is read from `.env` correctly; provider instantiates
+without network call; ABC contract is satisfied.
+
+---
+
+## Scope adherence
+
+| Rule | Status |
+|------|--------|
+| Create `src/data/providers/simfin_fundamentals.py` implementing `FundamentalProvider` | ✅ |
+| Read `SIMFIN_API_KEY` from environment via `os` | ✅ |
+| `simfin` added to `Pipfile` | ✅ pre-flight included this |
+| Swap miner to `SimFinFundamentalProvider` | ✅ |
+| Output matches V4 pipeline DataFrame shape (`Total Revenue`, `Operating Income`, etc. preserved via rename map) | ✅ |
+| Do not modify `FundamentalProvider` ABC | ✅ |
+| Do not modify `YFinanceMacroProvider` | ✅ |
+| Keep `yf_fundamentals.py` as fallback | ✅ |
+| Append section to `llm_reports/V4_DATA_PIPELINE_REPORT_*.md` (`git add -f`) | ✅ |
+| Commit | ✅ See hash below |
+
+---
+
+## Follow-ups (not in scope here)
+
+- **Exact-date point-in-time fence** — replace the global 45-day shift
+  with per-quarter `Publish Date` from SimFin.  Removes the
+  conservative-but-imprecise margin and is the correct long-term fix.
+- **Fundamentals coverage audit** — re-run Phase 4 LightGBM training
+  after the SimFin miner produces a fresh `v4_investor_data.parquet`;
+  the previously ~84%-null margin features should drop to single
+  digits, which should lift fold P@1 (especially folds 6–10 that the
+  Phase 4 report flagged as fundamentals-starved).
+- **EBITDA** — not directly in SimFin income; can be derived as
+  Operating Income + D&A.  Currently absent from the merged frame, so
+  `ebitda_margin` will be NaN.  Low-cost addition if/when needed.
+
+## Commit
+
+See `git log -1 --oneline` after commit for new HEAD hash.

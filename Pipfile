@@ -21,6 +21,7 @@ pyarrow = "*"
 rich = "*"
 polars = "*"
 lightgbm = "*"
+simfin = "*"
 
 [dev-packages]
 

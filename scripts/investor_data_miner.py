@@ -18,7 +18,9 @@ Data layers:
                       (YahooDataProvider targets intraday; daily bars
                        are fetched directly here at the orchestration layer)
     2. Macro        — YFinanceMacroProvider  (src/data/providers/yf_macro.py)
-    3. Fundamentals — YFinanceFundamentalProvider  (src/data/providers/)
+    3. Fundamentals — SimFinFundamentalProvider  (src/data/providers/)
+                      Institutional SEC fundamentals via SimFin bulk-download.
+                      Requires SIMFIN_API_KEY in .env.
 """
 
 from __future__ import annotations
@@ -39,7 +41,7 @@ sys.path.insert(0, str(_SRC_DIR))
 
 load_dotenv(_PROJECT_ROOT / ".env")
 
-from data.providers.yf_fundamentals import YFinanceFundamentalProvider  # noqa: E402
+from data.providers.simfin_fundamentals import SimFinFundamentalProvider  # noqa: E402
 from data.providers.yf_macro import YFinanceMacroProvider  # noqa: E402
 
 # ── logging ───────────────────────────────────────────────────────────
@@ -179,7 +181,7 @@ def main() -> None:
     logger.info("Lag      : %d days (SEC reporting safety margin)", _FUNDAMENTAL_LAG_DAYS)
     logger.info("=" * 70)
 
-    fundamental_provider = YFinanceFundamentalProvider()
+    fundamental_provider = SimFinFundamentalProvider()
     macro_provider = YFinanceMacroProvider()
 
     # ── Stage 1 — Macro series ────────────────────────────────────────
