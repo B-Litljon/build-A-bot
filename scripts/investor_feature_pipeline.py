@@ -10,18 +10,29 @@ engineers three feature families plus the cross-sectional ranking target:
   4. Target           — Binary 1 if asset is in the top quintile (Q5) of
                         60-day cross-sectional forward returns, 0 otherwise
 
+Modes
+-----
+Training mode (default)
+    Drops the embargo window (rows where forward_return_60d / target are
+    NaN — the most recent ~60 trading days).  Output:
+        data/processed/v4_training_features.parquet
+
+Inference mode (``--inference``)
+    Retains the embargo window so today's row survives — required by the
+    monthly portfolio orchestrator.  Output:
+        data/processed/v4_inference_features.parquet
+
 Usage:
     pipenv run python scripts/investor_feature_pipeline.py
+    pipenv run python scripts/investor_feature_pipeline.py --inference
 
 Input:
     data/raw/v4_investor_data.parquet
-
-Output:
-    data/processed/v4_training_features.parquet
 """
 
 from __future__ import annotations
 
+import argparse
 import logging
 import sys
 from pathlib import Path
@@ -34,7 +45,8 @@ _SRC_DIR = _PROJECT_ROOT / "src"
 sys.path.insert(0, str(_SRC_DIR))
 
 _INPUT_PATH = _PROJECT_ROOT / "data" / "raw" / "v4_investor_data.parquet"
-_OUTPUT_PATH = _PROJECT_ROOT / "data" / "processed" / "v4_training_features.parquet"
+_OUTPUT_PATH_TRAINING = _PROJECT_ROOT / "data" / "processed" / "v4_training_features.parquet"
+_OUTPUT_PATH_INFERENCE = _PROJECT_ROOT / "data" / "processed" / "v4_inference_features.parquet"
 
 # ── logging ───────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -113,11 +125,29 @@ def _top_quintile_label(series: pd.Series) -> pd.Series:
 # Main
 # ─────────────────────────────────────────────────────────────────────
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        description="Engineer V4 investor features and (optionally) the cross-sectional target."
+    )
+    parser.add_argument(
+        "--inference",
+        action="store_true",
+        help=(
+            "Inference mode: retain the 60-day embargo window so today's "
+            "row survives (required by the monthly orchestrator). Writes "
+            "to v4_inference_features.parquet instead of v4_training_features.parquet."
+        ),
+    )
+    args = parser.parse_args(argv)
+
+    inference_mode: bool = args.inference
+    output_path = _OUTPUT_PATH_INFERENCE if inference_mode else _OUTPUT_PATH_TRAINING
+
     logger.info("=" * 70)
     logger.info("V4 Investor Feature Pipeline")
+    logger.info("Mode   : %s", "INFERENCE (embargo retained)" if inference_mode else "TRAINING (embargo dropped)")
     logger.info("Input  : %s", _INPUT_PATH)
-    logger.info("Output : %s", _OUTPUT_PATH)
+    logger.info("Output : %s", output_path)
     logger.info("=" * 70)
 
     # ── Load & normalise ─────────────────────────────────────────────
@@ -214,46 +244,66 @@ def main() -> None:
         n_positive / n_target * 100 if n_target > 0 else 0,
     )
 
-    # ── Clean-up: drop the embargo period ────────────────────────────
+    # ── Embargo handling ─────────────────────────────────────────────
     # Rows where target_top_quintile is NaN are the final ~60 trading
-    # days where we cannot compute the forward return.  These must be
-    # excluded from training.  Feature NaNs (momentum warm-up, sparse
-    # fundamentals) are intentionally retained — LightGBM handles them.
-    pre_drop = len(df)
-    df = df.dropna(subset=["target_top_quintile"])
-    logger.info(
-        "\nDropped %d embargo rows (NaN target). Remaining: %d rows.",
-        pre_drop - len(df), len(df),
-    )
+    # days where we cannot compute the forward return.
+    #   Training mode  : drop them (no usable label).
+    #   Inference mode : KEEP them — today's row lives here and is the
+    #                    row the orchestrator will predict on.  The
+    #                    forward_return_60d / target_top_quintile columns
+    #                    will simply be NaN for those rows; downstream
+    #                    inference excludes them as features anyway.
+    if inference_mode:
+        n_embargo = int(df["target_top_quintile"].isna().sum())
+        logger.info(
+            "\nInference mode — retaining %d embargo rows (NaN target). "
+            "Total rows: %d.",
+            n_embargo, len(df),
+        )
+    else:
+        pre_drop = len(df)
+        df = df.dropna(subset=["target_top_quintile"])
+        logger.info(
+            "\nDropped %d embargo rows (NaN target). Remaining: %d rows.",
+            pre_drop - len(df), len(df),
+        )
 
-    # ── Final label distribution audit ───────────────────────────────
-    total = len(df)
-    pos = int((df["target_top_quintile"] == 1).sum())
-    neg = int((df["target_top_quintile"] == 0).sum())
-    logger.info(
-        "Target distribution — positive (Q5): %d (%.1f%%) | "
-        "negative: %d (%.1f%%)",
-        pos, pos / total * 100,
-        neg, neg / total * 100,
-    )
+    # ── Label distribution audit (training only — meaningless on NaN) ─
+    if not inference_mode:
+        total = len(df)
+        pos = int((df["target_top_quintile"] == 1).sum())
+        neg = int((df["target_top_quintile"] == 0).sum())
+        logger.info(
+            "Target distribution — positive (Q5): %d (%.1f%%) | "
+            "negative: %d (%.1f%%)",
+            pos, pos / total * 100,
+            neg, neg / total * 100,
+        )
 
-    # Per-symbol target rate
-    logger.info("Per-symbol positive rate:")
-    for sym, grp in df.groupby("symbol"):
-        rate = (grp["target_top_quintile"] == 1).mean() * 100
-        logger.info("  %-6s  %.1f%%", sym, rate)
+        logger.info("Per-symbol positive rate:")
+        for sym, grp in df.groupby("symbol"):
+            rate = (grp["target_top_quintile"] == 1).mean() * 100
+            logger.info("  %-6s  %.1f%%", sym, rate)
+    else:
+        # In inference mode, log the most recent observation date so
+        # operators can confirm today's row is present.
+        logger.info(
+            "Inference snapshot — most recent date in frame: %s",
+            df["date"].max().date().isoformat(),
+        )
 
     # ── Save ─────────────────────────────────────────────────────────
     df = df.set_index("date")
-    _OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(_OUTPUT_PATH, index=True)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(output_path, index=True)
 
-    size_mb = _OUTPUT_PATH.stat().st_size / (1024 * 1024)
+    size_mb = output_path.stat().st_size / (1024 * 1024)
     logger.info(
         "\nSaved → %s  (%d rows × %d cols, %.2f MB)",
-        _OUTPUT_PATH, *df.shape, size_mb,
+        output_path, *df.shape, size_mb,
     )
-    logger.info("V4 feature pipeline complete.")
+    logger.info("V4 feature pipeline complete (mode=%s).",
+                "inference" if inference_mode else "training")
 
 
 if __name__ == "__main__":

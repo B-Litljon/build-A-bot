@@ -22,6 +22,7 @@ rich = "*"
 polars = "*"
 lightgbm = "*"
 simfin = "*"
+oandapyv20 = "*"
 
 [dev-packages]
 

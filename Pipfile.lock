@@ -1,7 +1,7 @@
 {
     "_meta": {
         "hash": {
-            "sha256": "2d12f00affcfc16466c70bad887f939fcd0e0ab3db5408073ba07cb748fd5db9"
+            "sha256": "bda1741295714de895ea8fcab5335039d1c0c8dbdd25a1b0ca2e79b4c6a045e9"
         },
         "pipfile-spec": 6,
         "requires": {
@@ -918,6 +918,13 @@
             "index": "pypi",
             "markers": "python_version >= '3.9'",
             "version": "==1.26.4"
+        },
+        "oandapyv20": {
+            "hashes": [
+                "sha256:5ca3990f824d0b16afd49d8e08f7403862d2b3c5a583470f777db7f76f04d073"
+            ],
+            "index": "pypi",
+            "version": "==0.7.2"
         },
         "packaging": {
             "hashes": [

@@ -7,6 +7,7 @@ appropriate provider.  Supported values:
     - ``alpaca``  (default) — Alpaca REST + WebSocket
     - ``polygon`` — Polygon.io REST + WebSocket
     - ``yahoo``   — Yahoo Finance (polling, **paper trading only**)
+    - ``oanda``   — OANDA v20 REST + Streaming (forex, V5 scalper)
 """
 
 import logging
@@ -63,6 +64,22 @@ def get_market_provider() -> MarketDataProvider:
         logger.info("Data source: Yahoo Finance (poll every %ds)", poll)
         return YahooDataProvider(poll_interval=poll)
 
+    if source == "oanda":
+        from data.oanda_provider import OandaMarketProvider
+
+        environment = os.getenv("OANDA_ENV", "practice").strip().lower()
+        api_key = os.getenv("OANDA_API_KEY")
+        account_id = os.getenv("OANDA_ACCOUNT_ID")
+        stream_gran = int(os.getenv("OANDA_STREAM_GRANULARITY_MIN", "1"))
+        logger.info("Data source: OANDA (%s)", environment)
+        return OandaMarketProvider(
+            environment=environment,
+            api_key=api_key,
+            account_id=account_id,
+            stream_granularity_minutes=stream_gran,
+        )
+
     raise ValueError(
-        f"Unknown DATA_SOURCE={source!r}. Expected one of: alpaca, polygon, yahoo."
+        f"Unknown DATA_SOURCE={source!r}. "
+        f"Expected one of: alpaca, polygon, yahoo, oanda."
     )
