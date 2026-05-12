@@ -1,3 +1,17 @@
+---
+type: refactor
+date: 2026-04-26
+time: unknown
+agent: Kimi K2.6 (OpenCode)
+model: kimi-k2.6
+trigger: Tier 1 — establish foundational broker-agnostic abstractions for the Factory SDK
+head: 71a56f2cdfc32285e52c1075dda926f500874141
+scope: modifies-source
+files_touched:
+  - src/strategies/base.py
+imported_from: TIER_1_FOUNDATIONS_REPORT.md
+---
+
 # Tier 1 Foundations — Broker-Agnostic Abstraction Skeleton
 
 **Date:** 2026-04-26  

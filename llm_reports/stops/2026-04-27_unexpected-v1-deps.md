@@ -1,3 +1,15 @@
+---
+type: stop
+date: 2026-04-27
+time: unknown
+agent: unknown
+model: unknown
+trigger: Contract inconsistency detected — AlpacaProvider missing methods that PolygonDataProvider and YahooDataProvider implement
+head: unknown
+scope: read-only
+imported_from: STOP_REPORT_2026-04-27.md
+---
+
 # STOP AND REPORT: Contract Inconsistency Detected
 
 During Task 1, I inspected the three concrete provider classes (`AlpacaProvider`, `PolygonDataProvider`, and `YahooDataProvider`). I discovered that they **do not all implement the same contract**.

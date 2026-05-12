@@ -1,3 +1,17 @@
+---
+type: handoff
+date: 2026-05-03
+time: 01:07:06 PDT
+agent: Claude Sonnet 4.6
+model: claude-sonnet-4-6
+trigger: Maiden Voyage Runner Script Recovery & Commit — resume from dropped connection in prior session
+head: unknown
+scope: modifies-source
+files_touched:
+  - scripts/run_paper_live.py
+imported_from: MAIDEN_VOYAGE_REPORT_2026-05-03.md
+---
+
 # Maiden Voyage Report — Runner Script Recovery & Commit
 
 - **Date:** 2026-05-03

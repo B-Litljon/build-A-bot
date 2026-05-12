@@ -34,4 +34,3 @@ backtest_output.log
 # OS junk
 .DS_Store
 
-llm_reports/

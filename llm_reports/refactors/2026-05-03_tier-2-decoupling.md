@@ -1,3 +1,21 @@
+---
+type: refactor
+date: 2026-05-03
+time: 15:44:38 PDT
+agent: Claude Sonnet 4.6
+model: claude-sonnet-4-6
+trigger: Tier 2 Alpaca Enum Purge (Gemini 3.1 Pro brief) — purge remaining hardcoded Alpaca enum imports
+head: unknown
+scope: modifies-source
+files_touched:
+  - src/execution/factory_orchestrator.py
+  - src/data/discovery.py
+  - src/core/retrainer.py
+  - src/execution/enums.py
+  - src/data/enums.py
+imported_from: TIER_2_DECOUPLING_REPORT_2026-05-03.md
+---
+
 # Tier 2 Decoupling Report — Alpaca Enum Purge
 
 - **Date:** 2026-05-03

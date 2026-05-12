@@ -1,3 +1,20 @@
+---
+type: refactor
+date: 2026-05-03
+time: 18:22:19 PDT
+agent: Claude Sonnet 4.6
+model: claude-sonnet-4-6
+trigger: V4 Private Investor Pipeline — Fundamental & Macro Abstraction Layer (Phase 1)
+head: unknown
+scope: modifies-source
+files_touched:
+  - src/data/fundamentals.py
+  - src/data/macro.py
+  - src/data/providers/yf_fundamentals.py
+  - src/data/providers/yf_macro.py
+imported_from: V4_DATA_PIPELINE_REPORT_2026-05-03.md
+---
+
 # V4 Data Pipeline Report — Fundamental & Macro Abstraction Layer
 
 - **Date:** 2026-05-03
