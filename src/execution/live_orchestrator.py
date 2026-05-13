@@ -1627,6 +1627,9 @@ class LiveOrchestrator:
                         ctx.entry_qty = None
                         ctx.sl_price = None
                         ctx.tp_price = None
+                        # Clear so a same-bar retry signal isn't silently
+                        # dropped by the dedup gate in _handle_signal.
+                        ctx.last_client_order_id = None
                         logger.info(
                             "[%s] State -> FLAT | reason=%s",
                             symbol,

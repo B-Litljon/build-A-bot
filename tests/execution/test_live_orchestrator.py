@@ -132,6 +132,17 @@ class TestOnTradeUpdate(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ctx.entry_qty, 2.0)
         orch._enter_cooling.assert_not_awaited()
 
+    async def test_rejected_clears_client_order_id(self):
+        """After a rejected order, last_client_order_id must clear so a retry signal isn't deduplicated."""
+        ctx = _make_ctx(state=SymbolState.PENDING)
+        ctx.last_client_order_id = "test_order_1"
+        orch = _make_orch(ctx)
+
+        await orch._on_trade_update(_make_event("rejected", "BUY"))
+
+        self.assertEqual(ctx.state, SymbolState.FLAT)
+        self.assertIsNone(ctx.last_client_order_id)
+
 
 if __name__ == "__main__":
     unittest.main()
