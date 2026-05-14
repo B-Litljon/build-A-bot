@@ -28,6 +28,19 @@ import polars as pl
 class MarketDataProvider(abc.ABC):
     """Unified historical + streaming + discovery contract."""
 
+    _BAR_SCHEMA = {
+        "timestamp": pl.Datetime(time_unit="us", time_zone="UTC"),
+        "open": pl.Float64,
+        "high": pl.Float64,
+        "low": pl.Float64,
+        "close": pl.Float64,
+        "volume": pl.Float64,
+    }
+
+    @classmethod
+    def _empty_bars(cls) -> pl.DataFrame:
+        return pl.DataFrame({col: [] for col in cls._BAR_SCHEMA}, schema=cls._BAR_SCHEMA)
+
     @abc.abstractmethod
     def get_active_symbols(self, limit: int = 10) -> List[str]:
         """

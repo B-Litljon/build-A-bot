@@ -15,7 +15,7 @@ import asyncio
 import logging
 import os
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional
 
 import oandapyV20
@@ -27,16 +27,6 @@ import polars as pl
 from data.market_provider import MarketDataProvider
 
 logger = logging.getLogger(__name__)
-
-# Canonical Polars schema (mirrors polygon_provider._BAR_SCHEMA)
-_BAR_SCHEMA = {
-    "timestamp": pl.Datetime(time_unit="us", time_zone="UTC"),
-    "open": pl.Float64,
-    "high": pl.Float64,
-    "low": pl.Float64,
-    "close": pl.Float64,
-    "volume": pl.Float64,
-}
 
 # Maps timeframe_minutes → OANDA granularity string
 _GRANULARITY: Dict[int, str] = {
@@ -123,6 +113,7 @@ class OandaMarketProvider(MarketDataProvider):
         self._callback: Optional[Callable] = None
         self._symbols: List[str] = []
         self._stop_event = threading.Event()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
         # Per-symbol tick accumulator: symbol → bar state dict
         self._tick_bars: Dict[str, dict] = {}
@@ -162,6 +153,9 @@ class OandaMarketProvider(MarketDataProvider):
             mid = (bid + ask) / 2.0
 
             bar_epoch = int(ts.timestamp()) // (self._stream_gran * 60)
+            bar_start = datetime.fromtimestamp(
+                bar_epoch * self._stream_gran * 60, tz=timezone.utc
+            )
             state = self._tick_bars.get(instrument)
 
             if state is None or state["epoch"] != bar_epoch:
@@ -169,7 +163,7 @@ class OandaMarketProvider(MarketDataProvider):
                     self._flush_bar(instrument, state)
                 self._tick_bars[instrument] = {
                     "epoch": bar_epoch,
-                    "bar_start": ts,
+                    "bar_start": bar_start,
                     "open": mid,
                     "high": mid,
                     "low": mid,
@@ -196,10 +190,9 @@ class OandaMarketProvider(MarketDataProvider):
             "close": state["close"],
             "volume": float(state["volume"]),
         }
-        try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(self._callback(bar))
-        except RuntimeError:
+        if self._loop is not None and self._loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._callback(bar), self._loop)
+        else:
             asyncio.run(self._callback(bar))
 
     # ── MarketDataProvider interface ──────────────────────────────────
@@ -277,7 +270,7 @@ class OandaMarketProvider(MarketDataProvider):
                 last_ts = _parse_iso(candles[-1]["time"])
                 if last_ts <= chunk_start or len(candles) < _MAX_CANDLES:
                     break
-                chunk_start = last_ts
+                chunk_start = last_ts + timedelta(minutes=timeframe_minutes)
 
         except Exception as e:
             logger.error(
@@ -285,12 +278,12 @@ class OandaMarketProvider(MarketDataProvider):
                 oanda_symbol,
                 e,
             )
-            return pl.DataFrame({col: [] for col in _BAR_SCHEMA}, schema=_BAR_SCHEMA)
+            return self._empty_bars()
 
         if not rows:
-            return pl.DataFrame({col: [] for col in _BAR_SCHEMA}, schema=_BAR_SCHEMA)
+            return self._empty_bars()
 
-        return pl.DataFrame(rows, schema=_BAR_SCHEMA)
+        return pl.DataFrame(rows, schema=self._BAR_SCHEMA)
 
     def subscribe(self, symbols: List[str], callback: Callable) -> None:
         """
@@ -302,6 +295,10 @@ class OandaMarketProvider(MarketDataProvider):
         self._symbols = [_to_oanda_symbol(s) for s in symbols]
         self._callback = callback
         self._tick_bars = {}
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = asyncio.get_event_loop()
         logger.info("OandaMarketProvider: subscribed to %s", self._symbols)
 
     def run_stream(self) -> None:
@@ -333,5 +330,9 @@ class OandaMarketProvider(MarketDataProvider):
             logger.error("OandaMarketProvider stream error: %s", e)
 
     def stop_stream(self) -> None:
-        """Signal the stream loop to exit on the next tick."""
+        """Signal the stream loop to exit and flush all in-flight bars."""
         self._stop_event.set()
+        for instrument, state in list(self._tick_bars.items()):
+            if state:
+                self._flush_bar(instrument, state)
+        self._tick_bars.clear()

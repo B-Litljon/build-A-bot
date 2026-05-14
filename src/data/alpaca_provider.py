@@ -85,7 +85,7 @@ class AlpacaProvider(MarketDataProvider):
                 bars = self.stock_client.get_stock_bars(req)
 
             if not bars.data or symbol not in bars.data:
-                return pl.DataFrame()
+                return self._empty_bars()
 
             # Data Washing: Strip Alpaca metadata for Polars compatibility
             df_pandas = bars.df.loc[symbol].reset_index()
@@ -102,7 +102,7 @@ class AlpacaProvider(MarketDataProvider):
 
         except Exception as e:
             logger.error(f"Error fetching data for {symbol}: {e}")
-            return pl.DataFrame()
+            return self._empty_bars()
 
     def subscribe(self, symbols: List[str], callback: Callable) -> None:
         """

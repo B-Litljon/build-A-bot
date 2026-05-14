@@ -53,6 +53,8 @@ class LiveBarAggregator:
         """
         if timeframe < 1:
             raise ValueError(f"timeframe must be >= 1, got {timeframe}")
+        if 60 % timeframe != 0:
+            raise ValueError(f"timeframe must evenly divide 60, got {timeframe}")
 
         self.timeframe: int = int(timeframe)
         self.history_size: int = history_size
