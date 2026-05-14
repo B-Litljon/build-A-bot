@@ -7,10 +7,11 @@ generic :class:`MarketDataProvider` interface.
 Requires the ``POLYGON_API_KEY`` environment variable.
 """
 
+import asyncio
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Callable, List
+from typing import Callable, List, Optional
 
 import polars as pl
 from polygon import RESTClient
@@ -20,16 +21,6 @@ from polygon.websocket.models import WebSocketMessage
 from data.market_provider import MarketDataProvider
 
 logger = logging.getLogger(__name__)
-
-# ── canonical Polars schema (mirrors alpaca_provider._BAR_SCHEMA) ─────
-_BAR_SCHEMA = {
-    "timestamp": pl.Datetime(time_unit="us", time_zone="UTC"),
-    "open": pl.Float64,
-    "high": pl.Float64,
-    "low": pl.Float64,
-    "close": pl.Float64,
-    "volume": pl.Float64,
-}
 
 
 class PolygonDataProvider(MarketDataProvider):
@@ -59,6 +50,7 @@ class PolygonDataProvider(MarketDataProvider):
         self._ws: WebSocketClient | None = None
         self._callback: Callable | None = None
         self._symbols: List[str] = []
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     # ── MarketDataProvider interface ──────────────────────────────────
 
@@ -137,9 +129,7 @@ class PolygonDataProvider(MarketDataProvider):
 
             if not aggs:
                 logger.warning("Polygon returned 0 bars for %s.", symbol)
-                return pl.DataFrame(
-                    {col: [] for col in _BAR_SCHEMA}, schema=_BAR_SCHEMA
-                )
+                return self._empty_bars()
 
             rows = []
             for a in aggs:
@@ -155,12 +145,12 @@ class PolygonDataProvider(MarketDataProvider):
                     }
                 )
 
-            df = pl.DataFrame(rows, schema=_BAR_SCHEMA)
+            df = pl.DataFrame(rows, schema=self._BAR_SCHEMA)
             return df
 
         except Exception as e:
             logger.error("Polygon get_historical_bars failed for %s: %s", symbol, e)
-            return pl.DataFrame({col: [] for col in _BAR_SCHEMA}, schema=_BAR_SCHEMA)
+            return self._empty_bars()
 
     def subscribe(self, symbols: List[str], callback: Callable) -> None:
         """
@@ -172,6 +162,10 @@ class PolygonDataProvider(MarketDataProvider):
         """
         self._symbols = symbols
         self._callback = callback
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = asyncio.get_event_loop()
 
         self._ws = WebSocketClient(
             api_key=self._api_key,
@@ -189,24 +183,15 @@ class PolygonDataProvider(MarketDataProvider):
         if self._ws is None or self._callback is None:
             raise RuntimeError("Call subscribe() before run_stream().")
 
-        import asyncio
-
-        async def _dispatch(msgs: List[WebSocketMessage]) -> None:
-            for msg in msgs:
-                bar = self._convert_agg(msg)
-                if bar is not None:
-                    await self._callback(bar)
-
-        # Polygon's WebSocketClient.run() expects a sync handler;
-        # bridge to our async callback with asyncio.run().
         def _sync_handler(msgs: List[WebSocketMessage]) -> None:
             for msg in msgs:
                 bar = self._convert_agg(msg)
                 if bar is not None:
-                    try:
-                        loop = asyncio.get_running_loop()
-                        loop.create_task(self._callback(bar))
-                    except RuntimeError:
+                    if self._loop is not None and self._loop.is_running():
+                        asyncio.run_coroutine_threadsafe(
+                            self._callback(bar), self._loop
+                        )
+                    else:
                         asyncio.run(self._callback(bar))
 
         self._ws.run(handle_msg=_sync_handler)
