@@ -41,15 +41,19 @@ class FeaturePipeline:
         self.feature_generators = feature_generators
         self.target_generator = target_generator
 
-    def run(self, df: pl.DataFrame) -> pl.DataFrame:
+    def run(
+        self, df: pl.DataFrame, feature_cols: Optional[List[str]] = None
+    ) -> pl.DataFrame:
         for gen in self.feature_generators:
             df = gen.generate(df)
         if self.target_generator:
             df = self.target_generator.generate(df)
-        return self.clean_data(df)
+        return self.clean_data(df, feature_cols=feature_cols)
 
     @staticmethod
-    def clean_data(df: pl.DataFrame) -> pl.DataFrame:
+    def clean_data(
+        df: pl.DataFrame, feature_cols: Optional[List[str]] = None
+    ) -> pl.DataFrame:
         float_cols = [
             col for col, dtype in df.schema.items() if dtype in (pl.Float64, pl.Float32)
         ]
@@ -58,7 +62,8 @@ class FeaturePipeline:
                 pl.when(pl.col(c).is_nan()).then(None).otherwise(pl.col(c)).alias(c)
                 for c in float_cols
             )
-        return df.drop_nulls()
+        subset = [c for c in feature_cols if c in df.columns] if feature_cols else None
+        return df.drop_nulls(subset=subset) if subset else df.drop_nulls()
 
 
 def main() -> None:

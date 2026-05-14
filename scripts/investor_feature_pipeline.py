@@ -86,7 +86,7 @@ _REVENUE_COL: str = "Total Revenue"
 # Target helper
 # ─────────────────────────────────────────────────────────────────────
 
-def _top_quintile_label(series: pd.Series) -> pd.Series:
+def _top_k_label(series: pd.Series) -> pd.Series:
     """
     Cross-sectional top-quintile classifier for a single date group.
 
@@ -230,31 +230,31 @@ def main(argv: list[str] | None = None) -> None:
 
     # Cross-sectional target: 1 if top quintile on that date, 0 otherwise.
     # Groups by date — each daily slice contains one row per symbol.
-    # _top_quintile_label handles edge cases (ties, small groups).
-    df["target_top_quintile"] = (
+    # _top_k_label handles edge cases (ties, small groups).
+    df["target_top_k"] = (
         df.groupby("date")["forward_return_60d"]
-        .transform(_top_quintile_label)
+        .transform(_top_k_label)
     )
 
-    n_target = df["target_top_quintile"].notna().sum()
-    n_positive = (df["target_top_quintile"] == 1).sum()
+    n_target = df["target_top_k"].notna().sum()
+    n_positive = (df["target_top_k"] == 1).sum()
     logger.info(
-        "  target_top_quintile: %d labelled rows | positive rate: %.1f%%",
+        "  target_top_k: %d labelled rows | positive rate: %.1f%%",
         n_target,
         n_positive / n_target * 100 if n_target > 0 else 0,
     )
 
     # ── Embargo handling ─────────────────────────────────────────────
-    # Rows where target_top_quintile is NaN are the final ~60 trading
+    # Rows where target_top_k is NaN are the final ~60 trading
     # days where we cannot compute the forward return.
     #   Training mode  : drop them (no usable label).
     #   Inference mode : KEEP them — today's row lives here and is the
     #                    row the orchestrator will predict on.  The
-    #                    forward_return_60d / target_top_quintile columns
+    #                    forward_return_60d / target_top_k columns
     #                    will simply be NaN for those rows; downstream
     #                    inference excludes them as features anyway.
     if inference_mode:
-        n_embargo = int(df["target_top_quintile"].isna().sum())
+        n_embargo = int(df["target_top_k"].isna().sum())
         logger.info(
             "\nInference mode — retaining %d embargo rows (NaN target). "
             "Total rows: %d.",
@@ -262,7 +262,7 @@ def main(argv: list[str] | None = None) -> None:
         )
     else:
         pre_drop = len(df)
-        df = df.dropna(subset=["target_top_quintile"])
+        df = df.dropna(subset=["target_top_k"])
         logger.info(
             "\nDropped %d embargo rows (NaN target). Remaining: %d rows.",
             pre_drop - len(df), len(df),
@@ -271,8 +271,8 @@ def main(argv: list[str] | None = None) -> None:
     # ── Label distribution audit (training only — meaningless on NaN) ─
     if not inference_mode:
         total = len(df)
-        pos = int((df["target_top_quintile"] == 1).sum())
-        neg = int((df["target_top_quintile"] == 0).sum())
+        pos = int((df["target_top_k"] == 1).sum())
+        neg = int((df["target_top_k"] == 0).sum())
         logger.info(
             "Target distribution — positive (Q5): %d (%.1f%%) | "
             "negative: %d (%.1f%%)",
@@ -282,7 +282,7 @@ def main(argv: list[str] | None = None) -> None:
 
         logger.info("Per-symbol positive rate:")
         for sym, grp in df.groupby("symbol"):
-            rate = (grp["target_top_quintile"] == 1).mean() * 100
+            rate = (grp["target_top_k"] == 1).mean() * 100
             logger.info("  %-6s  %.1f%%", sym, rate)
     else:
         # In inference mode, log the most recent observation date so

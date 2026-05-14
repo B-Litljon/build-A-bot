@@ -356,9 +356,9 @@ def execute_rebalance(
         logger.info("Open positions: (none)")
 
     # ── Stage 4a — Liquidate positions outside top-K ────────────────
-    to_liquidate = [s for s in current_positions if s not in top_k]
+    to_liquidate = [s for s in current_positions if s not in top_k and s in UNIVERSE]
     logger.info(
-        "Positions to liquidate (not in top-%d): %s",
+        "Positions to liquidate (not in top-%d and in UNIVERSE): %s",
         TOP_K, to_liquidate or "(none)",
     )
 

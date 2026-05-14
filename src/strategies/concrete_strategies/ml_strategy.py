@@ -20,13 +20,13 @@ Usage:
 import json
 import logging
 import os
+import threading
 import warnings
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import polars as pl
-import pandas as pd
 
 warnings.filterwarnings("ignore", message=".*join_asof.*")
 
@@ -75,6 +75,7 @@ class MLStrategy(BaseStrategy):
     ):
         super().__init__(**kwargs)
 
+        self._reload_lock = threading.Lock()
         self.timeframe = 1  # 1-minute bars
         self.warmup = warmup_period
         self.angel_threshold = angel_threshold
@@ -160,6 +161,14 @@ class MLStrategy(BaseStrategy):
             "bar_lower_wick_pct",
         ]
 
+        # Feature schema validation (Fix 2.6)
+        model_features = self.angel_trainer.feature_names_in_
+        if model_features is not None and list(model_features) != self.feature_names:
+            raise RuntimeError(
+                f"Feature schema drift detected: strategy features {self.feature_names} "
+                f"do not match angel model features {list(model_features)}"
+            )
+
         # Override devil_threshold with the value persisted by the retrainer
         # (models/threshold.json).  Must be called AFTER self.devil_threshold is
         # set above so _load_threshold() can use it as a fallback.
@@ -232,12 +241,13 @@ class MLStrategy(BaseStrategy):
                         f"[HOT-RELOAD] Detected new Angel model: {self.angel_path}"
                     )
                     try:
-                        self.angel_trainer.load(str(self.angel_path))
-                        if hasattr(self.angel_trainer, "model") and hasattr(
-                            self.angel_trainer.model, "n_jobs"
-                        ):
-                            self.angel_trainer.model.n_jobs = 1
-                        self.angel_mtime = current_angel_mtime
+                        with self._reload_lock:
+                            self.angel_trainer.load(str(self.angel_path))
+                            if hasattr(self.angel_trainer, "model") and hasattr(
+                                self.angel_trainer.model, "n_jobs"
+                            ):
+                                self.angel_trainer.model.n_jobs = 1
+                            self.angel_mtime = current_angel_mtime
                         logger.info(f"[HOT-RELOAD] Angel model updated successfully")
                         reloaded = True
                     except Exception as e:
@@ -347,10 +357,8 @@ class MLStrategy(BaseStrategy):
             # STAGE 2: THE DEVIL (CONVICTION)
             # ═══════════════════════════════════════════════════════════
             # Build meta-feature set: original features + Angel's probability
-            meta_features = pd.DataFrame(
-                latest_features_df.to_numpy(), columns=self.feature_names
-            )
-            meta_features["angel_prob"] = angel_prob
+            angel_prob_col = np.array([[angel_prob]])
+            meta_features = np.hstack([latest_features, angel_prob_col])
 
             devil_prob = self.devil_trainer.predict_proba(meta_features)[0, 1]
 
@@ -407,11 +415,7 @@ class MLStrategy(BaseStrategy):
         """
         try:
             # Use imported FeaturePipeline.run()
-            features_df = self.pipeline.run(df)
-
-            # Handle NaN values that may exist in warmup period
-            feature_cols = [c for c in features_df.columns if c in self.feature_names]
-            features_df = features_df.drop_nulls(subset=feature_cols)
+            features_df = self.pipeline.run(df, feature_cols=self.feature_names)
 
             return features_df
 
