@@ -1573,11 +1573,12 @@ class LiveOrchestrator:
             )
 
             # ----------------------------------------------------------------
-            # Fill -> IN_TRADE
+            # Fill -> IN_TRADE (BUY entry) or COOLING (terminal SELL)
             # ----------------------------------------------------------------
             if event_type in ("fill", "partial_fill"):
+                order_side: str = str(getattr(order, "side", "")).upper()
                 async with ctx.lock:
-                    if ctx.state == SymbolState.PENDING:
+                    if order_side == "BUY" and ctx.state == SymbolState.PENDING:
                         ctx.state = SymbolState.IN_TRADE
                         ctx.entry_price = float(
                             getattr(order, "filled_avg_price", 0.0) or 0.0
@@ -1595,6 +1596,21 @@ class LiveOrchestrator:
                             f"Qty: {ctx.entry_qty:.4f}",
                             "success",
                         )
+                    elif (
+                        order_side == "SELL"
+                        and event_type == "fill"
+                        and ctx.state in (SymbolState.IN_TRADE, SymbolState.PENDING_EXIT)
+                    ):
+                        # Terminal SELL fill (bracket TP/SL hit or watchdog
+                        # exit). partial_fill is intentionally excluded so a
+                        # partial sell does not drop us into COOLING while the
+                        # remaining qty is still working at the broker.
+                        await self._enter_cooling(ctx)
+                    elif order_side == "SELL" and event_type == "partial_fill":
+                        logger.info(
+                            "[%s] Partial SELL fill — awaiting terminal fill",
+                            symbol,
+                        )
 
             # ----------------------------------------------------------------
             # Cancel / Expire / Reject -> FLAT
@@ -1611,25 +1627,15 @@ class LiveOrchestrator:
                         ctx.entry_qty = None
                         ctx.sl_price = None
                         ctx.tp_price = None
+                        # Clear so a same-bar retry signal isn't silently
+                        # dropped by the dedup gate in _handle_signal.
+                        ctx.last_client_order_id = None
                         logger.info(
                             "[%s] State -> FLAT | reason=%s",
                             symbol,
                             event_type,
                         )
                         self._log_activity(symbol, f"Order {event_type}", "warning")
-
-            # ----------------------------------------------------------------
-            # Bracket TP/SL hit (equity) or watchdog exit fill (crypto)
-            # — SELL fill while IN_TRADE or PENDING_EXIT -> COOLING
-            # ----------------------------------------------------------------
-            elif event_type == "fill":
-                order_side: str = str(getattr(order, "side", "")).upper()
-                async with ctx.lock:
-                    if (
-                        ctx.state in (SymbolState.IN_TRADE, SymbolState.PENDING_EXIT)
-                        and order_side == "SELL"
-                    ):
-                        await self._enter_cooling(ctx)
 
         except Exception as exc:
             logger.error("Error in _on_trade_update: %s", exc, exc_info=True)
