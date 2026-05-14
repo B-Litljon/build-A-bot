@@ -69,6 +69,7 @@ from collections import deque
 
 import warnings
 
+import numpy as np
 import polars as pl
 from dotenv import load_dotenv
 
@@ -1199,13 +1200,11 @@ class LiveOrchestrator:
             # Stage 2 — The Devil (conviction, high precision)
             # Meta-feature: original features + angel_prob appended
             # ----------------------------------------------------------------
-            import pandas as pd  # local import — pandas only needed here
-
-            meta_df = pd.DataFrame(feature_matrix, columns=ml_feature_names)
-            meta_df["angel_prob"] = angel_prob
+            angel_prob_col = np.array([[angel_prob]])
+            meta_features = np.hstack([feature_matrix, angel_prob_col])
 
             devil_prob: float = float(
-                self._strategy.devil_model.predict_proba(meta_df)[0, 1]
+                self._strategy.devil_model.predict_proba(meta_features)[0, 1]
             )
 
             if devil_prob < self._devil_threshold:
