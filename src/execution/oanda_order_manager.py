@@ -16,6 +16,7 @@ consumers, and watchdog wiring live in separate modules.
 
 import logging
 import os
+import threading
 from typing import Dict, Optional
 
 import oandapyV20
@@ -70,6 +71,7 @@ class OandaOrderManager:
             environment=environment,
         )
 
+        self._state_lock = threading.RLock()
         self._net_positions: Dict[str, int] = {}
         self._avg_entry_prices: Dict[str, float] = {}
 
@@ -81,11 +83,13 @@ class OandaOrderManager:
 
     def get_net_position(self, instrument: str) -> int:
         """Signed net units (positive=long, negative=short, 0=flat)."""
-        return self._net_positions.get(_to_oanda_symbol(instrument), 0)
+        with self._state_lock:
+            return self._net_positions.get(_to_oanda_symbol(instrument), 0)
 
     def get_average_entry_price(self, instrument: str) -> float:
         """Broker-reported average entry price; 0.0 when flat."""
-        return self._avg_entry_prices.get(_to_oanda_symbol(instrument), 0.0)
+        with self._state_lock:
+            return self._avg_entry_prices.get(_to_oanda_symbol(instrument), 0.0)
 
     # ── broker sync ───────────────────────────────────────────────────
 
@@ -112,26 +116,27 @@ class OandaOrderManager:
             long_units = int(float(long_side.get("units", "0") or "0"))
             short_units = int(float(short_side.get("units", "0") or "0"))
 
-            if long_units > 0:
-                self._net_positions[oanda_symbol] = long_units
-                self._avg_entry_prices[oanda_symbol] = float(
-                    long_side.get("averagePrice", "0") or "0"
-                )
-            elif short_units < 0:
-                self._net_positions[oanda_symbol] = short_units
-                self._avg_entry_prices[oanda_symbol] = float(
-                    short_side.get("averagePrice", "0") or "0"
-                )
-            else:
-                self._net_positions[oanda_symbol] = 0
-                self._avg_entry_prices[oanda_symbol] = 0.0
+            with self._state_lock:
+                if long_units > 0:
+                    self._net_positions[oanda_symbol] = long_units
+                    self._avg_entry_prices[oanda_symbol] = float(
+                        long_side.get("averagePrice", "0") or "0"
+                    )
+                elif short_units < 0:
+                    self._net_positions[oanda_symbol] = short_units
+                    self._avg_entry_prices[oanda_symbol] = float(
+                        short_side.get("averagePrice", "0") or "0"
+                    )
+                else:
+                    self._net_positions[oanda_symbol] = 0
+                    self._avg_entry_prices[oanda_symbol] = 0.0
 
-            logger.info(
-                "[%s] OandaOrderManager sync | net=%d | avg=%.5f",
-                oanda_symbol,
-                self._net_positions[oanda_symbol],
-                self._avg_entry_prices[oanda_symbol],
-            )
+                logger.info(
+                    "[%s] OandaOrderManager sync | net=%d | avg=%.5f",
+                    oanda_symbol,
+                    self._net_positions[oanda_symbol],
+                    self._avg_entry_prices[oanda_symbol],
+                )
         except Exception as e:
             logger.error(
                 "[%s] OandaOrderManager.sync_position failed: %s",
@@ -158,7 +163,9 @@ class OandaOrderManager:
         endpoint accepts the string fine.
         """
         oanda_symbol = _to_oanda_symbol(instrument)
-        net = self._net_positions.get(oanda_symbol, 0)
+        with self._state_lock:
+            net = self._net_positions.get(oanda_symbol, 0)
+
         if net == 0:
             logger.info(
                 "[%s] OandaOrderManager.close_position: already flat — no-op.",
@@ -178,14 +185,33 @@ class OandaOrderManager:
                 data=data,
             )
             self._client.request(req)
+            resp = req.response
 
-            logger.info(
-                "[%s] OandaOrderManager: flattened net position (was %d units).",
-                oanda_symbol,
-                net,
-            )
-            self._net_positions[oanda_symbol] = 0
-            self._avg_entry_prices[oanda_symbol] = 0.0
+            # ── Fix 1.7: Parse actual filled units ────────────────────
+            # OANDA returns 'longOrderFillTransaction' or 'shortOrderFillTransaction'
+            # containing 'units' as a signed string (e.g. "-100" for a sell).
+            fill_l = resp.get("longOrderFillTransaction", {}) or {}
+            fill_s = resp.get("shortOrderFillTransaction", {}) or {}
+
+            units_l = int(fill_l.get("units", "0"))
+            units_s = int(fill_s.get("units", "0"))
+            total_filled = units_l + units_s
+
+            with self._state_lock:
+                prev_net = self._net_positions.get(oanda_symbol, 0)
+                self._net_positions[oanda_symbol] = prev_net + total_filled
+
+                if self._net_positions[oanda_symbol] == 0:
+                    self._avg_entry_prices[oanda_symbol] = 0.0
+
+                logger.info(
+                    "[%s] OandaOrderManager close | fill=%d | net: %d -> %d",
+                    oanda_symbol,
+                    total_filled,
+                    prev_net,
+                    self._net_positions[oanda_symbol],
+                )
+
             return True
 
         except Exception as e:
