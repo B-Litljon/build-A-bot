@@ -20,6 +20,7 @@ import threading
 from typing import Dict, Optional
 
 import oandapyV20
+import oandapyV20.endpoints.orders as v20_orders
 import oandapyV20.endpoints.positions as v20_positions
 
 logger = logging.getLogger(__name__)
@@ -223,3 +224,146 @@ class OandaOrderManager:
                 exc_info=True,
             )
             return False
+
+    # ── target-position entry / reversal ───────────────────────────────
+
+    def submit_target_position(self, symbol: str, target_units: int) -> dict:
+        """
+        Atomically move the net position for *symbol* to *target_units*
+        via a single OANDA v20 market order.
+
+        Parameters
+        ----------
+        symbol : str
+            Instrument identifier (e.g. ``'EUR/USD'``).
+        target_units : int
+            Signed net target (>0 long, <0 short, 0 flat).
+
+        Returns
+        -------
+        dict
+            ``{'filled': int, 'avg_price': float, 'closed_units': int,
+            'opened_units': int}``
+        """
+        oanda_symbol = _to_oanda_symbol(symbol)
+
+        with self._state_lock:
+            current_net = self.get_net_position(symbol)
+
+        delta = target_units - current_net
+
+        if delta == 0:
+            return {
+                "filled": 0,
+                "avg_price": 0.0,
+                "closed_units": 0,
+                "opened_units": 0,
+            }
+
+        try:
+            order_data = {
+                "order": {
+                    "type": "MARKET",
+                    "instrument": oanda_symbol,
+                    "units": str(delta),
+                }
+            }
+
+            req = v20_orders.OrderCreate(
+                accountID=self._account_id,
+                data=order_data,
+            )
+            self._client.request(req)
+            resp = req.response
+
+            fill_tx = resp.get("orderFillTransaction", {}) or {}
+            if not fill_tx:
+                logger.error(
+                    "[%s] submit_target_position: no orderFillTransaction in response",
+                    oanda_symbol,
+                )
+                return {
+                    "filled": 0,
+                    "avg_price": 0.0,
+                    "closed_units": 0,
+                    "opened_units": 0,
+                }
+
+            fill_units = int(fill_tx.get("units", "0"))
+            fill_price = float(fill_tx.get("price", "0") or "0")
+
+            trades_closed = fill_tx.get("tradesClosed", []) or []
+            trade_opened = fill_tx.get("tradeOpened") or {}
+
+            closed_units = sum(
+                abs(int(t.get("units", "0"))) for t in trades_closed
+            )
+            opened_units = (
+                abs(int(trade_opened.get("units", "0")))
+                if trade_opened
+                else 0
+            )
+            total_filled = abs(fill_units)
+
+            with self._state_lock:
+                old_net = self._net_positions.get(oanda_symbol, 0)
+                old_avg = self._avg_entry_prices.get(oanda_symbol, 0.0)
+                new_net = old_net + fill_units
+
+                self._net_positions[oanda_symbol] = new_net
+
+                if new_net == 0:
+                    self._avg_entry_prices[oanda_symbol] = 0.0
+                elif old_net != 0 and (old_net > 0) == (new_net > 0):
+                    # Same direction — add or reduce.
+                    if abs(new_net) > abs(old_net):
+                        # Adding: blend old avg with opened-leg price.
+                        opened_price = float(
+                            trade_opened.get("price", fill_price)
+                            or fill_price
+                        ) if trade_opened else fill_price
+                        added = abs(new_net) - abs(old_net)
+                        self._avg_entry_prices[oanda_symbol] = (
+                            abs(old_net) * old_avg + added * opened_price
+                        ) / abs(new_net)
+                    # else: reduction — keep old avg.
+                else:
+                    # Fresh open or reversal — opened leg is the whole position.
+                    opened_price = float(
+                        trade_opened.get("price", fill_price)
+                        or fill_price
+                    ) if trade_opened else fill_price
+                    self._avg_entry_prices[oanda_symbol] = opened_price
+
+            logger.info(
+                "[%s] submit_target_position | target=%d delta=%d "
+                "fill_price=%.5f resulting_net=%d",
+                oanda_symbol,
+                target_units,
+                delta,
+                fill_price,
+                new_net,
+            )
+
+            return {
+                "filled": total_filled,
+                "avg_price": fill_price,
+                "closed_units": closed_units,
+                "opened_units": opened_units,
+            }
+
+        except Exception as e:
+            logger.error(
+                "[%s] submit_target_position failed (target=%d delta=%d): %s",
+                oanda_symbol,
+                target_units,
+                delta,
+                e,
+                exc_info=True,
+            )
+            return {
+                "filled": 0,
+                "avg_price": 0.0,
+                "closed_units": 0,
+                "opened_units": 0,
+            }
