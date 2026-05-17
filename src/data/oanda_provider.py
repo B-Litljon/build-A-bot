@@ -111,6 +111,7 @@ class OandaMarketProvider(MarketDataProvider):
 
         # Streaming state — populated by subscribe()
         self._callback: Optional[Callable] = None
+        self._tick_callback: Optional[Callable] = None
         self._symbols: List[str] = []
         self._stop_event = threading.Event()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -150,6 +151,19 @@ class OandaMarketProvider(MarketDataProvider):
 
             bid = float(bids[0]["price"])
             ask = float(asks[0]["price"])
+
+            # Raw tick hook — callee must return in <50 µs and do NO blocking I/O
+            if self._tick_callback is not None:
+                try:
+                    self._tick_callback(instrument, bid, ask)
+                except Exception as e:
+                    logger.error(
+                        "OandaMarketProvider tick_callback error for %s: %s",
+                        instrument,
+                        e,
+                        exc_info=True,
+                    )
+
             mid = (bid + ask) / 2.0
 
             bar_epoch = int(ts.timestamp()) // (self._stream_gran * 60)
@@ -285,15 +299,29 @@ class OandaMarketProvider(MarketDataProvider):
 
         return pl.DataFrame(rows, schema=self._BAR_SCHEMA)
 
-    def subscribe(self, symbols: List[str], callback: Callable) -> None:
+    def subscribe(
+        self,
+        symbols: List[str],
+        callback: Callable,
+        tick_callback: Optional[Callable] = None,
+    ) -> None:
         """
         Register *callback* for real-time bar updates.
 
         Ticks are aggregated into fixed-duration bars (``stream_granularity_minutes``).
         Non-blocking — call :meth:`run_stream` to start receiving data.
+
+        Parameters
+        ----------
+        tick_callback : callable, optional
+            Invoked synchronously on every raw tick as
+            ``tick_callback(symbol, bid, ask)``.  Must return in <50 µs and
+            perform **no blocking I/O**; any exception is logged and the
+            stream continues.
         """
         self._symbols = [_to_oanda_symbol(s) for s in symbols]
         self._callback = callback
+        self._tick_callback = tick_callback
         self._tick_bars = {}
         try:
             self._loop = asyncio.get_running_loop()
