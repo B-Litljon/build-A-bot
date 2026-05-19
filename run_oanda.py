@@ -20,6 +20,10 @@ import os
 import sys
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 # ---------------------------------------------------------------------------
 # Path bootstrap — must happen before ANY src/ imports.
 # ---------------------------------------------------------------------------

@@ -271,13 +271,16 @@ class V3HTFFeatures(BaseFeatureGenerator):
         df_sorted = df.sort(["symbol", "timestamp"] if has_symbol else "timestamp")
 
         if has_symbol:
-            df_sorted = df_sorted.join_asof(
-                htf_features,
-                left_on="timestamp",
-                right_on="available_at",
-                by="symbol",
-                strategy="backward",
-            )
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                df_sorted = df_sorted.join_asof(
+                    htf_features,
+                    left_on="timestamp",
+                    right_on="available_at",
+                    by="symbol",
+                    strategy="backward",
+                )
         else:
             df_sorted = df_sorted.join_asof(
                 htf_features,

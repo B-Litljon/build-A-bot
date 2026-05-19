@@ -385,9 +385,7 @@ class OandaScalperOrchestrator:
 
         # Run the blocking pricing stream in a thread-pool executor
         self._stream_task = asyncio.create_task(
-            asyncio.get_running_loop().run_in_executor(
-                None, self._provider.run_stream
-            )
+            asyncio.to_thread(self._provider.run_stream)
         )
 
         logger.info(
