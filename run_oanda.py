@@ -39,7 +39,7 @@ from execution.oanda_order_manager import OandaOrderManager  # noqa: E402
 from execution.oanda_scalper_orchestrator import (  # noqa: E402
     OandaScalperOrchestrator,
 )
-from execution.risk_manager import RiskManager  # noqa: E402
+from execution.risk_manager import RiskManager, RiskProfile  # noqa: E402
 from strategies.concrete_strategies.ml_strategy import MLStrategy  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -107,7 +107,11 @@ async def _main() -> None:
     provider = OandaMarketProvider(environment=args.env)
     order_manager = OandaOrderManager(environment=args.env)
     strategy = MLStrategy()
-    risk_manager = RiskManager()
+    
+    # Forex volatility is a fraction of Equities. Override the 0.15% equity floor
+    # to 0.002% (~2.3 pips on EUR/USD) so the chop filter doesn't reject everything.
+    risk_profile = RiskProfile(min_sl_pct=0.00002)
+    risk_manager = RiskManager(profile=risk_profile)
 
     orchestrator = OandaScalperOrchestrator(
         symbols=symbols,

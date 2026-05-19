@@ -51,6 +51,7 @@ class RiskManager:
         crypto available funds in the cash field, not buying_power).
         Returns 0.0 if the resulting notional is below the $50 zombie-trade floor.
         """
+        # 05192026: shouldn't apply to forex trades
         risk_dollars = equity * self.profile.risk_per_trade
         risk_per_share = entry_price - sl_price
 
