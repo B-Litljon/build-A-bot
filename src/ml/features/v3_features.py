@@ -163,7 +163,7 @@ class V3HTFFeatures(BaseFeatureGenerator):
         if has_symbol:
             htf_bars = (
                 df.sort(["symbol", "timestamp"])
-                .group_by_dynamic("timestamp", every=self.timeframe, by="symbol")
+                .group_by_dynamic("timestamp", every=self.timeframe, group_by="symbol")
                 .agg(
                     pl.col("open").first().alias("htf_open"),
                     pl.col("high").max().alias("htf_high"),
