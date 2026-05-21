@@ -11,6 +11,7 @@ class RiskProfile:
     min_sl_pct: float = 0.0015  # 0.15% absolute floor
     risk_per_trade: float = 0.02 # 2% of account
     max_notional_cap: float = 100000.0
+    round_precision: int = 4
 
 class RiskManager:
     """
@@ -33,7 +34,7 @@ class RiskManager:
         if sl_dist < (entry_price * self.profile.min_sl_pct):
             return None
 
-        return round(sl_dist, 4), round(tp_dist, 4)
+        return round(sl_dist, self.profile.round_precision), round(tp_dist, self.profile.round_precision)
 
     def calculate_quantity(
         self,

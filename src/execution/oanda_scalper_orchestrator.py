@@ -362,6 +362,38 @@ class OandaScalperOrchestrator:
                 self._last_hist_ts[norm_sym],
             )
 
+    async def _stream_with_retry(self) -> None:
+        """Run the pricing stream with reconnect-on-disconnect."""
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.to_thread(self._provider.run_stream)
+            except Exception as e:
+                logger.error("OandaMarketProvider stream disconnected: %s", e)
+            else:
+                if not self._shutdown_event.is_set():
+                    logger.warning(
+                        "Stream returned without shutdown signal; treating as disconnect"
+                    )
+
+            if self._shutdown_event.is_set():
+                break
+
+            logger.warning("Stream reconnect in 5s; re-priming history on resume")
+            await asyncio.sleep(5)
+
+            # Reset seam state so re-prime + new stream dedup cleanly
+            for sym in list(self._bar_buffers.keys()):
+                self._bar_buffers[sym] = []
+                self._last_hist_ts[sym] = None
+                self._seam_crossed[sym] = False
+
+            await self._prime_history()
+
+            # Defensive: clear provider stop event in case it was set
+            self._provider._stop_event.clear()
+
+            logger.info("Stream reconnect: priming complete, resuming stream")
+
     async def run(self) -> None:
         """Start the orchestrator loop."""
         self._loop = asyncio.get_running_loop()
@@ -383,10 +415,8 @@ class OandaScalperOrchestrator:
 
         await self._prime_history()
 
-        # Run the blocking pricing stream in a thread-pool executor
-        self._stream_task = asyncio.create_task(
-            asyncio.to_thread(self._provider.run_stream)
-        )
+        # Run the pricing stream with reconnect-on-disconnect wrapper
+        self._stream_task = asyncio.create_task(self._stream_with_retry())
 
         logger.info(
             "OandaScalperOrchestrator started | symbols=%s warmup=%d",

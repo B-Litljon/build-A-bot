@@ -354,8 +354,6 @@ class OandaMarketProvider(MarketDataProvider):
                     self._handle_tick(msg)
         except KeyboardInterrupt:
             logger.info("OandaMarketProvider stream stopped by user.")
-        except Exception as e:
-            logger.error("OandaMarketProvider stream error: %s", e)
 
     def stop_stream(self) -> None:
         """Signal the stream loop to exit and flush all in-flight bars."""

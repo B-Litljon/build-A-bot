@@ -109,8 +109,9 @@ async def _main() -> None:
     strategy = MLStrategy()
     
     # Forex volatility is a fraction of Equities. Override the 0.15% equity floor
-    # to 0.002% (~2.3 pips on EUR/USD) so the chop filter doesn't reject everything.
-    risk_profile = RiskProfile(min_sl_pct=0.00002)
+    # to 0.002% (~0.23 pips on EUR/USD) so the chop filter doesn't reject everything.
+    # Set round_precision=5 since Forex pairs are quoted to 5 decimal places natively.
+    risk_profile = RiskProfile(min_sl_pct=0.00002, round_precision=5)
     risk_manager = RiskManager(profile=risk_profile)
 
     orchestrator = OandaScalperOrchestrator(
