@@ -519,7 +519,7 @@ def engineer_features_and_labels(df: pl.DataFrame) -> Tuple[pl.DataFrame, List[s
     # CLEANUP: Drop NaN/null rows (uses FeaturePipeline.clean_data)
     # ═══════════════════════════════════════════════════════════════════
     initial_count = len(df)
-    df = FeaturePipeline.clean_data(df, feature_cols=FEATURE_COLS)
+    df = FeaturePipeline.clean_data(df, feature_cols=FEATURE_COLS + ["angel_target", "devil_target"])
     dropped_count = initial_count - len(df)
 
     logger.info(
