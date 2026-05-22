@@ -235,7 +235,7 @@ class OandaScalperOrchestrator:
         tp_price: Optional[float] = None
         if self._risk_manager is not None:
             bracket = self._risk_manager.calculate_bracket(
-                signal.entry_price, signal.raw_sl_distance
+                signal.entry_price, signal.raw_sl_distance, symbol=symbol
             )
             if bracket:
                 sl_dist, tp_dist = bracket

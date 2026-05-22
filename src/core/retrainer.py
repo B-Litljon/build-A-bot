@@ -49,6 +49,8 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import brier_score_loss
 from sklearn.model_selection import cross_val_predict, TimeSeriesSplit
 
+
+
 from src.data.timeframe import TimeFrame, TimeFrameUnit
 from src.data.enums import DataFeed
 from src.ml.feature_pipeline import FeaturePipeline
@@ -135,7 +137,7 @@ EV_THRESHOLD = 0.0005  # Min acceptable Expected Value
 PROFIT_FACTOR_THRESHOLD = 1.2  # Min acceptable Profit Factor
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# FEATURE COLUMNS (must match MLStrategy.feature_names and FeatureEngineer output)
+# FEATURE COLUMNS (must match MLStrategy.feature_names and FeaturePipeline output)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 FEATURE_COLS: List[str] = [
@@ -417,10 +419,10 @@ def engineer_features_and_labels(df: pl.DataFrame) -> Tuple[pl.DataFrame, List[s
     """
     Engineer technical features and generate ATR-dynamic target labels.
 
-    Delegates feature computation to FeatureEngineer.compute_indicators() to
+    Delegates feature computation to FeaturePipeline to
     guarantee zero training/inference skew with the production MLStrategy.
 
-    Features (produced by FeatureEngineer, matches MLStrategy.feature_names):
+    Features (produced by FeaturePipeline, matches MLStrategy.feature_names):
         rsi_14, ppo, natr_14, bb_pct_b, bb_width_pct,
         price_sma50_ratio, log_return, hour_of_day, dist_sma50, vol_rel
 
@@ -440,7 +442,7 @@ def engineer_features_and_labels(df: pl.DataFrame) -> Tuple[pl.DataFrame, List[s
     logger.info("=" * 70)
 
     # ═══════════════════════════════════════════════════════════════════
-    # TECHNICAL INDICATORS via FeatureEngineer (prevents training/inference skew)
+    # TECHNICAL INDICATORS via FeaturePipeline (prevents training/inference skew)
     # ═══════════════════════════════════════════════════════════════════
     logger.info("Computing indicators via FeaturePipeline (zero-skew pipeline)...")
     pipeline = FeaturePipeline(
@@ -517,7 +519,7 @@ def engineer_features_and_labels(df: pl.DataFrame) -> Tuple[pl.DataFrame, List[s
     # CLEANUP: Drop NaN/null rows (uses FeaturePipeline.clean_data)
     # ═══════════════════════════════════════════════════════════════════
     initial_count = len(df)
-    df = FeaturePipeline.clean_data(df)
+    df = FeaturePipeline.clean_data(df, feature_cols=FEATURE_COLS)
     dropped_count = initial_count - len(df)
 
     logger.info(
@@ -615,7 +617,8 @@ def refit_models(
     # ═══════════════════════════════════════════════════════════════════
     logger.info("\n[Step 1/4] Training Angel model (Direction)...")
     angel_model = RandomForestClassifier(**ANGEL_PARAMS)
-    angel_model.fit(X_base, y_angel, sample_weight=sample_weights)
+    df_base = pl.DataFrame(X_base, schema=feature_cols)
+    angel_model.fit(df_base, y_angel, sample_weight=sample_weights)
     logger.info(f"✓ Angel model trained on {len(feature_cols)} features")
 
     # ═══════════════════════════════════════════════════════════════════
@@ -737,7 +740,8 @@ def refit_models(
     logger.info(f"Devil feature space: {devil_features}")
 
     devil_model = RandomForestClassifier(**DEVIL_PARAMS)
-    devil_model.fit(X_devil, y_devil_train, sample_weight=devil_weights)
+    df_devil = pl.DataFrame(X_devil, schema=devil_features)
+    devil_model.fit(df_devil, y_devil_train, sample_weight=devil_weights)
     logger.info(
         f"✓ Devil model trained on {len(devil_features)} features "
         f"(Angel-approved subpopulation, n={n_approved:,})"
@@ -1015,15 +1019,14 @@ def validate_candidate(
             continue
 
         # Stage 2: Devil inference on Angel-proposed rows
-        import pandas as pd  # noqa: PLC0415 — used only for sklearn compat
-
         proposed_base_feats = X_val_base[signal_mask]
         proposed_angel_probs = angel_probs_val[signal_mask]
         proposed_devil_targets = y_val_devil[signal_mask]  # survival — for Brier
         proposed_devil_targets_macro = y_val_devil_macro[signal_mask]  # macro — for EV
 
-        meta_df = pd.DataFrame(proposed_base_feats, columns=feature_cols)
-        meta_df["angel_prob"] = proposed_angel_probs
+        meta_df = pl.DataFrame(proposed_base_feats, schema=feature_cols).with_columns(
+            pl.Series("angel_prob", proposed_angel_probs)
+        )
 
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")

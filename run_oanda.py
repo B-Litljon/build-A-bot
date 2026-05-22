@@ -124,10 +124,10 @@ async def _main() -> None:
         warmup_period=warmup_pd,
     )
     
-    # Forex volatility is a fraction of Equities. Override the 0.15% equity floor
-    # to 0.002% (~0.23 pips on EUR/USD) so the chop filter doesn't reject everything.
+    # Forex volatility is a fraction of Equities. Use a derived 2.0 pips stop-loss floor
+    # so the chop filter doesn't reject everything.
     # Set round_precision=5 since Forex pairs are quoted to 5 decimal places natively.
-    risk_profile = RiskProfile(min_sl_pct=0.00002, round_precision=5)
+    risk_profile = RiskProfile(min_sl_pips=2.0, round_precision=5)
     risk_manager = RiskManager(profile=risk_profile)
 
     orchestrator = OandaScalperOrchestrator(

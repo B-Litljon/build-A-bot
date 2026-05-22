@@ -326,7 +326,7 @@ class OandaMarketProvider(MarketDataProvider):
         try:
             self._loop = asyncio.get_running_loop()
         except RuntimeError:
-            self._loop = asyncio.get_event_loop()
+            self._loop = None
         logger.info("OandaMarketProvider: subscribed to %s", self._symbols)
 
     def run_stream(self) -> None:
