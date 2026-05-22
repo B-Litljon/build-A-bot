@@ -21,7 +21,8 @@ import joblib
 import numpy as np
 import polars as pl
 
-from src.ml.feature_pipeline import FeatureEngineer
+from src.ml.feature_pipeline import FeaturePipeline
+from src.ml.features.v3_features import V3BaseFeatures, V3HTFFeatures
 
 logging.basicConfig(
     level=logging.INFO,
@@ -122,8 +123,15 @@ def run_inference(
       - signals_df: rows that passed both thresholds, with angel_prob/devil_prob
       - featured_df: full feature-engineered DataFrame (for bracket simulation)
     """
-    fe = FeatureEngineer()
-    featured_df = fe.compute_indicators(df)
+    pipeline = FeaturePipeline(
+        feature_generators=[
+            V3BaseFeatures(),
+            V3HTFFeatures(timeframe="5m"),
+        ]
+    )
+    featured_df = df
+    for gen in pipeline.feature_generators:
+        featured_df = gen.generate(featured_df)
 
     # Feature lists come from the models themselves — guaranteed to match
     angel_features: List[str] = list(angel_model.feature_names_in_)

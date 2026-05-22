@@ -83,6 +83,12 @@ def _parse_args() -> argparse.Namespace:
         default=False,
         help="Headless mode (plain logging, no Rich UI)",
     )
+    parser.add_argument(
+        "--granularity",
+        type=int,
+        default=5,
+        help="Stream granularity/timeframe in minutes (default: 5)",
+    )
     return parser.parse_args()
 
 
@@ -104,9 +110,19 @@ async def _main() -> None:
         symbols = list(DEFAULT_SYMBOLS)
 
     # ── initialise components ──
-    provider = OandaMarketProvider(environment=args.env)
+    provider = OandaMarketProvider(
+        environment=args.env,
+        stream_granularity_minutes=args.granularity,
+    )
     order_manager = OandaOrderManager(environment=args.env)
-    strategy = MLStrategy()
+    
+    htf_tf = "30m" if args.granularity == 5 else "5m"
+    warmup_pd = 300 if args.granularity == 5 else 260
+    strategy = MLStrategy(
+        timeframe=args.granularity,
+        htf_timeframe=htf_tf,
+        warmup_period=warmup_pd,
+    )
     
     # Forex volatility is a fraction of Equities. Override the 0.15% equity floor
     # to 0.002% (~0.23 pips on EUR/USD) so the chop filter doesn't reject everything.

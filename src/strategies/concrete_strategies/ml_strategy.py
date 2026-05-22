@@ -68,7 +68,9 @@ class MLStrategy(BaseStrategy):
         devil_path: str | Path = "models/devil_latest.pkl",
         angel_threshold: float = 0.40,
         devil_threshold: float = 0.50,
-        warmup_period: int = 260,  # V3.3: expanded for 5m HTF SMA-50 warm-up
+        warmup_period: int = 260,  # default for 1m base / 5m HTF
+        timeframe: int = 1,
+        htf_timeframe: str = "5m",
         angel_trainer=None,
         devil_trainer=None,
         **kwargs,
@@ -76,7 +78,7 @@ class MLStrategy(BaseStrategy):
         super().__init__(**kwargs)
 
         self._reload_lock = threading.Lock()
-        self.timeframe = 1  # 1-minute bars
+        self.timeframe = timeframe
         self.warmup = warmup_period
         self.angel_threshold = angel_threshold
         self.devil_threshold = devil_threshold
@@ -133,7 +135,7 @@ class MLStrategy(BaseStrategy):
 
         # Initialize feature pipeline (imported, not duplicated!)
         self.pipeline = FeaturePipeline(
-            feature_generators=[V3BaseFeatures(), V3HTFFeatures(timeframe="5m")]
+            feature_generators=[V3BaseFeatures(), V3HTFFeatures(timeframe=htf_timeframe)]
         )
 
         # Feature columns (excluding absolute price columns to prevent leakage)

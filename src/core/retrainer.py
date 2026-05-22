@@ -51,7 +51,8 @@ from sklearn.model_selection import cross_val_predict, TimeSeriesSplit
 
 from src.data.timeframe import TimeFrame, TimeFrameUnit
 from src.data.enums import DataFeed
-from src.ml.feature_pipeline import FeatureEngineer
+from src.ml.feature_pipeline import FeaturePipeline
+from src.ml.features.v3_features import V3BaseFeatures, V3HTFFeatures
 from src.core.notification_manager import NotificationManager
 
 _ALPACA_TFU = {
@@ -441,8 +442,15 @@ def engineer_features_and_labels(df: pl.DataFrame) -> Tuple[pl.DataFrame, List[s
     # ═══════════════════════════════════════════════════════════════════
     # TECHNICAL INDICATORS via FeatureEngineer (prevents training/inference skew)
     # ═══════════════════════════════════════════════════════════════════
-    logger.info("Computing indicators via FeatureEngineer (zero-skew pipeline)...")
-    df = FeatureEngineer().compute_indicators(df)
+    logger.info("Computing indicators via FeaturePipeline (zero-skew pipeline)...")
+    pipeline = FeaturePipeline(
+        feature_generators=[
+            V3BaseFeatures(),
+            V3HTFFeatures(timeframe="5m"),
+        ]
+    )
+    for gen in pipeline.feature_generators:
+        df = gen.generate(df)
     logger.info(
         "Applied indicators: RSI, PPO, NATR, BBANDS, SMA50, log_return, "
         "hour_of_day, vol_rel"
@@ -506,10 +514,10 @@ def engineer_features_and_labels(df: pl.DataFrame) -> Tuple[pl.DataFrame, List[s
     )
 
     # ═══════════════════════════════════════════════════════════════════
-    # CLEANUP: Drop NaN/null rows (uses FeatureEngineer.clean_data)
+    # CLEANUP: Drop NaN/null rows (uses FeaturePipeline.clean_data)
     # ═══════════════════════════════════════════════════════════════════
     initial_count = len(df)
-    df = FeatureEngineer.clean_data(df)
+    df = FeaturePipeline.clean_data(df)
     dropped_count = initial_count - len(df)
 
     logger.info(

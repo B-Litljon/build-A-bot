@@ -22,7 +22,8 @@ import joblib
 import numpy as np
 import polars as pl
 
-from src.ml.feature_pipeline import FeatureEngineer
+from src.ml.feature_pipeline import FeaturePipeline
+from src.ml.features.v3_features import V3BaseFeatures, V3HTFFeatures
 from src.core.retrainer import fetch_training_data, get_alpaca_client
 
 logging.basicConfig(
@@ -136,8 +137,15 @@ def generate_signals(
                 pl.col("timestamp").dt.replace_time_zone("UTC")
             )
 
-    fe = FeatureEngineer()
-    featured_df = fe.compute_indicators(bars_df)
+    pipeline = FeaturePipeline(
+        feature_generators=[
+            V3BaseFeatures(),
+            V3HTFFeatures(timeframe="5m"),
+        ]
+    )
+    featured_df = bars_df
+    for gen in pipeline.feature_generators:
+        featured_df = gen.generate(featured_df)
 
     angel_features: List[str] = list(angel_model.feature_names_in_)
     featured_df = featured_df.drop_nulls(subset=angel_features)
