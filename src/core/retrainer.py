@@ -32,42 +32,23 @@ import os
 import sys
 import warnings
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 import joblib
 import numpy as np
 import polars as pl
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import (
-    TimeFrame as _AlpacaTimeFrame,
-    TimeFrameUnit as _AlpacaTimeFrameUnit,
-)
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import brier_score_loss
 from sklearn.model_selection import cross_val_predict, TimeSeriesSplit
 
-
-
-from src.data.timeframe import TimeFrame, TimeFrameUnit
-from src.data.enums import DataFeed
+from src.data.factory import get_market_provider
+from src.data.market_provider import MarketDataProvider
+from src.execution.risk_manager import RiskProfile
 from src.ml.feature_pipeline import FeaturePipeline
 from src.ml.features.v3_features import V3BaseFeatures, V3HTFFeatures
 from src.core.notification_manager import NotificationManager
-
-_ALPACA_TFU = {
-    TimeFrameUnit.MINUTE: _AlpacaTimeFrameUnit.Minute,
-    TimeFrameUnit.HOUR: _AlpacaTimeFrameUnit.Hour,
-    TimeFrameUnit.DAY: _AlpacaTimeFrameUnit.Day,
-    TimeFrameUnit.WEEK: _AlpacaTimeFrameUnit.Week,
-    TimeFrameUnit.MONTH: _AlpacaTimeFrameUnit.Month,
-}
-
-
-def _to_alpaca_timeframe(tf: TimeFrame) -> _AlpacaTimeFrame:
-    return _AlpacaTimeFrame(tf.amount, _ALPACA_TFU[tf.unit])
 
 logging.basicConfig(
     level=logging.INFO,
@@ -80,14 +61,38 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 DAYS_BACK = 60
-TICKERS: List[str] = ["TSLA", "NVDA", "MARA", "COIN", "SMCI"]
-TIMEFRAME = TimeFrame(1, TimeFrameUnit.MINUTE)
-DATA_FEED = DataFeed.IEX
+_DEFAULT_TICKERS_BY_CLASS = {
+    "forex": ["EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CAD"],
+    "equities": ["TSLA", "NVDA", "MARA", "COIN", "SMCI"],
+}
 
-# Model Paths
-MODEL_DIR = Path("models")
-ANGEL_PATH = MODEL_DIR / "angel_latest.pkl"
-DEVIL_PATH = MODEL_DIR / "devil_latest.pkl"
+def _asset_class_for_source(data_source: str) -> str:
+    if data_source == "oanda":
+        return "forex"
+    return "equities"
+
+def get_asset_config(data_source: str) -> dict:
+    """Get dynamic configurations for retraining based on the data source."""
+    asset_class = _asset_class_for_source(data_source)
+    profile = RiskProfile.for_asset_class(asset_class)
+    default_tickers = _DEFAULT_TICKERS_BY_CLASS[asset_class]
+    
+    if asset_class == "forex":
+        max_hold = 30
+        timeframe = 5
+    else:
+        max_hold = 45
+        timeframe = 1
+        
+    return {
+        "asset_class": asset_class,
+        "tickers": [t.strip() for t in os.getenv("RETRAIN_SYMBOLS", ",".join(default_tickers)).split(",") if t.strip()],
+        "sl_mult": profile.sl_atr_multiplier,
+        "tp_mult": profile.tp_atr_multiplier,
+        "max_hold": int(os.getenv("RETRAIN_MAX_HOLD", str(max_hold))),
+        "survival_bars": int(os.getenv("RETRAIN_SURVIVAL", "5")),
+        "timeframe_minutes": int(os.getenv("RETRAIN_TIMEFRAME_MINUTES", str(timeframe))),
+    }
 
 # Model Hyperparameters
 ANGEL_PARAMS = {
@@ -202,66 +207,53 @@ class ValidationReport:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def get_alpaca_client() -> StockHistoricalDataClient:
-    """Initialize Alpaca client from environment variables."""
-    api_key = os.getenv("ALPACA_API_KEY")
-    secret_key = os.getenv("ALPACA_SECRET_KEY")
-
-    if not api_key or not secret_key:
-        raise ValueError(
-            "ALPACA_API_KEY and ALPACA_SECRET_KEY environment variables must be set"
-        )
-
-    return StockHistoricalDataClient(api_key, secret_key)
-
-
 def fetch_training_data(
-    client: StockHistoricalDataClient,
+    provider: MarketDataProvider,
+    symbols: List[str],
     days_back: int = DAYS_BACK,
+    timeframe_minutes: int = 1,
 ) -> pl.DataFrame:
     """
-    Fetch historical 1-minute bars for training.
+    Fetch historical 1-minute bars for training using the unified provider.
 
     Args:
-        client: Alpaca API client
+        provider: MarketDataProvider instance
+        symbols: List of symbols to fetch
         days_back: Number of days to fetch (default: 60)
 
     Returns:
-        Polars DataFrame with OHLCV data for all tickers
+        Polars DataFrame with OHLCV data for all symbols
     """
     logger.info("=" * 70)
     logger.info("FETCHING TRAINING DATA")
     logger.info("=" * 70)
 
-    end_date = datetime.now()
+    # Use timezone-aware UTC datetime
+    end_date = datetime.now(timezone.utc)
     start_date = end_date - timedelta(days=days_back)
 
     logger.info(f"Date range: {start_date.date()} to {end_date.date()}")
-    logger.info(f"Tickers: {', '.join(TICKERS)}")
+    logger.info(f"Symbols: {', '.join(symbols)}")
     logger.info(f"Timeframe: 1-minute bars")
 
     all_frames: List[pl.DataFrame] = []
 
-    for ticker in TICKERS:
+    for ticker in symbols:
         try:
-            request = StockBarsRequest(
-                symbol_or_symbols=ticker,
-                timeframe=_to_alpaca_timeframe(TIMEFRAME),
+            # Fetch bars using generic provider
+            df = provider.get_historical_bars(
+                symbol=ticker,
+                timeframe_minutes=timeframe_minutes,
                 start=start_date,
                 end=end_date,
-                feed=DATA_FEED,
             )
 
-            bars = client.get_stock_bars(request)
-
-            if not bars.data or ticker not in bars.data:
+            if df is None or df.is_empty():
                 logger.warning(f"No data returned for {ticker}")
                 continue
 
-            # Convert to Polars
-            df_pandas = bars.df.reset_index()
-            df_pandas.columns = [col.lower() for col in df_pandas.columns]
-            df = pl.from_pandas(df_pandas)
+            # Ensure column names are lowercase
+            df.columns = [col.lower() for col in df.columns]
 
             # Add symbol column if not present
             if "symbol" not in df.columns:
@@ -275,9 +267,9 @@ def fetch_training_data(
             continue
 
     if not all_frames:
-        raise ValueError("No data fetched for any ticker")
+        raise ValueError("No data fetched for any symbol")
 
-    # Combine all tickers
+    # Combine all symbols
     combined = pl.concat(all_frames, how="vertical_relaxed")
     combined = combined.sort(["symbol", "timestamp"])
 
@@ -415,7 +407,13 @@ def _compute_devil_survival_target(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def engineer_features_and_labels(df: pl.DataFrame) -> Tuple[pl.DataFrame, List[str]]:
+def engineer_features_and_labels(
+    df: pl.DataFrame,
+    sl_mult: float = SL_ATR_MULTIPLIER,
+    tp_mult: float = TP_ATR_MULTIPLIER,
+    max_hold: int = MAX_HOLD_BARS,
+    survival_bars: int = SURVIVAL_BARS,
+) -> Tuple[pl.DataFrame, List[str]]:
     """
     Engineer technical features and generate ATR-dynamic target labels.
 
@@ -427,12 +425,16 @@ def engineer_features_and_labels(df: pl.DataFrame) -> Tuple[pl.DataFrame, List[s
         price_sma50_ratio, log_return, hour_of_day, dist_sma50, vol_rel
 
     Targets:
-        angel_target: 1 if close 3 bars ahead > close + 0.5 × ATR (ATR-relative)
-        devil_target: 1 if TP (3.0 × ATR) hit before SL (0.5 × ATR) in ≤45 bars
+        angel_target: 1 if close 3 bars ahead > close + sl_mult × ATR (ATR-relative)
+        devil_target: 1 if TP (tp_mult × ATR) hit before SL (sl_mult × ATR) in ≤max_hold bars
 
     Args:
         df: Raw OHLCV DataFrame with columns:
             open, high, low, close, volume, symbol, timestamp
+        sl_mult: Stop-loss ATR multiplier
+        tp_mult: Take-profit ATR multiplier
+        max_hold: Maximum hold bars
+        survival_bars: Number of survival bars for devil training
 
     Returns:
         Tuple of (features DataFrame with targets, feature column names)
@@ -460,57 +462,57 @@ def engineer_features_and_labels(df: pl.DataFrame) -> Tuple[pl.DataFrame, List[s
 
     # ═══════════════════════════════════════════════════════════════════
     # ANGEL TARGET: ATR-relative 3-bar momentum
-    # 1 if close 3 bars ahead > close + 0.5 × ATR_abs
+    # 1 if close 3 bars ahead > close + sl_mult × ATR_abs
     # natr_14 is a percentage: ATR_abs = close * natr_14 / 100
     # ═══════════════════════════════════════════════════════════════════
     df = df.with_columns(
         (
             pl.col("close").shift(-3)
-            > pl.col("close") + 0.5 * (pl.col("close") * pl.col("natr_14") / 100.0)
+            > pl.col("close") + sl_mult * (pl.col("close") * pl.col("natr_14") / 100.0)
         )
         .cast(pl.Int8)
         .alias("angel_target")
     )
-    logger.info("Generated angel_target (ATR-relative 3-bar momentum)")
+    logger.info(f"Generated angel_target (ATR-relative 3-bar momentum with sl_mult={sl_mult})")
 
     # ═══════════════════════════════════════════════════════════════════
     # DEVIL TARGETS (Phase 5.5 — Two-Target Architecture)
     #
-    # devil_target_macro  — 45-bar bracket outcome (TP hit before SL).
+    # devil_target_macro  — max_hold-bar bracket outcome (TP hit before SL).
     #   Used ONLY during threshold calibration (_find_optimal_threshold).
     #   Computes realized EV on Devil-approved trades using the actual
-    #   asymmetric R:R payload (0.5× SL / 3.0× TP).
+    #   asymmetric R:R payload (sl_mult × SL / tp_mult × TP).
     #
-    # devil_target        — 5-bar SL survival.
+    # devil_target        — survival_bars-bar SL survival.
     #   Used to TRAIN the Devil. Aligns the learning objective with the
     #   1m microstructure feature horizon.
-    #   1 = price did NOT breach SL in the next 5 bars (survived)
-    #   0 = price breached SL within 5 bars (stopped out immediately)
+    #   1 = price did NOT breach SL in the next survival_bars bars (survived)
+    #   0 = price breached SL within survival_bars bars (stopped out immediately)
     # ═══════════════════════════════════════════════════════════════════
 
-    # -- Macro target (45-bar) — evaluation only -----------------------
+    # -- Macro target (max_hold-bar) — evaluation only -----------------------
     logger.info(
         f"Computing devil_target_macro via ATR bracket simulation "
-        f"(SL={SL_ATR_MULTIPLIER}×ATR, TP={TP_ATR_MULTIPLIER}×ATR, "
-        f"max_hold={MAX_HOLD_BARS} bars)..."
+        f"(SL={sl_mult}×ATR, TP={tp_mult}×ATR, "
+        f"max_hold={max_hold} bars)..."
     )
-    devil_targets_macro = _compute_devil_targets_atr(df)
+    devil_targets_macro = _compute_devil_targets_atr(df, sl_mult=sl_mult, tp_mult=tp_mult, max_hold=max_hold)
     df = df.with_columns(pl.Series("devil_target_macro", devil_targets_macro))
     logger.info(
-        f"Generated devil_target_macro (45-bar bracket): "
+        f"Generated devil_target_macro ({max_hold}-bar bracket): "
         f"{int(devil_targets_macro.sum())} wins / {len(devil_targets_macro)} total "
         f"({devil_targets_macro.mean():.1%} macro win rate)"
     )
 
-    # -- Survival target (5-bar) — Devil training ----------------------
+    # -- Survival target (survival_bars-bar) — Devil training ----------------------
     logger.info(
-        f"Computing devil_target via {SURVIVAL_BARS}-bar SL survival "
-        f"(SL={SL_ATR_MULTIPLIER}×ATR)..."
+        f"Computing devil_target via {survival_bars}-bar SL survival "
+        f"(SL={sl_mult}×ATR)..."
     )
-    devil_targets_survival = _compute_devil_survival_target(df)
+    devil_targets_survival = _compute_devil_survival_target(df, sl_mult=sl_mult, survival_bars=survival_bars)
     df = df.with_columns(pl.Series("devil_target", devil_targets_survival))
     logger.info(
-        f"Generated devil_target ({SURVIVAL_BARS}-bar survival): "
+        f"Generated devil_target ({survival_bars}-bar survival): "
         f"{int(devil_targets_survival.sum())} survived / {len(devil_targets_survival)} total "
         f"({devil_targets_survival.mean():.1%} survival rate)"
     )
@@ -849,6 +851,8 @@ def _find_optimal_threshold(
 def validate_candidate(
     df: pl.DataFrame,
     feature_cols: List[str],
+    sl_mult: float = SL_ATR_MULTIPLIER,
+    tp_mult: float = TP_ATR_MULTIPLIER,
     n_folds: int = 3,
 ) -> Tuple[
     ValidationReport,
@@ -893,6 +897,8 @@ def validate_candidate(
         df: Full 60-day feature-engineered DataFrame (output of
             engineer_features_and_labels).
         feature_cols: List of base feature column names.
+        sl_mult: Stop-loss ATR multiplier
+        tp_mult: Take-profit ATR multiplier
         n_folds: Number of expanding folds (default: 3).
 
     Returns:
@@ -1115,6 +1121,8 @@ def validate_candidate(
             devil_probs=devil_probs_val,
             survival_targets=proposed_devil_targets,
             macro_targets=proposed_devil_targets_macro,
+            sl_mult=sl_mult,
+            tp_mult=tp_mult,
         )
         logger.info(
             f"  [Fold {fold_number}] Dynamic threshold: {optimal_threshold:.2f} "
@@ -1166,12 +1174,11 @@ def validate_candidate(
         brier = float(brier_score_loss(approved_targets, approved_devil_probs))
         win_rate = float(approved_targets.mean()) if len(approved_targets) > 0 else 0.0
 
-        # EV using ATR R-multiple: wins = +TP_MULT R, losses = -SL_MULT R
-        # Where R = 1 unit of SL_ATR_MULTIPLIER ATR
-        # EV = win_rate * (TP_MULT / SL_MULT) - (1 - win_rate) * 1
-        # With TP=3.0, SL=1.5: EV = win_rate * 2 - (1 - win_rate) * 1 = 3*wr - 1
+        # EV using ATR R-multiple: wins = +tp_mult R, losses = -sl_mult R
+        # Where R = 1 unit of sl_mult ATR
+        # EV = win_rate * (tp_mult / sl_mult) - (1 - win_rate) * 1
         ev = float(
-            win_rate * (TP_ATR_MULTIPLIER / SL_ATR_MULTIPLIER) - (1.0 - win_rate)
+            win_rate * (tp_mult / sl_mult) - (1.0 - win_rate)
         )
 
         logger.info(
@@ -1211,8 +1218,8 @@ def validate_candidate(
             approved_macro_targets = proposed_devil_targets_macro[approved_mask]
             macro_wins = int(approved_macro_targets.sum())
             macro_losses = n_devil_approved - macro_wins
-            gross_profit = macro_wins * TP_ATR_MULTIPLIER
-            gross_loss = macro_losses * SL_ATR_MULTIPLIER
+            gross_profit = macro_wins * tp_mult
+            gross_loss = macro_losses * sl_mult
             profit_factor = (
                 gross_profit / gross_loss if gross_loss > 0 else float("inf")
             )
@@ -1308,6 +1315,7 @@ def promote_or_reject(
     angel_model: RandomForestClassifier,
     devil_model: RandomForestClassifier,
     threshold: float = 0.20,
+    asset_config: dict = None,
 ) -> bool:
     """
     Promote or reject candidate models based on the validation report.
@@ -1325,6 +1333,7 @@ def promote_or_reject(
         angel_model: Final model (full-data if gate passed, Fold 3 if failed)
         devil_model: Final model (full-data if gate passed, Fold 3 if failed)
         threshold: Optimal Devil threshold from Fold 3 (default: 0.20 fallback)
+        asset_config: Asset configuration dictionary.
 
     Returns:
         True if models were promoted, False if rejected.
@@ -1336,8 +1345,11 @@ def promote_or_reject(
         logger.info("✅ VALIDATION GATE PASSED — PROMOTING MODELS")
         logger.info("=" * 70)
 
-        save_models(angel_model, devil_model)
-        save_threshold(threshold)
+        if asset_config is None:
+            asset_config = {}
+
+        save_models(angel_model, devil_model, asset_config)
+        save_threshold(threshold, asset_config)
 
         notifier.send_retraining_report(report, promoted=True)
         return True
@@ -1360,6 +1372,7 @@ def promote_or_reject(
 def save_models(
     angel_model: RandomForestClassifier,
     devil_model: RandomForestClassifier,
+    asset_config: dict,
 ) -> None:
     """
     Serialize models to disk using joblib with POSIX atomic writes.
@@ -1370,17 +1383,20 @@ def save_models(
     Args:
         angel_model: Trained Angel model
         devil_model: Trained Devil model
+        asset_config: Asset configuration dictionary.
     """
     logger.info("=" * 70)
     logger.info("SERIALIZING MODELS (ATOMIC)")
     logger.info("=" * 70)
 
-    # Ensure model directory exists
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    asset_class = asset_config.get("asset_class", "equities")
+    model_dir = Path("models") / asset_class
+    model_dir.mkdir(parents=True, exist_ok=True)
 
-    # Define temp and final paths
-    angel_temp = MODEL_DIR / "angel_temp.pkl"
-    devil_temp = MODEL_DIR / "devil_temp.pkl"
+    angel_path = model_dir / "angel_latest.pkl"
+    devil_path = model_dir / "devil_latest.pkl"
+    angel_temp = model_dir / "angel_temp.pkl"
+    devil_temp = model_dir / "devil_temp.pkl"
 
     # ═══════════════════════════════════════════════════════════════════
     # ATOMIC WRITE: Angel Model
@@ -1388,8 +1404,8 @@ def save_models(
     try:
         joblib.dump(angel_model, angel_temp)
         angel_size = angel_temp.stat().st_size / (1024 * 1024)
-        os.replace(angel_temp, ANGEL_PATH)
-        logger.info(f"[ATOMIC] Angel model saved: {ANGEL_PATH} ({angel_size:.1f} MB)")
+        os.replace(angel_temp, angel_path)
+        logger.info(f"[ATOMIC] Angel model saved: {angel_path} ({angel_size:.1f} MB)")
 
     except Exception as e:
         logger.error(f"[ATOMIC] Failed to save Angel model: {e}")
@@ -1403,8 +1419,8 @@ def save_models(
     try:
         joblib.dump(devil_model, devil_temp)
         devil_size = devil_temp.stat().st_size / (1024 * 1024)
-        os.replace(devil_temp, DEVIL_PATH)
-        logger.info(f"[ATOMIC] Devil model saved: {DEVIL_PATH} ({devil_size:.1f} MB)")
+        os.replace(devil_temp, devil_path)
+        logger.info(f"[ATOMIC] Devil model saved: {devil_path} ({devil_size:.1f} MB)")
 
     except Exception as e:
         logger.error(f"[ATOMIC] Failed to save Devil model: {e}")
@@ -1412,12 +1428,29 @@ def save_models(
             devil_temp.unlink()
         raise
 
+    # ═══════════════════════════════════════════════════════════════════
+    # ATOMIC WRITE: Metadata sidecar
+    # ═══════════════════════════════════════════════════════════════════
+    metadata_path = model_dir / "metadata.json"
+    metadata_temp = model_dir / "metadata_temp.json"
+    metadata = {
+        "asset_class": asset_class,
+        "timeframe_minutes": asset_config.get("timeframe_minutes", 1),
+        "trained_at": datetime.now(timezone.utc).isoformat(),
+        "trained_on_symbols": asset_config.get("tickers", []),
+        "data_source": os.getenv("DATA_SOURCE", "alpaca").strip().lower(),
+    }
+    with open(metadata_temp, "w") as f:
+        json.dump(metadata, f, indent=2)
+    os.replace(metadata_temp, metadata_path)
+    logger.info(f"[ATOMIC] Metadata saved: {metadata_path}")
+
     logger.info(
         "[ATOMIC] Model serialization complete — live bot can hot-reload safely"
     )
 
 
-def save_threshold(threshold: float) -> None:
+def save_threshold(threshold: float, asset_config: dict) -> None:
     """
     Save the optimal Devil threshold to disk as a JSON sidecar file.
 
@@ -1427,9 +1460,12 @@ def save_threshold(threshold: float) -> None:
 
     Args:
         threshold: The optimal Devil probability threshold (e.g., 0.28)
+        asset_config: Asset configuration dictionary.
     """
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    threshold_path = MODEL_DIR / "threshold.json"
+    asset_class = asset_config.get("asset_class", "equities")
+    model_dir = Path("models") / asset_class
+    model_dir.mkdir(parents=True, exist_ok=True)
+    threshold_path = model_dir / "threshold.json"
 
     data = {
         "devil_threshold": round(threshold, 4),
@@ -1437,7 +1473,7 @@ def save_threshold(threshold: float) -> None:
     }
 
     # Atomic write — same pattern as model serialisation
-    temp_path = MODEL_DIR / "threshold_temp.json"
+    temp_path = model_dir / "threshold_temp.json"
     with open(temp_path, "w") as f:
         json.dump(data, f, indent=2)
     os.replace(temp_path, threshold_path)
@@ -1476,15 +1512,35 @@ def main() -> int:
             "╚══════════════════════════════════════════════════════════════════╝"
         )
 
-        # ─── Phase 1: Fetch data ────────────────────────────────────────────
-        client = get_alpaca_client()
-        logger.info("Alpaca client initialized")
-        raw_data = fetch_training_data(client)
+        # ─── Phase 1: Initialize provider + load asset config ──────────────
+        data_source = os.getenv("DATA_SOURCE", "alpaca").strip().lower()
+        asset_config = get_asset_config(data_source)
+        provider = get_market_provider()
+        logger.info(
+            f"Provider initialized: {provider.__class__.__name__} "
+            f"| Asset config: {asset_config['tickers']} "
+            f"| SL={asset_config['sl_mult']}× TP={asset_config['tp_mult']}× "
+            f"max_hold={asset_config['max_hold']} survival={asset_config['survival_bars']}"
+        )
 
-        # ─── Phase 2: Engineer features with ATR-dynamic labels ────────────
-        features_df, feature_cols = engineer_features_and_labels(raw_data)
+        # ─── Phase 2: Fetch data ────────────────────────────────────────────
+        raw_data = fetch_training_data(
+            provider=provider,
+            symbols=asset_config["tickers"],
+            days_back=DAYS_BACK,
+            timeframe_minutes=asset_config["timeframe_minutes"]
+        )
 
-        # ─── Phase 3: Walk-forward validation (3-fold expanding window) ────
+        # ─── Phase 3: Engineer features with ATR-dynamic labels ────────────
+        features_df, feature_cols = engineer_features_and_labels(
+            raw_data,
+            sl_mult=asset_config["sl_mult"],
+            tp_mult=asset_config["tp_mult"],
+            max_hold=asset_config["max_hold"],
+            survival_bars=asset_config["survival_bars"],
+        )
+
+        # ─── Phase 4: Walk-forward validation (3-fold expanding window) ────
         # TEMPORAL BOUNDARY: CV folds and the Profit Factor gate are evaluated
         # strictly OOS (Fold 3 model evaluated on days 51–60). The full-data
         # production model is only trained AFTER the gate passes. Running the
@@ -1501,21 +1557,27 @@ def main() -> int:
             angel_feats,
             devil_feats,
             optimal_threshold,
-        ) = validate_candidate(features_df, feature_cols, n_folds=3)
+        ) = validate_candidate(
+            features_df, 
+            feature_cols, 
+            sl_mult=asset_config["sl_mult"],
+            tp_mult=asset_config["tp_mult"],
+            n_folds=3
+        )
         logger.info(f"Optimal Devil threshold (from Fold 3): {optimal_threshold:.4f}")
 
-        # ─── Phase 4: Gate decision ─────────────────────────────────────────
+        # ─── Phase 5: Gate decision ─────────────────────────────────────────
         # If gate passed: angel_model/devil_model are trained on full 60 days
         # If gate failed: they are Fold 3 models (will NOT be saved)
         promoted = promote_or_reject(
-            report, angel_model, devil_model, optimal_threshold
+            report, angel_model, devil_model, optimal_threshold, asset_config
         )
 
         if promoted:
+            asset_class = asset_config.get("asset_class", "equities")
             logger.info("=" * 70)
-            logger.info("✅ MODELS PROMOTED — Ready for next market open")
-            logger.info(f"  Angel: {ANGEL_PATH}")
-            logger.info(f"  Devil: {DEVIL_PATH}")
+            logger.info(f"✅ MODELS PROMOTED ({asset_class}) — Ready for next market open")
+            logger.info(f"  Models saved in: models/{asset_class}/")
             logger.info("=" * 70)
             return 0
         else:

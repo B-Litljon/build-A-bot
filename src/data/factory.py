@@ -13,7 +13,7 @@ appropriate provider.  Supported values:
 import logging
 import os
 
-from data.market_provider import MarketDataProvider
+from src.data.market_provider import MarketDataProvider
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,7 @@ def get_market_provider() -> MarketDataProvider:
     source = os.getenv("DATA_SOURCE", "alpaca").strip().lower()
 
     if source == "alpaca":
-        from data.alpaca_provider import AlpacaProvider
+        from src.data.alpaca_provider import AlpacaProvider
 
         api_key = os.getenv("alpaca_key") or os.getenv("ALPACA_API_KEY")
         secret = os.getenv("alpaca_secret") or os.getenv("ALPACA_SECRET_KEY")
@@ -51,21 +51,21 @@ def get_market_provider() -> MarketDataProvider:
         return AlpacaProvider(api_key, secret, paper=is_paper)
 
     if source == "polygon":
-        from data.polygon_provider import PolygonDataProvider
+        from src.data.polygon_provider import PolygonDataProvider
 
         api_key = os.getenv("poly_keys") or os.getenv("POLYGON_API_KEY")
         logger.info("Data source: Polygon")
         return PolygonDataProvider(api_key=api_key)
 
     if source == "yahoo":
-        from data.yahoo_provider import YahooDataProvider
+        from src.data.yahoo_provider import YahooDataProvider
 
         poll = int(os.getenv("YAHOO_POLL_INTERVAL", "60"))
         logger.info("Data source: Yahoo Finance (poll every %ds)", poll)
         return YahooDataProvider(poll_interval=poll)
 
     if source == "oanda":
-        from data.oanda_provider import OandaMarketProvider
+        from src.data.oanda_provider import OandaMarketProvider
 
         environment = os.getenv("OANDA_ENV", "practice").strip().lower()
         api_key = os.getenv("OANDA_API_KEY")

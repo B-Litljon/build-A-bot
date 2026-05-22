@@ -119,6 +119,7 @@ async def _main() -> None:
     htf_tf = "30m" if args.granularity == 5 else "5m"
     warmup_pd = 300 if args.granularity == 5 else 260
     strategy = MLStrategy(
+        asset_class="forex",
         timeframe=args.granularity,
         htf_timeframe=htf_tf,
         warmup_period=warmup_pd,
@@ -127,7 +128,7 @@ async def _main() -> None:
     # Forex volatility is a fraction of Equities. Use a derived 2.0 pips stop-loss floor
     # so the chop filter doesn't reject everything.
     # Set round_precision=5 since Forex pairs are quoted to 5 decimal places natively.
-    risk_profile = RiskProfile(min_sl_pips=2.0, round_precision=5)
+    risk_profile = RiskProfile.for_asset_class("forex")
     risk_manager = RiskManager(profile=risk_profile)
 
     orchestrator = OandaScalperOrchestrator(

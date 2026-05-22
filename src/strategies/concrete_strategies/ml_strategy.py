@@ -64,8 +64,9 @@ class MLStrategy(BaseStrategy):
 
     def __init__(
         self,
-        angel_path: str | Path = "models/angel_latest.pkl",
-        devil_path: str | Path = "models/devil_latest.pkl",
+        asset_class: str = "equities",
+        angel_path: str | Path = None,
+        devil_path: str | Path = None,
         angel_threshold: float = 0.40,
         devil_threshold: float = 0.50,
         warmup_period: int = 260,  # default for 1m base / 5m HTF
@@ -76,6 +77,12 @@ class MLStrategy(BaseStrategy):
         **kwargs,
     ):
         super().__init__(**kwargs)
+
+        self.asset_class = asset_class
+        if angel_path is None:
+            angel_path = f"models/{asset_class}/angel_latest.pkl"
+        if devil_path is None:
+            devil_path = f"models/{asset_class}/devil_latest.pkl"
 
         self._reload_lock = threading.Lock()
         self.timeframe = timeframe
@@ -171,14 +178,47 @@ class MLStrategy(BaseStrategy):
                 f"do not match angel model features {list(model_features)}"
             )
 
+        # Validate metadata sidecar
+        self._validate_metadata()
+
         # Override devil_threshold with the value persisted by the retrainer
         # (models/threshold.json).  Must be called AFTER self.devil_threshold is
         # set above so _load_threshold() can use it as a fallback.
         self.devil_threshold = self._load_threshold()
 
+    def _validate_metadata(self) -> None:
+        """
+        Validate that the loaded model matches the expected asset class using the metadata sidecar.
+        """
+        project_root = Path(__file__).resolve().parent.parent.parent.parent
+        metadata_path = project_root / "models" / self.asset_class / "metadata.json"
+        
+        if not metadata_path.exists():
+            logger.warning(
+                "_validate_metadata: %s not found. Skipping distribution drift check.", 
+                metadata_path
+            )
+            return
+            
+        try:
+            with open(metadata_path, "r") as fh:
+                data = json.load(fh)
+                
+            trained_class = data.get("asset_class")
+            if trained_class != self.asset_class:
+                raise RuntimeError(
+                    f"Distribution drift detected: Strategy instantiated for asset class '{self.asset_class}', "
+                    f"but model was trained on '{trained_class}'."
+                )
+            logger.info("_validate_metadata: passed (asset_class=%s)", trained_class)
+        except Exception as exc:
+            if isinstance(exc, RuntimeError):
+                raise
+            logger.warning("_validate_metadata: failed to read %s (%s)", metadata_path, exc)
+
     def _load_threshold(self) -> float:
         """
-        Load the Devil model's optimal threshold from models/threshold.json.
+        Load the Devil model's optimal threshold from models/<asset_class>/threshold.json.
 
         Written by retrainer.save_threshold() after a successful validation gate.
         Falls back to self.devil_threshold (the value passed to __init__) if the
@@ -189,7 +229,7 @@ class MLStrategy(BaseStrategy):
         """
         # Search relative to project root (4 levels up from this file in src/)
         project_root = Path(__file__).resolve().parent.parent.parent.parent
-        threshold_path = project_root / "models" / "threshold.json"
+        threshold_path = project_root / "models" / self.asset_class / "threshold.json"
         if not threshold_path.exists():
             logger.warning(
                 "_load_threshold: models/threshold.json not found — "

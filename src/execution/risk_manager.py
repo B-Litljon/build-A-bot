@@ -14,6 +14,17 @@ class RiskProfile:
     max_notional_cap: float = 100000.0
     round_precision: int = 4
 
+    @classmethod
+    def for_asset_class(cls, asset_class: str) -> "RiskProfile":
+        if asset_class == "forex":
+            return cls(
+                sl_atr_multiplier=1.0,
+                tp_atr_multiplier=2.0,
+                min_sl_pips=2.0,
+                round_precision=5,
+            )
+        return cls()
+
 class RiskManager:
     """
     The Shield: Enforces institutional-grade safety nets and dynamic sizing.
