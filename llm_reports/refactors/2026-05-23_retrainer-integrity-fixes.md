@@ -228,6 +228,54 @@ OANDA data. This is informative, not catastrophic: the integrity fixes are
 *working*, and they're correctly refusing to deploy weights that have no
 demonstrable predictive power.
 
+### Final verification: V3.5 features + 8-instrument basket, 365 days
+
+After V3.5 session features + the volatile basket landed (commit `149ef8b`)
+and the basket was extended to 8 instruments, one more retrain confirmed the
+signal-quality story across the full dataset:
+
+```
+$ DATA_SOURCE=oanda RETRAIN_DAYS_BACK=365 PYTHONPATH=src pipenv run python -m src.core.retrainer
+```
+
+Instruments: `XAU_USD, XAG_USD, GBP_JPY, AUD_JPY, EUR_JPY, NZD_JPY, GBP_AUD, GBP_NZD`.
+Raw bars fetched: 2,914,650 across 5 instruments × 365d.
+
+Per-fold (strict OOS at frozen Fold-2 threshold 0.66 for Fold 3):
+
+| Fold | Angel proposals | Devil approved | Brier  | Separation gap | Verdict   |
+|------|-----------------|----------------|--------|----------------|-----------|
+| 1    | ~30             | ~6             | ~0.19  | +0.0682        | SIGNAL ✅ |
+| 2    | 126             | 14             | 0.1501 | +0.0829        | SIGNAL ✅ |
+| 3    | **210**         | 13             | 0.1774 | +0.0751        | SIGNAL ✅ |
+
+Fold 3 strict-OOS metrics:
+- 210 Angel proposals — first run of the session to clear 100 proposals honestly
+- Macro WR 61.5%, Survival WR 76.9%, EV +1.31
+- PF 3.20 ✅
+
+Aggregate gate readout:
+```
+Mean Brier 0.20  ✅ | Mean EV 1.27  ✅ | PF 3.20 ✅
+OOS Trades 13 ❌ (< 100 floor)
+Verdict: REJECTED (sample-size only)
+```
+
+**This is the strongest signal-quality result of the session.** All three
+folds show SIGNAL DETECTED (separation > 0.05). Mean Brier 0.20 is the best
+Devil calibration of any run today. The integrity-fixed gate still rejects
+deployment because the Devil at the frozen 0.66 threshold is highly
+selective — only 13 of 210 Fold 3 Angel proposals cleared it. 13 OOS trades
+over 60-day val ≈ 80–100 trades/year live: a low-frequency, high-conviction
+scalper rather than a true HFT setup.
+
+The gate is doing its job: it's neither false-passing on lottery PF (the
+fixed problem) nor refusing real signal (the new evidence shows separation
+holds at strict OOS, frozen threshold, across all three folds). It is
+correctly insisting that 13 OOS trades — even with PF 3.20 — is too few to
+commit production weights. The next path forward is feature-side or
+basket-side (more proposals reaching the gate), not threshold relaxation.
+
 Other things checked:
 
 - **Walk-forward folds are structurally clean.** TimeSeriesSplit at
