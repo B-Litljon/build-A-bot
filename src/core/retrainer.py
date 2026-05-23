@@ -47,7 +47,7 @@ from src.data.factory import get_market_provider
 from src.data.market_provider import MarketDataProvider
 from src.execution.risk_manager import RiskProfile
 from src.ml.feature_pipeline import FeaturePipeline
-from src.ml.features.v3_features import V3BaseFeatures, V3HTFFeatures
+from src.ml.features.v3_features import V3BaseFeatures, V3HTFFeatures, V3SessionFeatures
 from src.core.notification_manager import NotificationManager
 
 logging.basicConfig(
@@ -61,8 +61,12 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 DAYS_BACK = int(os.getenv("RETRAIN_DAYS_BACK", "60"))
+# Forex basket pivoted 2026-05-23 from G7 majors (failed integrity gate, NO
+# SIGNAL separation) to a volatility-first basket: two liquid metals plus
+# three JPY/AUD-crossing pairs known for wide intraday ranges. XPT/XPD
+# skipped — too illiquid on OANDA for scalping.
 _DEFAULT_TICKERS_BY_CLASS = {
-    "forex": ["EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CAD"],
+    "forex": ["XAU_USD", "XAG_USD", "GBP_JPY", "AUD_JPY", "GBP_AUD"],
     "equities": ["TSLA", "NVDA", "MARA", "COIN", "SMCI"],
 }
 
@@ -192,6 +196,13 @@ FEATURE_COLS: List[str] = [
     "bar_body_pct",
     "bar_upper_wick_pct",
     "bar_lower_wick_pct",
+    # V3.5 (2026-05-23): UTC session-activity indicators — tame G7 + XAU
+    # failed at M1 with the 18-feature vector; sessions condition the model
+    # on activity regime (London/NY overlap = volatility sweet spot).
+    "session_asia",
+    "session_london",
+    "session_ny",
+    "session_overlap",
 ]
 
 
@@ -490,6 +501,7 @@ def engineer_features_and_labels(
         feature_generators=[
             V3BaseFeatures(),
             V3HTFFeatures(timeframe=htf_timeframe),
+            V3SessionFeatures(),
         ]
     )
     for gen in pipeline.feature_generators:

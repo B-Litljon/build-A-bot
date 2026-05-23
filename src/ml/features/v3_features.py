@@ -139,6 +139,35 @@ class V3BaseFeatures(BaseFeatureGenerator):
 
         return df
 
+class V3SessionFeatures(BaseFeatureGenerator):
+    """
+    Binary session-activity indicators from the UTC hour of `timestamp`.
+
+    Forex / metals microstructure regimes shift sharply across the three
+    major trading sessions; capturing them lets the model condition on
+    activity context rather than rediscover the bins from `hour_of_day`.
+
+    Session windows (UTC, conservative midpoints across DST seasons):
+        Asia/Tokyo   : 00:00 – 09:00
+        London       : 07:00 – 16:00
+        New York     : 12:00 – 21:00
+        London/NY    : 12:00 – 16:00  (overlap — the volatility sweet spot)
+
+    Produces (all Int8 0/1): session_asia, session_london, session_ny,
+    session_overlap.
+    """
+
+    def generate(self, df: pl.DataFrame) -> pl.DataFrame:
+        hour = pl.col("timestamp").dt.hour()
+        # closed="left" → [start, end). Hour values are 0..23 ints.
+        return df.with_columns(
+            hour.is_between(0, 9, closed="left").cast(pl.Int8).alias("session_asia"),
+            hour.is_between(7, 16, closed="left").cast(pl.Int8).alias("session_london"),
+            hour.is_between(12, 21, closed="left").cast(pl.Int8).alias("session_ny"),
+            hour.is_between(12, 16, closed="left").cast(pl.Int8).alias("session_overlap"),
+        )
+
+
 class V3HTFFeatures(BaseFeatureGenerator):
     """
     Compute higher-timeframe features and join them onto the 1m DataFrame

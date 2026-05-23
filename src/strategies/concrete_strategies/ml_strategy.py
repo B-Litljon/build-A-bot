@@ -35,7 +35,7 @@ from core.notification_manager import NotificationManager
 
 # CRITICAL: Import FeaturePipeline to prevent training/inference skew
 from ml.feature_pipeline import FeaturePipeline
-from ml.features.v3_features import V3BaseFeatures, V3HTFFeatures
+from ml.features.v3_features import V3BaseFeatures, V3HTFFeatures, V3SessionFeatures
 from ml.trainers.v3_rf_trainer import V3RandomForestTrainer
 
 logger = logging.getLogger(__name__)
@@ -142,11 +142,15 @@ class MLStrategy(BaseStrategy):
 
         # Initialize feature pipeline (imported, not duplicated!)
         self.pipeline = FeaturePipeline(
-            feature_generators=[V3BaseFeatures(), V3HTFFeatures(timeframe=htf_timeframe)]
+            feature_generators=[
+                V3BaseFeatures(),
+                V3HTFFeatures(timeframe=htf_timeframe),
+                V3SessionFeatures(),
+            ]
         )
 
         # Feature columns (excluding absolute price columns to prevent leakage)
-        # V3.4: expanded from 14 to 18 features with Phase 5 microstructure additions
+        # V3.5 (2026-05-23): expanded from 18 to 22 features with UTC session indicators
         self.feature_names = [
             "rsi_14",
             "ppo",
@@ -168,6 +172,11 @@ class MLStrategy(BaseStrategy):
             "bar_body_pct",
             "bar_upper_wick_pct",
             "bar_lower_wick_pct",
+            # V3.5: UTC session-activity indicators
+            "session_asia",
+            "session_london",
+            "session_ny",
+            "session_overlap",
         ]
 
         # Feature schema validation (Fix 2.6)
