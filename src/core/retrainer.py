@@ -66,7 +66,11 @@ DAYS_BACK = int(os.getenv("RETRAIN_DAYS_BACK", "60"))
 # three JPY/AUD-crossing pairs known for wide intraday ranges. XPT/XPD
 # skipped — too illiquid on OANDA for scalping.
 _DEFAULT_TICKERS_BY_CLASS = {
-    "forex": ["XAU_USD", "XAG_USD", "GBP_JPY", "AUD_JPY", "GBP_AUD"],
+    "forex": [
+        "XAU_USD", "XAG_USD",                        # liquid metals
+        "GBP_JPY", "AUD_JPY", "EUR_JPY", "NZD_JPY",  # JPY-cross volatility
+        "GBP_AUD", "GBP_NZD",                        # commonwealth crosses
+    ],
     "equities": ["TSLA", "NVDA", "MARA", "COIN", "SMCI"],
 }
 
