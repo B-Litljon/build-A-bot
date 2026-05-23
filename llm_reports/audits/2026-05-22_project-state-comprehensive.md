@@ -21,6 +21,17 @@ This document is written to support a downstream LLM in producing investor-facin
 
 **Reader contract:** This is a snapshot at HEAD `c14298d` with 5 uncommitted working-tree files. Where uncommitted state diverges from committed state, both are called out. Honest about what works in production today vs. what is staged but unverified. No marketing varnish — investors get rosy decks from the founder; technical state from the engineering trace.
 
+### Naming guidance for investor-facing slides (REQUIRED)
+
+The internal codebase names the two-model meta-labeling cascade **Angel** (the proposer) and **Devil** (the gate). This was conceptual shorthand for a high-recall / high-precision pairing, never marketing language. **For the slide deck and any other audience-facing material (parents, investors, demos), rename them throughout:**
+
+| Internal name | Slide name | Role |
+|---|---|---|
+| Angel | **Thing 1** | Proposer model — high recall, surfaces candidate setups from microstructure features |
+| Devil | **Thing 2** | Gate model — high precision, vetoes weak proposals using the proposer's confidence |
+
+When this report cites file paths like `models/angel_latest.pkl` or class names like the `Angel`/`Devil` distinction, the slides should describe the architecture using "Thing 1 / Thing 2" without exposing the internal labels. The architecture, math, and behavior described in the rest of this report apply unchanged — only the names change for the audience.
+
 ---
 
 ## 1. Executive Summary
