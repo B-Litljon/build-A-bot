@@ -86,8 +86,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--granularity",
         type=int,
-        default=5,
-        help="Stream granularity/timeframe in minutes (default: 5)",
+        default=1,
+        help="Stream granularity/timeframe in minutes (default: 1)",
     )
     return parser.parse_args()
 

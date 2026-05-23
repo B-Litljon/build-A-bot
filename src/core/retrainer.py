@@ -60,7 +60,7 @@ logger = logging.getLogger(__name__)
 # CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-DAYS_BACK = 60
+DAYS_BACK = int(os.getenv("RETRAIN_DAYS_BACK", "60"))
 _DEFAULT_TICKERS_BY_CLASS = {
     "forex": ["EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CAD"],
     "equities": ["TSLA", "NVDA", "MARA", "COIN", "SMCI"],
@@ -77,10 +77,11 @@ def get_asset_config(data_source: str) -> dict:
     profile = RiskProfile.for_asset_class(asset_class)
     default_tickers = _DEFAULT_TICKERS_BY_CLASS[asset_class]
     
+    # Asset-class specific overrides
     if asset_class == "forex":
-        max_hold = 30
-        timeframe = 5
-        htf_timeframe = "30m"
+        max_hold = 45
+        timeframe = 1
+        htf_timeframe = "5m"
     else:
         max_hold = 45
         timeframe = 1
@@ -102,12 +103,16 @@ def get_hyperparameters(asset_class: str) -> Tuple[dict, dict]:
     """
     Get hyperparameter configurations for Angel and Devil models based on asset class.
     """
-    # Common parameters for both asset classes
+    # min_samples_leaf=20 floor for forex: leaf=1 (Gemini 2026-05-23) memorized
+    # the 1,043-row Angel-approved subset, producing a Fold 3 separation gap that
+    # collapsed from +0.0718 → -0.0092 across a 10-hour window shift. leaf=50
+    # was the prior production floor but starves forex (~0.3% Angel approval).
+    # 20 is the defensible middle ground. See llm_reports/audits/2026-05-23.
     angel_params = {
         "n_estimators": 100,
         "max_depth": 10,
-        "min_samples_leaf": 50,
-        "class_weight": "balanced",
+        "min_samples_leaf": 20 if asset_class == "forex" else 50,
+        "class_weight": None if asset_class == "forex" else "balanced",
         "random_state": 42,
         "n_jobs": -1,
     }
@@ -115,10 +120,8 @@ def get_hyperparameters(asset_class: str) -> Tuple[dict, dict]:
     devil_params = {
         "n_estimators": 100,
         "max_depth": 8,
-        "min_samples_leaf": 50,
-        # class_weight is balanced for Forex to avoid probability compression,
-        # but None for Equities to avoid Brier score/rubber-stamping issues
-        "class_weight": "balanced" if asset_class == "forex" else None,
+        "min_samples_leaf": 20 if asset_class == "forex" else 50,
+        "class_weight": None,
         "random_state": 42,
         "n_jobs": -1,
     }
@@ -157,6 +160,12 @@ BRIER_THRESHOLD = 0.30  # Phase 5.5: raised from 0.25 — survival target base r
 # genuinely uncalibrated models.
 EV_THRESHOLD = 0.0005  # Min acceptable Expected Value
 PROFIT_FACTOR_THRESHOLD = 1.2  # Min acceptable Profit Factor
+# Sample-size floor for Fold 3 OOS PF: small trade counts under high R:R
+# (TP=3.0×ATR / SL=0.5×ATR ⇒ 6:1 payoff) produce false-positive gate passes
+# from a handful of lucky wins. Empirically the 2026-05-23 Gemini run "passed"
+# with 14–16 OOS trades while the Devil's own separation diagnostic read
+# "NO SIGNAL." 100 is the minimum sample for any honest PF claim.
+MIN_OOS_TRADES_FOR_PF = 100
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # FEATURE COLUMNS (must match MLStrategy.feature_names and FeaturePipeline output)
@@ -959,11 +968,17 @@ def validate_candidate(
     # ───────────────────────────────────────────────────────────────────
     min_date = df["timestamp"].min()
 
-    # fold_configs: (train_end_days, val_end_days) — exclusive upper bounds
+    # fold_configs: (train_end_days, val_end_days) — exclusive upper bounds.
+    # Fractions chosen to reproduce the legacy 60-day schedule exactly:
+    #   (30,40),(40,50),(50,60) at DAYS_BACK=60.
+    # For larger windows the same expanding-train / fixed-fraction-val shape
+    # scales (e.g. DAYS_BACK=180 → (90,120),(120,150),(150,180)). Without
+    # this scaling the val sets stayed pinned to days 30–60 and 67% of any
+    # extended window was silently discarded.
     fold_configs = [
-        (30, 40),  # Fold 1: Train days 0–29, Val days 30–39
-        (40, 50),  # Fold 2: Train days 0–39, Val days 40–49
-        (50, 60),  # Fold 3: Train days 0–49, Val days 50–59
+        (DAYS_BACK // 2,     DAYS_BACK * 2 // 3),   # train 0–½,  val ½–⅔
+        (DAYS_BACK * 2 // 3, DAYS_BACK * 5 // 6),   # train 0–⅔,  val ⅔–⅚
+        (DAYS_BACK * 5 // 6, DAYS_BACK),            # train 0–⅚,  val ⅚–1
     ]
 
     fold_metrics: List[FoldMetrics] = []
@@ -977,6 +992,12 @@ def validate_candidate(
     final_win_rate: float = 0.0
     final_total_trades: int = 0
     production_threshold: float = 0.20  # fallback; overwritten by Fold 3
+    # Fold n_folds-1 (the "calibration" fold) sweeps for an optimal threshold;
+    # that threshold is frozen and applied to Fold n_folds for strict OOS gate
+    # evaluation. Without this freeze, the threshold sweep on Fold 3 would
+    # leak validation info into the production parameter — historically
+    # surfaced as PF=3.3 on 16 trades with separation gap = -0.0092.
+    calibration_threshold: Optional[float] = None
 
     for fold_idx, (train_end_day, val_end_day) in enumerate(fold_configs):
         fold_number = fold_idx + 1
@@ -1076,7 +1097,25 @@ def validate_candidate(
 
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
-            devil_probs_val = devil_model.predict_proba(meta_df)[:, 1]
+            devil_proba_full = devil_model.predict_proba(meta_df)
+
+        # Defensive: if the Devil's training set was single-class (common on
+        # tiny single-symbol windows where Angel approves <10 rows that all
+        # survive or all stop), predict_proba returns shape (n, 1) and the
+        # `[:, 1]` indexer raises IndexError. Treat the constant as 1.0 if
+        # the only class seen was 1 (survived ⇒ no veto), else 0.0 (every
+        # proposal vetoed).
+        if devil_proba_full.shape[1] == 1:
+            only_class = int(devil_model.classes_[0])
+            const_prob = 1.0 if only_class == 1 else 0.0
+            devil_probs_val = np.full(len(meta_df), const_prob, dtype=np.float64)
+            logger.warning(
+                f"[Fold {fold_number}] Devil trained on single-class data "
+                f"(class={only_class}); using constant probability "
+                f"{const_prob:.1f}. This fold's metrics are degenerate."
+            )
+        else:
+            devil_probs_val = devil_proba_full[:, 1]
 
         # ═══════════════════════════════════════════════════════════════════
         # DEVIL DIAGNOSTIC: Probability Distribution Analysis
@@ -1152,28 +1191,51 @@ def validate_candidate(
             logger.info(f"{'─' * 60}\n")
 
         # ─────────────────────────────────────────────────────────────
-        # Dynamic threshold selection — sweep 0.10–0.44 for max EV
-        # Replaces hardcoded DEVIL_THRESHOLD (0.50) which rejects all
-        # trades when class_weight=None shifts probs to the true ~20%
-        # base-rate range.
+        # Threshold selection — split strategy per fold:
+        #   Fold 1 .. n_folds-1 : sweep for EV-maximising threshold (in-fold)
+        #   Fold n_folds-1      : freeze that threshold as `calibration_threshold`
+        #   Fold n_folds        : use the FROZEN calibration_threshold (no sweep)
+        #
+        # Why: sweeping the threshold on the same fold whose metrics gate
+        # promotion leaks val data into the production parameter. Freezing
+        # the threshold on the penultimate fold restores OOS purity.
         # ─────────────────────────────────────────────────────────────
-        optimal_threshold, fold_ev_at_threshold = _find_optimal_threshold(
-            devil_probs=devil_probs_val,
-            survival_targets=proposed_devil_targets,
-            macro_targets=proposed_devil_targets_macro,
-            sl_mult=sl_mult,
-            tp_mult=tp_mult,
-        )
-        logger.info(
-            f"  [Fold {fold_number}] Dynamic threshold: {optimal_threshold:.2f} "
-            f"(EV at threshold: {fold_ev_at_threshold:+.4f})"
-        )
-
-        # Store Fold 3 threshold as the production threshold
-        if fold_number == n_folds:
+        if fold_number < n_folds:
+            optimal_threshold, fold_ev_at_threshold = _find_optimal_threshold(
+                devil_probs=devil_probs_val,
+                survival_targets=proposed_devil_targets,
+                macro_targets=proposed_devil_targets_macro,
+                sl_mult=sl_mult,
+                tp_mult=tp_mult,
+            )
+            logger.info(
+                f"  [Fold {fold_number}] Swept threshold: {optimal_threshold:.2f} "
+                f"(EV at threshold: {fold_ev_at_threshold:+.4f})"
+            )
+            if fold_number == n_folds - 1:
+                calibration_threshold = optimal_threshold
+                logger.info(
+                    f"  [Fold {fold_number}] FROZEN as calibration_threshold "
+                    f"for Fold {n_folds} strict-OOS evaluation"
+                )
+        else:
+            # Fold n_folds: strict OOS — use frozen threshold from Fold n_folds-1
+            if calibration_threshold is None:
+                optimal_threshold = 0.50
+                logger.warning(
+                    f"  [Fold {fold_number}] No calibration_threshold available "
+                    f"(Fold {n_folds - 1} had zero approvals) — "
+                    f"falling back to {optimal_threshold:.2f}"
+                )
+            else:
+                optimal_threshold = calibration_threshold
+                logger.info(
+                    f"  [Fold {fold_number}] Using FROZEN calibration_threshold: "
+                    f"{optimal_threshold:.2f} (strict OOS — no threshold leakage)"
+                )
             production_threshold = optimal_threshold
             logger.info(
-                f"  Production threshold (Fold {fold_number}): {production_threshold:.2f}"
+                f"  Production threshold: {production_threshold:.2f}"
             )
 
         approved_mask = devil_probs_val >= optimal_threshold
@@ -1291,6 +1353,12 @@ def validate_candidate(
         rejection_reasons.append(
             f"Profit Factor {profit_factor:.4f} < {PROFIT_FACTOR_THRESHOLD} threshold"
         )
+    if final_total_trades < MIN_OOS_TRADES_FOR_PF:
+        rejection_reasons.append(
+            f"Fold {n_folds} OOS trades {final_total_trades} < "
+            f"{MIN_OOS_TRADES_FOR_PF} minimum — sample too small to trust "
+            f"PF={profit_factor:.4f}"
+        )
 
     gate_passed = len(rejection_reasons) == 0
 
@@ -1301,7 +1369,11 @@ def validate_candidate(
     logger.info(f"Mean EV          : {mean_ev:.6f} (threshold ≥ {EV_THRESHOLD})")
     logger.info(
         f"Profit Factor    : {profit_factor:.4f} "
-        f"(threshold ≥ {PROFIT_FACTOR_THRESHOLD}, Fold 3 OOS)"
+        f"(threshold ≥ {PROFIT_FACTOR_THRESHOLD}, Fold {n_folds} OOS)"
+    )
+    logger.info(
+        f"OOS Trades       : {final_total_trades} "
+        f"(threshold ≥ {MIN_OOS_TRADES_FOR_PF}, Fold {n_folds} sample-size floor)"
     )
     logger.info(f"Gate Result      : {'PASSED ✅' if gate_passed else 'FAILED 🚫'}")
 
