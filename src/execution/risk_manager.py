@@ -9,8 +9,21 @@ class RiskProfile:
     sl_atr_multiplier: float = 0.5
     tp_atr_multiplier: float = 3.0
     min_sl_pct: float = 0.0015  # 0.15% absolute floor
+    min_sl_pips: float = 2.0     # Default Forex pip floor (2.0 pips)
     risk_per_trade: float = 0.02 # 2% of account
     max_notional_cap: float = 100000.0
+    round_precision: int = 4
+
+    @classmethod
+    def for_asset_class(cls, asset_class: str) -> "RiskProfile":
+        if asset_class == "forex":
+            return cls(
+                sl_atr_multiplier=1.0,
+                tp_atr_multiplier=2.0,
+                min_sl_pips=2.0,
+                round_precision=5,
+            )
+        return cls()
 
 class RiskManager:
     """
@@ -19,21 +32,41 @@ class RiskManager:
     def __init__(self, profile: RiskProfile = RiskProfile()):
         self.profile = profile
 
-    def calculate_bracket(self, entry_price: float, raw_atr: float) -> Optional[Tuple[float, float]]:
+    def calculate_bracket(
+        self, entry_price: float, raw_atr: float, symbol: Optional[str] = None
+    ) -> Optional[Tuple[float, float]]:
         """
         Applies multipliers and A3 chop filter to raw ATR volatility.
 
         Returns (sl_distance, tp_distance) or None if A3 filter rejects the trade
-        (volatility too low — 0.5x ATR stop would sit below the 0.15% floor).
+        (volatility too low — 0.5x ATR stop would sit below the floor).
         """
         sl_dist = raw_atr * self.profile.sl_atr_multiplier
         tp_dist = raw_atr * self.profile.tp_atr_multiplier
 
+        # Determine the stop-loss floor
+        if symbol and self._is_forex_symbol(symbol):
+            pip_size = self._get_forex_pip_size(symbol)
+            floor = self.profile.min_sl_pips * pip_size
+        else:
+            floor = entry_price * self.profile.min_sl_pct
+
         # A3 chop filter: if the stop floor would override the ATR stop, skip entirely
-        if sl_dist < (entry_price * self.profile.min_sl_pct):
+        if sl_dist < floor:
             return None
 
-        return round(sl_dist, 4), round(tp_dist, 4)
+        return round(sl_dist, self.profile.round_precision), round(tp_dist, self.profile.round_precision)
+
+    def _is_forex_symbol(self, symbol: str) -> bool:
+        clean = symbol.replace("_", "").replace("/", "").upper()
+        return len(clean) == 6 and clean.isalpha()
+
+    def _get_forex_pip_size(self, symbol: str) -> float:
+        clean = symbol.replace("_", "").replace("/", "").upper()
+        quote = clean[-3:]
+        if quote == "JPY":
+            return 0.01
+        return 0.0001
 
     def calculate_quantity(
         self,
@@ -51,6 +84,7 @@ class RiskManager:
         crypto available funds in the cash field, not buying_power).
         Returns 0.0 if the resulting notional is below the $50 zombie-trade floor.
         """
+        # 05192026: shouldn't apply to forex trades
         risk_dollars = equity * self.profile.risk_per_trade
         risk_per_share = entry_price - sl_price
 

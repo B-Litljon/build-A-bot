@@ -36,6 +36,19 @@ class V3BaseFeatures(BaseFeatureGenerator):
     """
 
     def generate(self, df: pl.DataFrame) -> pl.DataFrame:
+        has_symbol = "symbol" in df.columns
+        if has_symbol and df["symbol"].n_unique() > 1:
+            # Sort to keep things deterministic and ordered
+            df_sorted = df.sort(["symbol", "timestamp"])
+            parts = []
+            for sym in df_sorted["symbol"].unique().sort().to_list():
+                sym_df = df_sorted.filter(pl.col("symbol") == sym)
+                parts.append(self._generate_single_symbol(sym_df))
+            return pl.concat(parts, how="vertical_relaxed")
+        else:
+            return self._generate_single_symbol(df)
+
+    def _generate_single_symbol(self, df: pl.DataFrame) -> pl.DataFrame:
         close: np.ndarray = df["close"].to_numpy()
         high: np.ndarray = df["high"].to_numpy()
         low: np.ndarray = df["low"].to_numpy()
@@ -75,7 +88,7 @@ class V3BaseFeatures(BaseFeatureGenerator):
         df = df.with_columns(
             (
                 (pl.col("close") - pl.col("bb_lower"))
-                / (pl.col("bb_upper") - pl.col("bb_lower"))
+                / (pl.col("bb_upper") - pl.col("bb_lower") + 1e-9)
             ).alias("bb_pct_b"),
             ((pl.col("bb_upper") - pl.col("bb_lower")) / pl.col("bb_middle")).alias(
                 "bb_width_pct"
@@ -126,6 +139,35 @@ class V3BaseFeatures(BaseFeatureGenerator):
 
         return df
 
+class V3SessionFeatures(BaseFeatureGenerator):
+    """
+    Binary session-activity indicators from the UTC hour of `timestamp`.
+
+    Forex / metals microstructure regimes shift sharply across the three
+    major trading sessions; capturing them lets the model condition on
+    activity context rather than rediscover the bins from `hour_of_day`.
+
+    Session windows (UTC, conservative midpoints across DST seasons):
+        Asia/Tokyo   : 00:00 – 09:00
+        London       : 07:00 – 16:00
+        New York     : 12:00 – 21:00
+        London/NY    : 12:00 – 16:00  (overlap — the volatility sweet spot)
+
+    Produces (all Int8 0/1): session_asia, session_london, session_ny,
+    session_overlap.
+    """
+
+    def generate(self, df: pl.DataFrame) -> pl.DataFrame:
+        hour = pl.col("timestamp").dt.hour()
+        # closed="left" → [start, end). Hour values are 0..23 ints.
+        return df.with_columns(
+            hour.is_between(0, 9, closed="left").cast(pl.Int8).alias("session_asia"),
+            hour.is_between(7, 16, closed="left").cast(pl.Int8).alias("session_london"),
+            hour.is_between(12, 21, closed="left").cast(pl.Int8).alias("session_ny"),
+            hour.is_between(12, 16, closed="left").cast(pl.Int8).alias("session_overlap"),
+        )
+
+
 class V3HTFFeatures(BaseFeatureGenerator):
     """
     Compute higher-timeframe features and join them onto the 1m DataFrame
@@ -163,7 +205,7 @@ class V3HTFFeatures(BaseFeatureGenerator):
         if has_symbol:
             htf_bars = (
                 df.sort(["symbol", "timestamp"])
-                .group_by_dynamic("timestamp", every=self.timeframe, by="symbol")
+                .group_by_dynamic("timestamp", every=self.timeframe, group_by="symbol")
                 .agg(
                     pl.col("open").first().alias("htf_open"),
                     pl.col("high").max().alias("htf_high"),
@@ -271,13 +313,16 @@ class V3HTFFeatures(BaseFeatureGenerator):
         df_sorted = df.sort(["symbol", "timestamp"] if has_symbol else "timestamp")
 
         if has_symbol:
-            df_sorted = df_sorted.join_asof(
-                htf_features,
-                left_on="timestamp",
-                right_on="available_at",
-                by="symbol",
-                strategy="backward",
-            )
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                df_sorted = df_sorted.join_asof(
+                    htf_features,
+                    left_on="timestamp",
+                    right_on="available_at",
+                    by="symbol",
+                    strategy="backward",
+                )
         else:
             df_sorted = df_sorted.join_asof(
                 htf_features,

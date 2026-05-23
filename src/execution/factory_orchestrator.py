@@ -112,7 +112,7 @@ class FactoryOrchestrator:
         entry = signal.entry_price
 
         # Path Alpha: delegate multipliers and A3 chop filter to RiskManager
-        bracket = self.risk_manager.calculate_bracket(entry, signal.raw_sl_distance)
+        bracket = self.risk_manager.calculate_bracket(entry, signal.raw_sl_distance, symbol=symbol)
         if bracket is None:
             logger.info(f"[{symbol}] Volatility too low, skipping trade")
             return

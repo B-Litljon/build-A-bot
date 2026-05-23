@@ -17,11 +17,12 @@ import logging
 import os
 import signal as sig
 import threading
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
 import polars as pl
 
-from data.oanda_provider import OandaMarketProvider
+from data.oanda_provider import OandaMarketProvider, _to_oanda_symbol
 from execution.oanda_order_manager import OandaOrderManager
 from execution.risk_manager import RiskManager
 from strategies.concrete_strategies.ml_strategy import MLStrategy
@@ -75,8 +76,20 @@ class OandaScalperOrchestrator:
         self._warmup = warmup_period or strategy.warmup_period
         self._max_bars = self._warmup * 2
 
-        # Rolling bar buffers: symbol -> list of bar dicts
-        self._bar_buffers: Dict[str, List[dict]] = {s: [] for s in symbols}
+        # Rolling bar buffers: normalized symbol -> list of bar dicts
+        self._bar_buffers: Dict[str, List[dict]] = {
+            _to_oanda_symbol(s): [] for s in symbols
+        }
+
+        # History seam state: normalized symbol -> last historical timestamp
+        self._last_hist_ts: Dict[str, Optional[datetime]] = {
+            _to_oanda_symbol(s): None for s in symbols
+        }
+
+        # History seam state: normalized symbol -> seam crossed flag
+        self._seam_crossed: Dict[str, bool] = {
+            _to_oanda_symbol(s): False for s in symbols
+        }
 
         # Position state: symbol -> {entry, sl, tp, units, state}
         self._positions: Dict[str, dict] = {}
@@ -161,6 +174,20 @@ class OandaScalperOrchestrator:
         """Process a completed bar: update buffer, generate signal, trade."""
         symbol = bar["symbol"]
 
+        # ── history/stream seam: drop overlap and partial seam bar ──
+        last_ts = self._last_hist_ts.get(symbol)
+        if last_ts is not None and not self._seam_crossed.get(symbol, False):
+            if bar["timestamp"] <= last_ts:
+                return  # Drop overlap
+            else:
+                self._seam_crossed[symbol] = True
+                logger.info(
+                    "[%s] Dropping partial seam bar at %s; stream is now clean",
+                    symbol,
+                    bar["timestamp"],
+                )
+                return  # Drop the first bar > last_ts (the partial seam bar)
+
         # ── update rolling buffer ──
         buf = self._bar_buffers.get(symbol)
         if buf is None:
@@ -208,7 +235,7 @@ class OandaScalperOrchestrator:
         tp_price: Optional[float] = None
         if self._risk_manager is not None:
             bracket = self._risk_manager.calculate_bracket(
-                signal.entry_price, signal.raw_sl_distance
+                signal.entry_price, signal.raw_sl_distance, symbol=symbol
             )
             if bracket:
                 sl_dist, tp_dist = bracket
@@ -292,6 +319,81 @@ class OandaScalperOrchestrator:
 
     # ── lifecycle ─────────────────────────────────────────────────────
 
+    async def _prime_history(self) -> None:
+        """Prime bar buffers with historical REST data to bypass cold warm-up."""
+        for symbol in self._symbols:
+            norm_sym = _to_oanda_symbol(symbol)
+            gran_min = getattr(self._provider, "_stream_gran", 1)
+            start = datetime.now(timezone.utc) - timedelta(days=5)
+            end = datetime.now(timezone.utc)
+
+            try:
+                df = await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    self._provider.get_historical_bars,
+                    symbol,
+                    gran_min,
+                    start,
+                    end,
+                )
+            except Exception as e:
+                logger.warning(
+                    "[%s] Historical bars fetch failed: %s", norm_sym, e
+                )
+                continue
+
+            if df.is_empty():
+                logger.warning("[%s] Historical bars returned empty", norm_sym)
+                continue
+
+            df = df.tail(self._warmup + 5)
+
+            hist_bars = []
+            for row in df.iter_rows(named=True):
+                assert row["timestamp"].tzinfo is not None
+                hist_bars.append({**row, "symbol": norm_sym})
+
+            self._bar_buffers[norm_sym].extend(hist_bars)
+            self._last_hist_ts[norm_sym] = df.select("timestamp").row(-1)[0]
+            logger.info(
+                "[%s] Primed %d historical bars (tail) up to %s",
+                norm_sym,
+                len(hist_bars),
+                self._last_hist_ts[norm_sym],
+            )
+
+    async def _stream_with_retry(self) -> None:
+        """Run the pricing stream with reconnect-on-disconnect."""
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.to_thread(self._provider.run_stream)
+            except Exception as e:
+                logger.error("OandaMarketProvider stream disconnected: %s", e)
+            else:
+                if not self._shutdown_event.is_set():
+                    logger.warning(
+                        "Stream returned without shutdown signal; treating as disconnect"
+                    )
+
+            if self._shutdown_event.is_set():
+                break
+
+            logger.warning("Stream reconnect in 5s; re-priming history on resume")
+            await asyncio.sleep(5)
+
+            # Reset seam state so re-prime + new stream dedup cleanly
+            for sym in list(self._bar_buffers.keys()):
+                self._bar_buffers[sym] = []
+                self._last_hist_ts[sym] = None
+                self._seam_crossed[sym] = False
+
+            await self._prime_history()
+
+            # Defensive: clear provider stop event in case it was set
+            self._provider._stop_event.clear()
+
+            logger.info("Stream reconnect: priming complete, resuming stream")
+
     async def run(self) -> None:
         """Start the orchestrator loop."""
         self._loop = asyncio.get_running_loop()
@@ -311,12 +413,10 @@ class OandaScalperOrchestrator:
             tick_callback=self._on_tick,
         )
 
-        # Run the blocking pricing stream in a thread-pool executor
-        self._stream_task = asyncio.create_task(
-            asyncio.get_running_loop().run_in_executor(
-                None, self._provider.run_stream
-            )
-        )
+        await self._prime_history()
+
+        # Run the pricing stream with reconnect-on-disconnect wrapper
+        self._stream_task = asyncio.create_task(self._stream_with_retry())
 
         logger.info(
             "OandaScalperOrchestrator started | symbols=%s warmup=%d",

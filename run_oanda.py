@@ -20,6 +20,10 @@ import os
 import sys
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 # ---------------------------------------------------------------------------
 # Path bootstrap — must happen before ANY src/ imports.
 # ---------------------------------------------------------------------------
@@ -35,7 +39,7 @@ from execution.oanda_order_manager import OandaOrderManager  # noqa: E402
 from execution.oanda_scalper_orchestrator import (  # noqa: E402
     OandaScalperOrchestrator,
 )
-from execution.risk_manager import RiskManager  # noqa: E402
+from execution.risk_manager import RiskManager, RiskProfile  # noqa: E402
 from strategies.concrete_strategies.ml_strategy import MLStrategy  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -79,6 +83,12 @@ def _parse_args() -> argparse.Namespace:
         default=False,
         help="Headless mode (plain logging, no Rich UI)",
     )
+    parser.add_argument(
+        "--granularity",
+        type=int,
+        default=1,
+        help="Stream granularity/timeframe in minutes (default: 1)",
+    )
     return parser.parse_args()
 
 
@@ -100,10 +110,26 @@ async def _main() -> None:
         symbols = list(DEFAULT_SYMBOLS)
 
     # ── initialise components ──
-    provider = OandaMarketProvider(environment=args.env)
+    provider = OandaMarketProvider(
+        environment=args.env,
+        stream_granularity_minutes=args.granularity,
+    )
     order_manager = OandaOrderManager(environment=args.env)
-    strategy = MLStrategy()
-    risk_manager = RiskManager()
+    
+    htf_tf = "30m" if args.granularity == 5 else "5m"
+    warmup_pd = 300 if args.granularity == 5 else 260
+    strategy = MLStrategy(
+        asset_class="forex",
+        timeframe=args.granularity,
+        htf_timeframe=htf_tf,
+        warmup_period=warmup_pd,
+    )
+    
+    # Forex volatility is a fraction of Equities. Use a derived 2.0 pips stop-loss floor
+    # so the chop filter doesn't reject everything.
+    # Set round_precision=5 since Forex pairs are quoted to 5 decimal places natively.
+    risk_profile = RiskProfile.for_asset_class("forex")
+    risk_manager = RiskManager(profile=risk_profile)
 
     orchestrator = OandaScalperOrchestrator(
         symbols=symbols,

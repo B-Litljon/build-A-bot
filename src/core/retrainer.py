@@ -32,39 +32,23 @@ import os
 import sys
 import warnings
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 import joblib
 import numpy as np
 import polars as pl
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import (
-    TimeFrame as _AlpacaTimeFrame,
-    TimeFrameUnit as _AlpacaTimeFrameUnit,
-)
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import brier_score_loss
 from sklearn.model_selection import cross_val_predict, TimeSeriesSplit
 
-from src.data.timeframe import TimeFrame, TimeFrameUnit
-from src.data.enums import DataFeed
-from src.ml.feature_pipeline import FeatureEngineer
+from src.data.factory import get_market_provider
+from src.data.market_provider import MarketDataProvider
+from src.execution.risk_manager import RiskProfile
+from src.ml.feature_pipeline import FeaturePipeline
+from src.ml.features.v3_features import V3BaseFeatures, V3HTFFeatures, V3SessionFeatures
 from src.core.notification_manager import NotificationManager
-
-_ALPACA_TFU = {
-    TimeFrameUnit.MINUTE: _AlpacaTimeFrameUnit.Minute,
-    TimeFrameUnit.HOUR: _AlpacaTimeFrameUnit.Hour,
-    TimeFrameUnit.DAY: _AlpacaTimeFrameUnit.Day,
-    TimeFrameUnit.WEEK: _AlpacaTimeFrameUnit.Week,
-    TimeFrameUnit.MONTH: _AlpacaTimeFrameUnit.Month,
-}
-
-
-def _to_alpaca_timeframe(tf: TimeFrame) -> _AlpacaTimeFrame:
-    return _AlpacaTimeFrame(tf.amount, _ALPACA_TFU[tf.unit])
 
 logging.basicConfig(
     level=logging.INFO,
@@ -76,33 +60,85 @@ logger = logging.getLogger(__name__)
 # CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-DAYS_BACK = 60
-TICKERS: List[str] = ["TSLA", "NVDA", "MARA", "COIN", "SMCI"]
-TIMEFRAME = TimeFrame(1, TimeFrameUnit.MINUTE)
-DATA_FEED = DataFeed.IEX
+DAYS_BACK = int(os.getenv("RETRAIN_DAYS_BACK", "60"))
+# Forex basket pivoted 2026-05-23 from G7 majors (failed integrity gate, NO
+# SIGNAL separation) to a volatility-first basket: two liquid metals plus
+# three JPY/AUD-crossing pairs known for wide intraday ranges. XPT/XPD
+# skipped — too illiquid on OANDA for scalping.
+_DEFAULT_TICKERS_BY_CLASS = {
+    "forex": [
+        "XAU_USD", "XAG_USD",                        # liquid metals
+        "GBP_JPY", "AUD_JPY", "EUR_JPY", "NZD_JPY",  # JPY-cross volatility
+        "GBP_AUD", "GBP_NZD",                        # commonwealth crosses
+    ],
+    "equities": ["TSLA", "NVDA", "MARA", "COIN", "SMCI"],
+}
 
-# Model Paths
-MODEL_DIR = Path("models")
-ANGEL_PATH = MODEL_DIR / "angel_latest.pkl"
-DEVIL_PATH = MODEL_DIR / "devil_latest.pkl"
+def _asset_class_for_source(data_source: str) -> str:
+    if data_source == "oanda":
+        return "forex"
+    return "equities"
+
+def get_asset_config(data_source: str) -> dict:
+    """Get dynamic configurations for retraining based on the data source."""
+    asset_class = _asset_class_for_source(data_source)
+    profile = RiskProfile.for_asset_class(asset_class)
+    default_tickers = _DEFAULT_TICKERS_BY_CLASS[asset_class]
+    
+    # Asset-class specific overrides
+    if asset_class == "forex":
+        max_hold = 45
+        timeframe = 1
+        htf_timeframe = "5m"
+    else:
+        max_hold = 45
+        timeframe = 1
+        htf_timeframe = "5m"
+        
+    return {
+        "asset_class": asset_class,
+        "tickers": [t.strip() for t in os.getenv("RETRAIN_SYMBOLS", ",".join(default_tickers)).split(",") if t.strip()],
+        "sl_mult": profile.sl_atr_multiplier,
+        "tp_mult": profile.tp_atr_multiplier,
+        "max_hold": int(os.getenv("RETRAIN_MAX_HOLD", str(max_hold))),
+        "survival_bars": int(os.getenv("RETRAIN_SURVIVAL", "5")),
+        "timeframe_minutes": int(os.getenv("RETRAIN_TIMEFRAME_MINUTES", str(timeframe))),
+        "htf_timeframe": os.getenv("RETRAIN_HTF_TIMEFRAME", htf_timeframe),
+    }
 
 # Model Hyperparameters
-ANGEL_PARAMS = {
-    "n_estimators": 100,
-    "max_depth": 10,
-    "random_state": 42,
-    "n_jobs": -1,
-}
+def get_hyperparameters(asset_class: str) -> Tuple[dict, dict]:
+    """
+    Get hyperparameter configurations for Angel and Devil models based on asset class.
+    """
+    # min_samples_leaf=20 floor for forex: leaf=1 (Gemini 2026-05-23) memorized
+    # the 1,043-row Angel-approved subset, producing a Fold 3 separation gap that
+    # collapsed from +0.0718 → -0.0092 across a 10-hour window shift. leaf=50
+    # was the prior production floor but starves forex (~0.3% Angel approval).
+    # 20 is the defensible middle ground. See llm_reports/audits/2026-05-23.
+    angel_params = {
+        "n_estimators": 100,
+        "max_depth": 10,
+        "min_samples_leaf": 20 if asset_class == "forex" else 50,
+        "class_weight": None if asset_class == "forex" else "balanced",
+        "random_state": 42,
+        "n_jobs": -1,
+    }
 
-DEVIL_PARAMS = {
-    "n_estimators": 100,
-    "max_depth": 8,
-    "random_state": 42,
-    # class_weight intentionally None — the Devil must learn the true ~20%
-    # base rate. "balanced" artificially inflated probabilities, causing
-    # Brier Score failure (0.31 > 0.25 threshold) and rubber-stamping.
-    "n_jobs": -1,
-}
+    devil_params = {
+        "n_estimators": 100,
+        "max_depth": 8,
+        "min_samples_leaf": 20 if asset_class == "forex" else 50,
+        "class_weight": None,
+        "random_state": 42,
+        "n_jobs": -1,
+    }
+
+    return angel_params, devil_params
+
+# Fallback constants for backward compatibility
+ANGEL_PARAMS, DEVIL_PARAMS = get_hyperparameters("equities")
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ATR BRACKET PARAMETERS (must match evaluate_performance.py and LiveOrchestrator)
@@ -132,9 +168,15 @@ BRIER_THRESHOLD = 0.30  # Phase 5.5: raised from 0.25 — survival target base r
 # genuinely uncalibrated models.
 EV_THRESHOLD = 0.0005  # Min acceptable Expected Value
 PROFIT_FACTOR_THRESHOLD = 1.2  # Min acceptable Profit Factor
+# Sample-size floor for Fold 3 OOS PF: small trade counts under high R:R
+# (TP=3.0×ATR / SL=0.5×ATR ⇒ 6:1 payoff) produce false-positive gate passes
+# from a handful of lucky wins. Empirically the 2026-05-23 Gemini run "passed"
+# with 14–16 OOS trades while the Devil's own separation diagnostic read
+# "NO SIGNAL." 100 is the minimum sample for any honest PF claim.
+MIN_OOS_TRADES_FOR_PF = 100
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# FEATURE COLUMNS (must match MLStrategy.feature_names and FeatureEngineer output)
+# FEATURE COLUMNS (must match MLStrategy.feature_names and FeaturePipeline output)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 FEATURE_COLS: List[str] = [
@@ -158,6 +200,13 @@ FEATURE_COLS: List[str] = [
     "bar_body_pct",
     "bar_upper_wick_pct",
     "bar_lower_wick_pct",
+    # V3.5 (2026-05-23): UTC session-activity indicators — tame G7 + XAU
+    # failed at M1 with the 18-feature vector; sessions condition the model
+    # on activity regime (London/NY overlap = volatility sweet spot).
+    "session_asia",
+    "session_london",
+    "session_ny",
+    "session_overlap",
 ]
 
 
@@ -199,66 +248,53 @@ class ValidationReport:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def get_alpaca_client() -> StockHistoricalDataClient:
-    """Initialize Alpaca client from environment variables."""
-    api_key = os.getenv("ALPACA_API_KEY")
-    secret_key = os.getenv("ALPACA_SECRET_KEY")
-
-    if not api_key or not secret_key:
-        raise ValueError(
-            "ALPACA_API_KEY and ALPACA_SECRET_KEY environment variables must be set"
-        )
-
-    return StockHistoricalDataClient(api_key, secret_key)
-
-
 def fetch_training_data(
-    client: StockHistoricalDataClient,
+    provider: MarketDataProvider,
+    symbols: List[str],
     days_back: int = DAYS_BACK,
+    timeframe_minutes: int = 1,
 ) -> pl.DataFrame:
     """
-    Fetch historical 1-minute bars for training.
+    Fetch historical 1-minute bars for training using the unified provider.
 
     Args:
-        client: Alpaca API client
+        provider: MarketDataProvider instance
+        symbols: List of symbols to fetch
         days_back: Number of days to fetch (default: 60)
 
     Returns:
-        Polars DataFrame with OHLCV data for all tickers
+        Polars DataFrame with OHLCV data for all symbols
     """
     logger.info("=" * 70)
     logger.info("FETCHING TRAINING DATA")
     logger.info("=" * 70)
 
-    end_date = datetime.now()
+    # Use timezone-aware UTC datetime
+    end_date = datetime.now(timezone.utc)
     start_date = end_date - timedelta(days=days_back)
 
     logger.info(f"Date range: {start_date.date()} to {end_date.date()}")
-    logger.info(f"Tickers: {', '.join(TICKERS)}")
+    logger.info(f"Symbols: {', '.join(symbols)}")
     logger.info(f"Timeframe: 1-minute bars")
 
     all_frames: List[pl.DataFrame] = []
 
-    for ticker in TICKERS:
+    for ticker in symbols:
         try:
-            request = StockBarsRequest(
-                symbol_or_symbols=ticker,
-                timeframe=_to_alpaca_timeframe(TIMEFRAME),
+            # Fetch bars using generic provider
+            df = provider.get_historical_bars(
+                symbol=ticker,
+                timeframe_minutes=timeframe_minutes,
                 start=start_date,
                 end=end_date,
-                feed=DATA_FEED,
             )
 
-            bars = client.get_stock_bars(request)
-
-            if not bars.data or ticker not in bars.data:
+            if df is None or df.is_empty():
                 logger.warning(f"No data returned for {ticker}")
                 continue
 
-            # Convert to Polars
-            df_pandas = bars.df.reset_index()
-            df_pandas.columns = [col.lower() for col in df_pandas.columns]
-            df = pl.from_pandas(df_pandas)
+            # Ensure column names are lowercase
+            df.columns = [col.lower() for col in df.columns]
 
             # Add symbol column if not present
             if "symbol" not in df.columns:
@@ -272,9 +308,9 @@ def fetch_training_data(
             continue
 
     if not all_frames:
-        raise ValueError("No data fetched for any ticker")
+        raise ValueError("No data fetched for any symbol")
 
-    # Combine all tickers
+    # Combine all symbols
     combined = pl.concat(all_frames, how="vertical_relaxed")
     combined = combined.sort(["symbol", "timestamp"])
 
@@ -325,6 +361,7 @@ def _compute_devil_targets_atr(
     high = df["high"].to_numpy()
     low = df["low"].to_numpy()
     natr = df["natr_14"].to_numpy()
+    symbol = df["symbol"].to_numpy() if "symbol" in df.columns else np.array([""] * len(close))
     n = len(close)
     targets = np.zeros(n, dtype=np.int8)
 
@@ -337,6 +374,8 @@ def _compute_devil_targets_atr(
         tp_price = close[i] + tp_mult * atr_abs
 
         for j in range(i + 1, min(i + max_hold + 1, n)):
+            if symbol[j] != symbol[i]:
+                break
             # SL checked first (conservative — matches evaluate_performance.py)
             if low[j] <= sl_price:
                 targets[i] = 0
@@ -386,10 +425,15 @@ def _compute_devil_survival_target(
     close = df["close"].to_numpy()
     low = df["low"].to_numpy()
     natr = df["natr_14"].to_numpy()
+    symbol = df["symbol"].to_numpy() if "symbol" in df.columns else np.array([""] * len(close))
     n = len(close)
     targets = np.zeros(n, dtype=np.int8)
 
     for i in range(n - 1):
+        # Insufficient lookahead safety: check if symbol changes before survival window completes
+        if i + survival_bars >= n or symbol[i + survival_bars] != symbol[i]:
+            continue  # leaves targets[i] = 0 (default)
+
         atr_abs = close[i] * natr[i] / 100.0
         if np.isnan(atr_abs) or atr_abs <= 0:
             continue
@@ -398,6 +442,9 @@ def _compute_devil_survival_target(
         survived = True
 
         for j in range(i + 1, min(i + survival_bars + 1, n)):
+            if symbol[j] != symbol[i]:
+                survived = False
+                break
             if low[j] <= sl_price:
                 survived = False
                 break
@@ -412,24 +459,36 @@ def _compute_devil_survival_target(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def engineer_features_and_labels(df: pl.DataFrame) -> Tuple[pl.DataFrame, List[str]]:
+def engineer_features_and_labels(
+    df: pl.DataFrame,
+    sl_mult: float = SL_ATR_MULTIPLIER,
+    tp_mult: float = TP_ATR_MULTIPLIER,
+    max_hold: int = MAX_HOLD_BARS,
+    survival_bars: int = SURVIVAL_BARS,
+    htf_timeframe: str = "5m",
+) -> Tuple[pl.DataFrame, List[str]]:
     """
     Engineer technical features and generate ATR-dynamic target labels.
 
-    Delegates feature computation to FeatureEngineer.compute_indicators() to
+    Delegates feature computation to FeaturePipeline to
     guarantee zero training/inference skew with the production MLStrategy.
 
-    Features (produced by FeatureEngineer, matches MLStrategy.feature_names):
+    Features (produced by FeaturePipeline, matches MLStrategy.feature_names):
         rsi_14, ppo, natr_14, bb_pct_b, bb_width_pct,
         price_sma50_ratio, log_return, hour_of_day, dist_sma50, vol_rel
 
     Targets:
-        angel_target: 1 if close 3 bars ahead > close + 0.5 × ATR (ATR-relative)
-        devil_target: 1 if TP (3.0 × ATR) hit before SL (0.5 × ATR) in ≤45 bars
+        angel_target: 1 if close 3 bars ahead > close + sl_mult × ATR (ATR-relative)
+        devil_target: 1 if TP (tp_mult × ATR) hit before SL (sl_mult × ATR) in ≤max_hold bars
 
     Args:
         df: Raw OHLCV DataFrame with columns:
             open, high, low, close, volume, symbol, timestamp
+        sl_mult: Stop-loss ATR multiplier
+        tp_mult: Take-profit ATR multiplier
+        max_hold: Maximum hold bars
+        survival_bars: Number of survival bars for devil training
+        htf_timeframe: Higher timeframe representation for HTFFeatures
 
     Returns:
         Tuple of (features DataFrame with targets, feature column names)
@@ -439,10 +498,18 @@ def engineer_features_and_labels(df: pl.DataFrame) -> Tuple[pl.DataFrame, List[s
     logger.info("=" * 70)
 
     # ═══════════════════════════════════════════════════════════════════
-    # TECHNICAL INDICATORS via FeatureEngineer (prevents training/inference skew)
+    # TECHNICAL INDICATORS via FeaturePipeline (prevents training/inference skew)
     # ═══════════════════════════════════════════════════════════════════
-    logger.info("Computing indicators via FeatureEngineer (zero-skew pipeline)...")
-    df = FeatureEngineer().compute_indicators(df)
+    logger.info("Computing indicators via FeaturePipeline (zero-skew pipeline)...")
+    pipeline = FeaturePipeline(
+        feature_generators=[
+            V3BaseFeatures(),
+            V3HTFFeatures(timeframe=htf_timeframe),
+            V3SessionFeatures(),
+        ]
+    )
+    for gen in pipeline.feature_generators:
+        df = gen.generate(df)
     logger.info(
         "Applied indicators: RSI, PPO, NATR, BBANDS, SMA50, log_return, "
         "hour_of_day, vol_rel"
@@ -450,66 +517,66 @@ def engineer_features_and_labels(df: pl.DataFrame) -> Tuple[pl.DataFrame, List[s
 
     # ═══════════════════════════════════════════════════════════════════
     # ANGEL TARGET: ATR-relative 3-bar momentum
-    # 1 if close 3 bars ahead > close + 0.5 × ATR_abs
+    # 1 if close 3 bars ahead > close + sl_mult × ATR_abs
     # natr_14 is a percentage: ATR_abs = close * natr_14 / 100
     # ═══════════════════════════════════════════════════════════════════
     df = df.with_columns(
         (
-            pl.col("close").shift(-3)
-            > pl.col("close") + 0.5 * (pl.col("close") * pl.col("natr_14") / 100.0)
+            pl.col("close").shift(-3).over("symbol")
+            > pl.col("close") + sl_mult * (pl.col("close") * pl.col("natr_14") / 100.0)
         )
         .cast(pl.Int8)
         .alias("angel_target")
     )
-    logger.info("Generated angel_target (ATR-relative 3-bar momentum)")
+    logger.info(f"Generated angel_target (ATR-relative 3-bar momentum with sl_mult={sl_mult})")
 
     # ═══════════════════════════════════════════════════════════════════
     # DEVIL TARGETS (Phase 5.5 — Two-Target Architecture)
     #
-    # devil_target_macro  — 45-bar bracket outcome (TP hit before SL).
+    # devil_target_macro  — max_hold-bar bracket outcome (TP hit before SL).
     #   Used ONLY during threshold calibration (_find_optimal_threshold).
     #   Computes realized EV on Devil-approved trades using the actual
-    #   asymmetric R:R payload (0.5× SL / 3.0× TP).
+    #   asymmetric R:R payload (sl_mult × SL / tp_mult × TP).
     #
-    # devil_target        — 5-bar SL survival.
+    # devil_target        — survival_bars-bar SL survival.
     #   Used to TRAIN the Devil. Aligns the learning objective with the
     #   1m microstructure feature horizon.
-    #   1 = price did NOT breach SL in the next 5 bars (survived)
-    #   0 = price breached SL within 5 bars (stopped out immediately)
+    #   1 = price did NOT breach SL in the next survival_bars bars (survived)
+    #   0 = price breached SL within survival_bars bars (stopped out immediately)
     # ═══════════════════════════════════════════════════════════════════
 
-    # -- Macro target (45-bar) — evaluation only -----------------------
+    # -- Macro target (max_hold-bar) — evaluation only -----------------------
     logger.info(
         f"Computing devil_target_macro via ATR bracket simulation "
-        f"(SL={SL_ATR_MULTIPLIER}×ATR, TP={TP_ATR_MULTIPLIER}×ATR, "
-        f"max_hold={MAX_HOLD_BARS} bars)..."
+        f"(SL={sl_mult}×ATR, TP={tp_mult}×ATR, "
+        f"max_hold={max_hold} bars)..."
     )
-    devil_targets_macro = _compute_devil_targets_atr(df)
+    devil_targets_macro = _compute_devil_targets_atr(df, sl_mult=sl_mult, tp_mult=tp_mult, max_hold=max_hold)
     df = df.with_columns(pl.Series("devil_target_macro", devil_targets_macro))
     logger.info(
-        f"Generated devil_target_macro (45-bar bracket): "
+        f"Generated devil_target_macro ({max_hold}-bar bracket): "
         f"{int(devil_targets_macro.sum())} wins / {len(devil_targets_macro)} total "
         f"({devil_targets_macro.mean():.1%} macro win rate)"
     )
 
-    # -- Survival target (5-bar) — Devil training ----------------------
+    # -- Survival target (survival_bars-bar) — Devil training ----------------------
     logger.info(
-        f"Computing devil_target via {SURVIVAL_BARS}-bar SL survival "
-        f"(SL={SL_ATR_MULTIPLIER}×ATR)..."
+        f"Computing devil_target via {survival_bars}-bar SL survival "
+        f"(SL={sl_mult}×ATR)..."
     )
-    devil_targets_survival = _compute_devil_survival_target(df)
+    devil_targets_survival = _compute_devil_survival_target(df, sl_mult=sl_mult, survival_bars=survival_bars)
     df = df.with_columns(pl.Series("devil_target", devil_targets_survival))
     logger.info(
-        f"Generated devil_target ({SURVIVAL_BARS}-bar survival): "
+        f"Generated devil_target ({survival_bars}-bar survival): "
         f"{int(devil_targets_survival.sum())} survived / {len(devil_targets_survival)} total "
         f"({devil_targets_survival.mean():.1%} survival rate)"
     )
 
     # ═══════════════════════════════════════════════════════════════════
-    # CLEANUP: Drop NaN/null rows (uses FeatureEngineer.clean_data)
+    # CLEANUP: Drop NaN/null rows (uses FeaturePipeline.clean_data)
     # ═══════════════════════════════════════════════════════════════════
     initial_count = len(df)
-    df = FeatureEngineer.clean_data(df)
+    df = FeaturePipeline.clean_data(df, feature_cols=FEATURE_COLS + ["angel_target", "devil_target"])
     dropped_count = initial_count - len(df)
 
     logger.info(
@@ -562,6 +629,8 @@ def generate_time_decay_weights(
 def refit_models(
     df: pl.DataFrame,
     feature_cols: List[str],
+    angel_params: Optional[dict] = None,
+    devil_params: Optional[dict] = None,
 ) -> Tuple[RandomForestClassifier, RandomForestClassifier, List[str], List[str]]:
     """
     Refit Angel and Devil models with time-decay weighting.
@@ -574,6 +643,8 @@ def refit_models(
     Args:
         df: Feature-engineered DataFrame with 'angel_target' and 'devil_target'
         feature_cols: List of base feature column names
+        angel_params: Hyperparameters for Angel classifier
+        devil_params: Hyperparameters for Devil classifier
 
     Returns:
         Tuple of (Angel model, Devil model, angel_features, devil_features)
@@ -581,6 +652,10 @@ def refit_models(
     logger.info("=" * 70)
     logger.info("REFITTING MODELS (META-LABELING)")
     logger.info("=" * 70)
+
+    # Resolve parameter configs
+    a_params = angel_params if angel_params is not None else ANGEL_PARAMS
+    d_params = devil_params if devil_params is not None else DEVIL_PARAMS
 
     # Extract base features and targets
     X_base = df[feature_cols].to_numpy()
@@ -606,8 +681,9 @@ def refit_models(
     # STEP 1: Train the Angel (Primary Model - Direction)
     # ═══════════════════════════════════════════════════════════════════
     logger.info("\n[Step 1/4] Training Angel model (Direction)...")
-    angel_model = RandomForestClassifier(**ANGEL_PARAMS)
-    angel_model.fit(X_base, y_angel, sample_weight=sample_weights)
+    angel_model = RandomForestClassifier(**a_params)
+    df_base = pl.DataFrame(X_base, schema=feature_cols).to_pandas()
+    angel_model.fit(df_base, y_angel, sample_weight=sample_weights)
     logger.info(f"✓ Angel model trained on {len(feature_cols)} features")
 
     # ═══════════════════════════════════════════════════════════════════
@@ -644,7 +720,7 @@ def refit_models(
 
         for fold_train_idx, fold_val_idx in tss.split(X_base):
             fold_weights = sample_weights[fold_train_idx]
-            fold_angel = RandomForestClassifier(**ANGEL_PARAMS)
+            fold_angel = RandomForestClassifier(**a_params)
             fold_angel.fit(
                 X_base[fold_train_idx],
                 y_angel[fold_train_idx],
@@ -659,7 +735,7 @@ def refit_models(
         head_missing = np.isnan(angel_probs_oof)
         if head_missing.sum() > 0:
             first_train_idx, _ = next(iter(tss.split(X_base)))
-            head_angel = RandomForestClassifier(**ANGEL_PARAMS)
+            head_angel = RandomForestClassifier(**a_params)
             head_angel.fit(
                 X_base[first_train_idx],
                 y_angel[first_train_idx],
@@ -728,8 +804,9 @@ def refit_models(
     )
     logger.info(f"Devil feature space: {devil_features}")
 
-    devil_model = RandomForestClassifier(**DEVIL_PARAMS)
-    devil_model.fit(X_devil, y_devil_train, sample_weight=devil_weights)
+    devil_model = RandomForestClassifier(**d_params)
+    df_devil = pl.DataFrame(X_devil, schema=devil_features).to_pandas()
+    devil_model.fit(df_devil, y_devil_train, sample_weight=devil_weights)
     logger.info(
         f"✓ Devil model trained on {len(devil_features)} features "
         f"(Angel-approved subpopulation, n={n_approved:,})"
@@ -837,7 +914,11 @@ def _find_optimal_threshold(
 def validate_candidate(
     df: pl.DataFrame,
     feature_cols: List[str],
+    sl_mult: float = SL_ATR_MULTIPLIER,
+    tp_mult: float = TP_ATR_MULTIPLIER,
     n_folds: int = 3,
+    angel_params: Optional[dict] = None,
+    devil_params: Optional[dict] = None,
 ) -> Tuple[
     ValidationReport,
     RandomForestClassifier,
@@ -881,6 +962,8 @@ def validate_candidate(
         df: Full 60-day feature-engineered DataFrame (output of
             engineer_features_and_labels).
         feature_cols: List of base feature column names.
+        sl_mult: Stop-loss ATR multiplier
+        tp_mult: Take-profit ATR multiplier
         n_folds: Number of expanding folds (default: 3).
 
     Returns:
@@ -901,11 +984,17 @@ def validate_candidate(
     # ───────────────────────────────────────────────────────────────────
     min_date = df["timestamp"].min()
 
-    # fold_configs: (train_end_days, val_end_days) — exclusive upper bounds
+    # fold_configs: (train_end_days, val_end_days) — exclusive upper bounds.
+    # Fractions chosen to reproduce the legacy 60-day schedule exactly:
+    #   (30,40),(40,50),(50,60) at DAYS_BACK=60.
+    # For larger windows the same expanding-train / fixed-fraction-val shape
+    # scales (e.g. DAYS_BACK=180 → (90,120),(120,150),(150,180)). Without
+    # this scaling the val sets stayed pinned to days 30–60 and 67% of any
+    # extended window was silently discarded.
     fold_configs = [
-        (30, 40),  # Fold 1: Train days 0–29, Val days 30–39
-        (40, 50),  # Fold 2: Train days 0–39, Val days 40–49
-        (50, 60),  # Fold 3: Train days 0–49, Val days 50–59
+        (DAYS_BACK // 2,     DAYS_BACK * 2 // 3),   # train 0–½,  val ½–⅔
+        (DAYS_BACK * 2 // 3, DAYS_BACK * 5 // 6),   # train 0–⅔,  val ⅔–⅚
+        (DAYS_BACK * 5 // 6, DAYS_BACK),            # train 0–⅚,  val ⅚–1
     ]
 
     fold_metrics: List[FoldMetrics] = []
@@ -919,6 +1008,12 @@ def validate_candidate(
     final_win_rate: float = 0.0
     final_total_trades: int = 0
     production_threshold: float = 0.20  # fallback; overwritten by Fold 3
+    # Fold n_folds-1 (the "calibration" fold) sweeps for an optimal threshold;
+    # that threshold is frozen and applied to Fold n_folds for strict OOS gate
+    # evaluation. Without this freeze, the threshold sweep on Fold 3 would
+    # leak validation info into the production parameter — historically
+    # surfaced as PF=3.3 on 16 trades with separation gap = -0.0092.
+    calibration_threshold: Optional[float] = None
 
     for fold_idx, (train_end_day, val_end_day) in enumerate(fold_configs):
         fold_number = fold_idx + 1
@@ -961,7 +1056,7 @@ def validate_candidate(
         # Train on this fold's training window
         # ─────────────────────────────────────────────────────────────
         angel_model, devil_model, angel_feats, devil_feats = refit_models(
-            train_df, feature_cols
+            train_df, feature_cols, angel_params=angel_params, devil_params=devil_params
         )
 
         # ─────────────────────────────────────────────────────────────
@@ -1007,19 +1102,36 @@ def validate_candidate(
             continue
 
         # Stage 2: Devil inference on Angel-proposed rows
-        import pandas as pd  # noqa: PLC0415 — used only for sklearn compat
-
         proposed_base_feats = X_val_base[signal_mask]
         proposed_angel_probs = angel_probs_val[signal_mask]
         proposed_devil_targets = y_val_devil[signal_mask]  # survival — for Brier
         proposed_devil_targets_macro = y_val_devil_macro[signal_mask]  # macro — for EV
 
-        meta_df = pd.DataFrame(proposed_base_feats, columns=feature_cols)
-        meta_df["angel_prob"] = proposed_angel_probs
+        meta_df = pl.DataFrame(proposed_base_feats, schema=feature_cols).with_columns(
+            pl.Series("angel_prob", proposed_angel_probs)
+        )
 
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
-            devil_probs_val = devil_model.predict_proba(meta_df)[:, 1]
+            devil_proba_full = devil_model.predict_proba(meta_df)
+
+        # Defensive: if the Devil's training set was single-class (common on
+        # tiny single-symbol windows where Angel approves <10 rows that all
+        # survive or all stop), predict_proba returns shape (n, 1) and the
+        # `[:, 1]` indexer raises IndexError. Treat the constant as 1.0 if
+        # the only class seen was 1 (survived ⇒ no veto), else 0.0 (every
+        # proposal vetoed).
+        if devil_proba_full.shape[1] == 1:
+            only_class = int(devil_model.classes_[0])
+            const_prob = 1.0 if only_class == 1 else 0.0
+            devil_probs_val = np.full(len(meta_df), const_prob, dtype=np.float64)
+            logger.warning(
+                f"[Fold {fold_number}] Devil trained on single-class data "
+                f"(class={only_class}); using constant probability "
+                f"{const_prob:.1f}. This fold's metrics are degenerate."
+            )
+        else:
+            devil_probs_val = devil_proba_full[:, 1]
 
         # ═══════════════════════════════════════════════════════════════════
         # DEVIL DIAGNOSTIC: Probability Distribution Analysis
@@ -1095,26 +1207,51 @@ def validate_candidate(
             logger.info(f"{'─' * 60}\n")
 
         # ─────────────────────────────────────────────────────────────
-        # Dynamic threshold selection — sweep 0.10–0.44 for max EV
-        # Replaces hardcoded DEVIL_THRESHOLD (0.50) which rejects all
-        # trades when class_weight=None shifts probs to the true ~20%
-        # base-rate range.
+        # Threshold selection — split strategy per fold:
+        #   Fold 1 .. n_folds-1 : sweep for EV-maximising threshold (in-fold)
+        #   Fold n_folds-1      : freeze that threshold as `calibration_threshold`
+        #   Fold n_folds        : use the FROZEN calibration_threshold (no sweep)
+        #
+        # Why: sweeping the threshold on the same fold whose metrics gate
+        # promotion leaks val data into the production parameter. Freezing
+        # the threshold on the penultimate fold restores OOS purity.
         # ─────────────────────────────────────────────────────────────
-        optimal_threshold, fold_ev_at_threshold = _find_optimal_threshold(
-            devil_probs=devil_probs_val,
-            survival_targets=proposed_devil_targets,
-            macro_targets=proposed_devil_targets_macro,
-        )
-        logger.info(
-            f"  [Fold {fold_number}] Dynamic threshold: {optimal_threshold:.2f} "
-            f"(EV at threshold: {fold_ev_at_threshold:+.4f})"
-        )
-
-        # Store Fold 3 threshold as the production threshold
-        if fold_number == n_folds:
+        if fold_number < n_folds:
+            optimal_threshold, fold_ev_at_threshold = _find_optimal_threshold(
+                devil_probs=devil_probs_val,
+                survival_targets=proposed_devil_targets,
+                macro_targets=proposed_devil_targets_macro,
+                sl_mult=sl_mult,
+                tp_mult=tp_mult,
+            )
+            logger.info(
+                f"  [Fold {fold_number}] Swept threshold: {optimal_threshold:.2f} "
+                f"(EV at threshold: {fold_ev_at_threshold:+.4f})"
+            )
+            if fold_number == n_folds - 1:
+                calibration_threshold = optimal_threshold
+                logger.info(
+                    f"  [Fold {fold_number}] FROZEN as calibration_threshold "
+                    f"for Fold {n_folds} strict-OOS evaluation"
+                )
+        else:
+            # Fold n_folds: strict OOS — use frozen threshold from Fold n_folds-1
+            if calibration_threshold is None:
+                optimal_threshold = 0.50
+                logger.warning(
+                    f"  [Fold {fold_number}] No calibration_threshold available "
+                    f"(Fold {n_folds - 1} had zero approvals) — "
+                    f"falling back to {optimal_threshold:.2f}"
+                )
+            else:
+                optimal_threshold = calibration_threshold
+                logger.info(
+                    f"  [Fold {fold_number}] Using FROZEN calibration_threshold: "
+                    f"{optimal_threshold:.2f} (strict OOS — no threshold leakage)"
+                )
             production_threshold = optimal_threshold
             logger.info(
-                f"  Production threshold (Fold {fold_number}): {production_threshold:.2f}"
+                f"  Production threshold: {production_threshold:.2f}"
             )
 
         approved_mask = devil_probs_val >= optimal_threshold
@@ -1155,12 +1292,11 @@ def validate_candidate(
         brier = float(brier_score_loss(approved_targets, approved_devil_probs))
         win_rate = float(approved_targets.mean()) if len(approved_targets) > 0 else 0.0
 
-        # EV using ATR R-multiple: wins = +TP_MULT R, losses = -SL_MULT R
-        # Where R = 1 unit of SL_ATR_MULTIPLIER ATR
-        # EV = win_rate * (TP_MULT / SL_MULT) - (1 - win_rate) * 1
-        # With TP=3.0, SL=1.5: EV = win_rate * 2 - (1 - win_rate) * 1 = 3*wr - 1
+        # EV using ATR R-multiple: wins = +tp_mult R, losses = -sl_mult R
+        # Where R = 1 unit of sl_mult ATR
+        # EV = win_rate * (tp_mult / sl_mult) - (1 - win_rate) * 1
         ev = float(
-            win_rate * (TP_ATR_MULTIPLIER / SL_ATR_MULTIPLIER) - (1.0 - win_rate)
+            win_rate * (tp_mult / sl_mult) - (1.0 - win_rate)
         )
 
         logger.info(
@@ -1200,8 +1336,8 @@ def validate_candidate(
             approved_macro_targets = proposed_devil_targets_macro[approved_mask]
             macro_wins = int(approved_macro_targets.sum())
             macro_losses = n_devil_approved - macro_wins
-            gross_profit = macro_wins * TP_ATR_MULTIPLIER
-            gross_loss = macro_losses * SL_ATR_MULTIPLIER
+            gross_profit = macro_wins * tp_mult
+            gross_loss = macro_losses * sl_mult
             profit_factor = (
                 gross_profit / gross_loss if gross_loss > 0 else float("inf")
             )
@@ -1233,6 +1369,12 @@ def validate_candidate(
         rejection_reasons.append(
             f"Profit Factor {profit_factor:.4f} < {PROFIT_FACTOR_THRESHOLD} threshold"
         )
+    if final_total_trades < MIN_OOS_TRADES_FOR_PF:
+        rejection_reasons.append(
+            f"Fold {n_folds} OOS trades {final_total_trades} < "
+            f"{MIN_OOS_TRADES_FOR_PF} minimum — sample too small to trust "
+            f"PF={profit_factor:.4f}"
+        )
 
     gate_passed = len(rejection_reasons) == 0
 
@@ -1243,7 +1385,11 @@ def validate_candidate(
     logger.info(f"Mean EV          : {mean_ev:.6f} (threshold ≥ {EV_THRESHOLD})")
     logger.info(
         f"Profit Factor    : {profit_factor:.4f} "
-        f"(threshold ≥ {PROFIT_FACTOR_THRESHOLD}, Fold 3 OOS)"
+        f"(threshold ≥ {PROFIT_FACTOR_THRESHOLD}, Fold {n_folds} OOS)"
+    )
+    logger.info(
+        f"OOS Trades       : {final_total_trades} "
+        f"(threshold ≥ {MIN_OOS_TRADES_FOR_PF}, Fold {n_folds} sample-size floor)"
     )
     logger.info(f"Gate Result      : {'PASSED ✅' if gate_passed else 'FAILED 🚫'}")
 
@@ -1255,7 +1401,7 @@ def validate_candidate(
     if gate_passed:
         logger.info("Gate passed — training final production model on full dataset")
         final_angel, final_devil, final_angel_feats, final_devil_feats = refit_models(
-            df, feature_cols
+            df, feature_cols, angel_params=angel_params, devil_params=devil_params
         )
     else:
         logger.info(
@@ -1297,6 +1443,7 @@ def promote_or_reject(
     angel_model: RandomForestClassifier,
     devil_model: RandomForestClassifier,
     threshold: float = 0.20,
+    asset_config: dict = None,
 ) -> bool:
     """
     Promote or reject candidate models based on the validation report.
@@ -1314,6 +1461,7 @@ def promote_or_reject(
         angel_model: Final model (full-data if gate passed, Fold 3 if failed)
         devil_model: Final model (full-data if gate passed, Fold 3 if failed)
         threshold: Optimal Devil threshold from Fold 3 (default: 0.20 fallback)
+        asset_config: Asset configuration dictionary.
 
     Returns:
         True if models were promoted, False if rejected.
@@ -1325,8 +1473,11 @@ def promote_or_reject(
         logger.info("✅ VALIDATION GATE PASSED — PROMOTING MODELS")
         logger.info("=" * 70)
 
-        save_models(angel_model, devil_model)
-        save_threshold(threshold)
+        if asset_config is None:
+            asset_config = {}
+
+        save_models(angel_model, devil_model, asset_config)
+        save_threshold(threshold, asset_config)
 
         notifier.send_retraining_report(report, promoted=True)
         return True
@@ -1349,6 +1500,7 @@ def promote_or_reject(
 def save_models(
     angel_model: RandomForestClassifier,
     devil_model: RandomForestClassifier,
+    asset_config: dict,
 ) -> None:
     """
     Serialize models to disk using joblib with POSIX atomic writes.
@@ -1359,17 +1511,20 @@ def save_models(
     Args:
         angel_model: Trained Angel model
         devil_model: Trained Devil model
+        asset_config: Asset configuration dictionary.
     """
     logger.info("=" * 70)
     logger.info("SERIALIZING MODELS (ATOMIC)")
     logger.info("=" * 70)
 
-    # Ensure model directory exists
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    asset_class = asset_config.get("asset_class", "equities")
+    model_dir = Path("models") / asset_class
+    model_dir.mkdir(parents=True, exist_ok=True)
 
-    # Define temp and final paths
-    angel_temp = MODEL_DIR / "angel_temp.pkl"
-    devil_temp = MODEL_DIR / "devil_temp.pkl"
+    angel_path = model_dir / "angel_latest.pkl"
+    devil_path = model_dir / "devil_latest.pkl"
+    angel_temp = model_dir / "angel_temp.pkl"
+    devil_temp = model_dir / "devil_temp.pkl"
 
     # ═══════════════════════════════════════════════════════════════════
     # ATOMIC WRITE: Angel Model
@@ -1377,8 +1532,8 @@ def save_models(
     try:
         joblib.dump(angel_model, angel_temp)
         angel_size = angel_temp.stat().st_size / (1024 * 1024)
-        os.replace(angel_temp, ANGEL_PATH)
-        logger.info(f"[ATOMIC] Angel model saved: {ANGEL_PATH} ({angel_size:.1f} MB)")
+        os.replace(angel_temp, angel_path)
+        logger.info(f"[ATOMIC] Angel model saved: {angel_path} ({angel_size:.1f} MB)")
 
     except Exception as e:
         logger.error(f"[ATOMIC] Failed to save Angel model: {e}")
@@ -1392,8 +1547,8 @@ def save_models(
     try:
         joblib.dump(devil_model, devil_temp)
         devil_size = devil_temp.stat().st_size / (1024 * 1024)
-        os.replace(devil_temp, DEVIL_PATH)
-        logger.info(f"[ATOMIC] Devil model saved: {DEVIL_PATH} ({devil_size:.1f} MB)")
+        os.replace(devil_temp, devil_path)
+        logger.info(f"[ATOMIC] Devil model saved: {devil_path} ({devil_size:.1f} MB)")
 
     except Exception as e:
         logger.error(f"[ATOMIC] Failed to save Devil model: {e}")
@@ -1401,12 +1556,29 @@ def save_models(
             devil_temp.unlink()
         raise
 
+    # ═══════════════════════════════════════════════════════════════════
+    # ATOMIC WRITE: Metadata sidecar
+    # ═══════════════════════════════════════════════════════════════════
+    metadata_path = model_dir / "metadata.json"
+    metadata_temp = model_dir / "metadata_temp.json"
+    metadata = {
+        "asset_class": asset_class,
+        "timeframe_minutes": asset_config.get("timeframe_minutes", 1),
+        "trained_at": datetime.now(timezone.utc).isoformat(),
+        "trained_on_symbols": asset_config.get("tickers", []),
+        "data_source": os.getenv("DATA_SOURCE", "alpaca").strip().lower(),
+    }
+    with open(metadata_temp, "w") as f:
+        json.dump(metadata, f, indent=2)
+    os.replace(metadata_temp, metadata_path)
+    logger.info(f"[ATOMIC] Metadata saved: {metadata_path}")
+
     logger.info(
         "[ATOMIC] Model serialization complete — live bot can hot-reload safely"
     )
 
 
-def save_threshold(threshold: float) -> None:
+def save_threshold(threshold: float, asset_config: dict) -> None:
     """
     Save the optimal Devil threshold to disk as a JSON sidecar file.
 
@@ -1416,9 +1588,12 @@ def save_threshold(threshold: float) -> None:
 
     Args:
         threshold: The optimal Devil probability threshold (e.g., 0.28)
+        asset_config: Asset configuration dictionary.
     """
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    threshold_path = MODEL_DIR / "threshold.json"
+    asset_class = asset_config.get("asset_class", "equities")
+    model_dir = Path("models") / asset_class
+    model_dir.mkdir(parents=True, exist_ok=True)
+    threshold_path = model_dir / "threshold.json"
 
     data = {
         "devil_threshold": round(threshold, 4),
@@ -1426,7 +1601,7 @@ def save_threshold(threshold: float) -> None:
     }
 
     # Atomic write — same pattern as model serialisation
-    temp_path = MODEL_DIR / "threshold_temp.json"
+    temp_path = model_dir / "threshold_temp.json"
     with open(temp_path, "w") as f:
         json.dump(data, f, indent=2)
     os.replace(temp_path, threshold_path)
@@ -1465,15 +1640,43 @@ def main() -> int:
             "╚══════════════════════════════════════════════════════════════════╝"
         )
 
-        # ─── Phase 1: Fetch data ────────────────────────────────────────────
-        client = get_alpaca_client()
-        logger.info("Alpaca client initialized")
-        raw_data = fetch_training_data(client)
+        # ─── Phase 1: Initialize provider + load asset config ──────────────
+        data_source = os.getenv("DATA_SOURCE", "alpaca").strip().lower()
+        asset_config = get_asset_config(data_source)
+        provider = get_market_provider()
+        
+        # Get asset-class-aware hyperparameters
+        asset_class = asset_config.get("asset_class", "equities")
+        angel_params, devil_params = get_hyperparameters(asset_class)
+        
+        logger.info(
+            f"Provider initialized: {provider.__class__.__name__} "
+            f"| Asset config: {asset_config['tickers']} "
+            f"| SL={asset_config['sl_mult']}× TP={asset_config['tp_mult']}× "
+            f"max_hold={asset_config['max_hold']} survival={asset_config['survival_bars']} "
+            f"| Hyperparams: Angel Leaf={angel_params['min_samples_leaf']}/{angel_params['class_weight']} "
+            f"Devil Leaf={devil_params['min_samples_leaf']}/{devil_params['class_weight']}"
+        )
 
-        # ─── Phase 2: Engineer features with ATR-dynamic labels ────────────
-        features_df, feature_cols = engineer_features_and_labels(raw_data)
+        # ─── Phase 2: Fetch data ────────────────────────────────────────────
+        raw_data = fetch_training_data(
+            provider=provider,
+            symbols=asset_config["tickers"],
+            days_back=DAYS_BACK,
+            timeframe_minutes=asset_config["timeframe_minutes"]
+        )
 
-        # ─── Phase 3: Walk-forward validation (3-fold expanding window) ────
+        # ─── Phase 3: Engineer features with ATR-dynamic labels ────────────
+        features_df, feature_cols = engineer_features_and_labels(
+            raw_data,
+            sl_mult=asset_config["sl_mult"],
+            tp_mult=asset_config["tp_mult"],
+            max_hold=asset_config["max_hold"],
+            survival_bars=asset_config["survival_bars"],
+            htf_timeframe=asset_config.get("htf_timeframe", "5m"),
+        )
+
+        # ─── Phase 4: Walk-forward validation (3-fold expanding window) ────
         # TEMPORAL BOUNDARY: CV folds and the Profit Factor gate are evaluated
         # strictly OOS (Fold 3 model evaluated on days 51–60). The full-data
         # production model is only trained AFTER the gate passes. Running the
@@ -1490,21 +1693,29 @@ def main() -> int:
             angel_feats,
             devil_feats,
             optimal_threshold,
-        ) = validate_candidate(features_df, feature_cols, n_folds=3)
+        ) = validate_candidate(
+            features_df,
+            feature_cols,
+            sl_mult=asset_config["sl_mult"],
+            tp_mult=asset_config["tp_mult"],
+            n_folds=3,
+            angel_params=angel_params,
+            devil_params=devil_params,
+        )
         logger.info(f"Optimal Devil threshold (from Fold 3): {optimal_threshold:.4f}")
 
-        # ─── Phase 4: Gate decision ─────────────────────────────────────────
+        # ─── Phase 5: Gate decision ─────────────────────────────────────────
         # If gate passed: angel_model/devil_model are trained on full 60 days
         # If gate failed: they are Fold 3 models (will NOT be saved)
         promoted = promote_or_reject(
-            report, angel_model, devil_model, optimal_threshold
+            report, angel_model, devil_model, optimal_threshold, asset_config
         )
 
         if promoted:
+            asset_class = asset_config.get("asset_class", "equities")
             logger.info("=" * 70)
-            logger.info("✅ MODELS PROMOTED — Ready for next market open")
-            logger.info(f"  Angel: {ANGEL_PATH}")
-            logger.info(f"  Devil: {DEVIL_PATH}")
+            logger.info(f"✅ MODELS PROMOTED ({asset_class}) — Ready for next market open")
+            logger.info(f"  Models saved in: models/{asset_class}/")
             logger.info("=" * 70)
             return 0
         else:

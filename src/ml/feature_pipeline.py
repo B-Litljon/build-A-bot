@@ -58,8 +58,15 @@ class FeaturePipeline:
             col for col, dtype in df.schema.items() if dtype in (pl.Float64, pl.Float32)
         ]
         if float_cols:
+            # Convert both NaN and ±Inf to null so drop_nulls can sweep them.
+            # Inf surfaces from division-by-zero in normalized features on
+            # flat-volatility bars (e.g. bb_pct_b when bb_upper==bb_lower);
+            # sklearn's fit() rejects inf, so we must scrub it before training.
             df = df.with_columns(
-                pl.when(pl.col(c).is_nan()).then(None).otherwise(pl.col(c)).alias(c)
+                pl.when(pl.col(c).is_nan() | pl.col(c).is_infinite())
+                .then(None)
+                .otherwise(pl.col(c))
+                .alias(c)
                 for c in float_cols
             )
         subset = [c for c in feature_cols if c in df.columns] if feature_cols else None

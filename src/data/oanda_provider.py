@@ -326,7 +326,7 @@ class OandaMarketProvider(MarketDataProvider):
         try:
             self._loop = asyncio.get_running_loop()
         except RuntimeError:
-            self._loop = asyncio.get_event_loop()
+            self._loop = None
         logger.info("OandaMarketProvider: subscribed to %s", self._symbols)
 
     def run_stream(self) -> None:
@@ -354,8 +354,6 @@ class OandaMarketProvider(MarketDataProvider):
                     self._handle_tick(msg)
         except KeyboardInterrupt:
             logger.info("OandaMarketProvider stream stopped by user.")
-        except Exception as e:
-            logger.error("OandaMarketProvider stream error: %s", e)
 
     def stop_stream(self) -> None:
         """Signal the stream loop to exit and flush all in-flight bars."""
