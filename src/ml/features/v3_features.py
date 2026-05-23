@@ -36,6 +36,19 @@ class V3BaseFeatures(BaseFeatureGenerator):
     """
 
     def generate(self, df: pl.DataFrame) -> pl.DataFrame:
+        has_symbol = "symbol" in df.columns
+        if has_symbol and df["symbol"].n_unique() > 1:
+            # Sort to keep things deterministic and ordered
+            df_sorted = df.sort(["symbol", "timestamp"])
+            parts = []
+            for sym in df_sorted["symbol"].unique().sort().to_list():
+                sym_df = df_sorted.filter(pl.col("symbol") == sym)
+                parts.append(self._generate_single_symbol(sym_df))
+            return pl.concat(parts, how="vertical_relaxed")
+        else:
+            return self._generate_single_symbol(df)
+
+    def _generate_single_symbol(self, df: pl.DataFrame) -> pl.DataFrame:
         close: np.ndarray = df["close"].to_numpy()
         high: np.ndarray = df["high"].to_numpy()
         low: np.ndarray = df["low"].to_numpy()

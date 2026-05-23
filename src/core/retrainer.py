@@ -80,9 +80,11 @@ def get_asset_config(data_source: str) -> dict:
     if asset_class == "forex":
         max_hold = 30
         timeframe = 5
+        htf_timeframe = "30m"
     else:
         max_hold = 45
         timeframe = 1
+        htf_timeframe = "5m"
         
     return {
         "asset_class": asset_class,
@@ -92,25 +94,40 @@ def get_asset_config(data_source: str) -> dict:
         "max_hold": int(os.getenv("RETRAIN_MAX_HOLD", str(max_hold))),
         "survival_bars": int(os.getenv("RETRAIN_SURVIVAL", "5")),
         "timeframe_minutes": int(os.getenv("RETRAIN_TIMEFRAME_MINUTES", str(timeframe))),
+        "htf_timeframe": os.getenv("RETRAIN_HTF_TIMEFRAME", htf_timeframe),
     }
 
 # Model Hyperparameters
-ANGEL_PARAMS = {
-    "n_estimators": 100,
-    "max_depth": 10,
-    "random_state": 42,
-    "n_jobs": -1,
-}
+def get_hyperparameters(asset_class: str) -> Tuple[dict, dict]:
+    """
+    Get hyperparameter configurations for Angel and Devil models based on asset class.
+    """
+    # Common parameters for both asset classes
+    angel_params = {
+        "n_estimators": 100,
+        "max_depth": 10,
+        "min_samples_leaf": 50,
+        "class_weight": "balanced",
+        "random_state": 42,
+        "n_jobs": -1,
+    }
 
-DEVIL_PARAMS = {
-    "n_estimators": 100,
-    "max_depth": 8,
-    "random_state": 42,
-    # class_weight intentionally None — the Devil must learn the true ~20%
-    # base rate. "balanced" artificially inflated probabilities, causing
-    # Brier Score failure (0.31 > 0.25 threshold) and rubber-stamping.
-    "n_jobs": -1,
-}
+    devil_params = {
+        "n_estimators": 100,
+        "max_depth": 8,
+        "min_samples_leaf": 50,
+        # class_weight is balanced for Forex to avoid probability compression,
+        # but None for Equities to avoid Brier score/rubber-stamping issues
+        "class_weight": "balanced" if asset_class == "forex" else None,
+        "random_state": 42,
+        "n_jobs": -1,
+    }
+
+    return angel_params, devil_params
+
+# Fallback constants for backward compatibility
+ANGEL_PARAMS, DEVIL_PARAMS = get_hyperparameters("equities")
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ATR BRACKET PARAMETERS (must match evaluate_performance.py and LiveOrchestrator)
@@ -320,6 +337,7 @@ def _compute_devil_targets_atr(
     high = df["high"].to_numpy()
     low = df["low"].to_numpy()
     natr = df["natr_14"].to_numpy()
+    symbol = df["symbol"].to_numpy() if "symbol" in df.columns else np.array([""] * len(close))
     n = len(close)
     targets = np.zeros(n, dtype=np.int8)
 
@@ -332,6 +350,8 @@ def _compute_devil_targets_atr(
         tp_price = close[i] + tp_mult * atr_abs
 
         for j in range(i + 1, min(i + max_hold + 1, n)):
+            if symbol[j] != symbol[i]:
+                break
             # SL checked first (conservative — matches evaluate_performance.py)
             if low[j] <= sl_price:
                 targets[i] = 0
@@ -381,10 +401,15 @@ def _compute_devil_survival_target(
     close = df["close"].to_numpy()
     low = df["low"].to_numpy()
     natr = df["natr_14"].to_numpy()
+    symbol = df["symbol"].to_numpy() if "symbol" in df.columns else np.array([""] * len(close))
     n = len(close)
     targets = np.zeros(n, dtype=np.int8)
 
     for i in range(n - 1):
+        # Insufficient lookahead safety: check if symbol changes before survival window completes
+        if i + survival_bars >= n or symbol[i + survival_bars] != symbol[i]:
+            continue  # leaves targets[i] = 0 (default)
+
         atr_abs = close[i] * natr[i] / 100.0
         if np.isnan(atr_abs) or atr_abs <= 0:
             continue
@@ -393,6 +418,9 @@ def _compute_devil_survival_target(
         survived = True
 
         for j in range(i + 1, min(i + survival_bars + 1, n)):
+            if symbol[j] != symbol[i]:
+                survived = False
+                break
             if low[j] <= sl_price:
                 survived = False
                 break
@@ -413,6 +441,7 @@ def engineer_features_and_labels(
     tp_mult: float = TP_ATR_MULTIPLIER,
     max_hold: int = MAX_HOLD_BARS,
     survival_bars: int = SURVIVAL_BARS,
+    htf_timeframe: str = "5m",
 ) -> Tuple[pl.DataFrame, List[str]]:
     """
     Engineer technical features and generate ATR-dynamic target labels.
@@ -435,6 +464,7 @@ def engineer_features_and_labels(
         tp_mult: Take-profit ATR multiplier
         max_hold: Maximum hold bars
         survival_bars: Number of survival bars for devil training
+        htf_timeframe: Higher timeframe representation for HTFFeatures
 
     Returns:
         Tuple of (features DataFrame with targets, feature column names)
@@ -450,7 +480,7 @@ def engineer_features_and_labels(
     pipeline = FeaturePipeline(
         feature_generators=[
             V3BaseFeatures(),
-            V3HTFFeatures(timeframe="5m"),
+            V3HTFFeatures(timeframe=htf_timeframe),
         ]
     )
     for gen in pipeline.feature_generators:
@@ -467,7 +497,7 @@ def engineer_features_and_labels(
     # ═══════════════════════════════════════════════════════════════════
     df = df.with_columns(
         (
-            pl.col("close").shift(-3)
+            pl.col("close").shift(-3).over("symbol")
             > pl.col("close") + sl_mult * (pl.col("close") * pl.col("natr_14") / 100.0)
         )
         .cast(pl.Int8)
@@ -574,6 +604,8 @@ def generate_time_decay_weights(
 def refit_models(
     df: pl.DataFrame,
     feature_cols: List[str],
+    angel_params: Optional[dict] = None,
+    devil_params: Optional[dict] = None,
 ) -> Tuple[RandomForestClassifier, RandomForestClassifier, List[str], List[str]]:
     """
     Refit Angel and Devil models with time-decay weighting.
@@ -586,6 +618,8 @@ def refit_models(
     Args:
         df: Feature-engineered DataFrame with 'angel_target' and 'devil_target'
         feature_cols: List of base feature column names
+        angel_params: Hyperparameters for Angel classifier
+        devil_params: Hyperparameters for Devil classifier
 
     Returns:
         Tuple of (Angel model, Devil model, angel_features, devil_features)
@@ -593,6 +627,10 @@ def refit_models(
     logger.info("=" * 70)
     logger.info("REFITTING MODELS (META-LABELING)")
     logger.info("=" * 70)
+
+    # Resolve parameter configs
+    a_params = angel_params if angel_params is not None else ANGEL_PARAMS
+    d_params = devil_params if devil_params is not None else DEVIL_PARAMS
 
     # Extract base features and targets
     X_base = df[feature_cols].to_numpy()
@@ -618,8 +656,8 @@ def refit_models(
     # STEP 1: Train the Angel (Primary Model - Direction)
     # ═══════════════════════════════════════════════════════════════════
     logger.info("\n[Step 1/4] Training Angel model (Direction)...")
-    angel_model = RandomForestClassifier(**ANGEL_PARAMS)
-    df_base = pl.DataFrame(X_base, schema=feature_cols)
+    angel_model = RandomForestClassifier(**a_params)
+    df_base = pl.DataFrame(X_base, schema=feature_cols).to_pandas()
     angel_model.fit(df_base, y_angel, sample_weight=sample_weights)
     logger.info(f"✓ Angel model trained on {len(feature_cols)} features")
 
@@ -657,7 +695,7 @@ def refit_models(
 
         for fold_train_idx, fold_val_idx in tss.split(X_base):
             fold_weights = sample_weights[fold_train_idx]
-            fold_angel = RandomForestClassifier(**ANGEL_PARAMS)
+            fold_angel = RandomForestClassifier(**a_params)
             fold_angel.fit(
                 X_base[fold_train_idx],
                 y_angel[fold_train_idx],
@@ -672,7 +710,7 @@ def refit_models(
         head_missing = np.isnan(angel_probs_oof)
         if head_missing.sum() > 0:
             first_train_idx, _ = next(iter(tss.split(X_base)))
-            head_angel = RandomForestClassifier(**ANGEL_PARAMS)
+            head_angel = RandomForestClassifier(**a_params)
             head_angel.fit(
                 X_base[first_train_idx],
                 y_angel[first_train_idx],
@@ -741,8 +779,8 @@ def refit_models(
     )
     logger.info(f"Devil feature space: {devil_features}")
 
-    devil_model = RandomForestClassifier(**DEVIL_PARAMS)
-    df_devil = pl.DataFrame(X_devil, schema=devil_features)
+    devil_model = RandomForestClassifier(**d_params)
+    df_devil = pl.DataFrame(X_devil, schema=devil_features).to_pandas()
     devil_model.fit(df_devil, y_devil_train, sample_weight=devil_weights)
     logger.info(
         f"✓ Devil model trained on {len(devil_features)} features "
@@ -854,6 +892,8 @@ def validate_candidate(
     sl_mult: float = SL_ATR_MULTIPLIER,
     tp_mult: float = TP_ATR_MULTIPLIER,
     n_folds: int = 3,
+    angel_params: Optional[dict] = None,
+    devil_params: Optional[dict] = None,
 ) -> Tuple[
     ValidationReport,
     RandomForestClassifier,
@@ -979,7 +1019,7 @@ def validate_candidate(
         # Train on this fold's training window
         # ─────────────────────────────────────────────────────────────
         angel_model, devil_model, angel_feats, devil_feats = refit_models(
-            train_df, feature_cols
+            train_df, feature_cols, angel_params=angel_params, devil_params=devil_params
         )
 
         # ─────────────────────────────────────────────────────────────
@@ -1273,7 +1313,7 @@ def validate_candidate(
     if gate_passed:
         logger.info("Gate passed — training final production model on full dataset")
         final_angel, final_devil, final_angel_feats, final_devil_feats = refit_models(
-            df, feature_cols
+            df, feature_cols, angel_params=angel_params, devil_params=devil_params
         )
     else:
         logger.info(
@@ -1516,11 +1556,18 @@ def main() -> int:
         data_source = os.getenv("DATA_SOURCE", "alpaca").strip().lower()
         asset_config = get_asset_config(data_source)
         provider = get_market_provider()
+        
+        # Get asset-class-aware hyperparameters
+        asset_class = asset_config.get("asset_class", "equities")
+        angel_params, devil_params = get_hyperparameters(asset_class)
+        
         logger.info(
             f"Provider initialized: {provider.__class__.__name__} "
             f"| Asset config: {asset_config['tickers']} "
             f"| SL={asset_config['sl_mult']}× TP={asset_config['tp_mult']}× "
-            f"max_hold={asset_config['max_hold']} survival={asset_config['survival_bars']}"
+            f"max_hold={asset_config['max_hold']} survival={asset_config['survival_bars']} "
+            f"| Hyperparams: Angel Leaf={angel_params['min_samples_leaf']}/{angel_params['class_weight']} "
+            f"Devil Leaf={devil_params['min_samples_leaf']}/{devil_params['class_weight']}"
         )
 
         # ─── Phase 2: Fetch data ────────────────────────────────────────────
@@ -1538,6 +1585,7 @@ def main() -> int:
             tp_mult=asset_config["tp_mult"],
             max_hold=asset_config["max_hold"],
             survival_bars=asset_config["survival_bars"],
+            htf_timeframe=asset_config.get("htf_timeframe", "5m"),
         )
 
         # ─── Phase 4: Walk-forward validation (3-fold expanding window) ────
@@ -1558,11 +1606,13 @@ def main() -> int:
             devil_feats,
             optimal_threshold,
         ) = validate_candidate(
-            features_df, 
-            feature_cols, 
+            features_df,
+            feature_cols,
             sl_mult=asset_config["sl_mult"],
             tp_mult=asset_config["tp_mult"],
-            n_folds=3
+            n_folds=3,
+            angel_params=angel_params,
+            devil_params=devil_params,
         )
         logger.info(f"Optimal Devil threshold (from Fold 3): {optimal_threshold:.4f}")
 
