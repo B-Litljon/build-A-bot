@@ -88,7 +88,7 @@ class V3BaseFeatures(BaseFeatureGenerator):
         df = df.with_columns(
             (
                 (pl.col("close") - pl.col("bb_lower"))
-                / (pl.col("bb_upper") - pl.col("bb_lower"))
+                / (pl.col("bb_upper") - pl.col("bb_lower") + 1e-9)
             ).alias("bb_pct_b"),
             ((pl.col("bb_upper") - pl.col("bb_lower")) / pl.col("bb_middle")).alias(
                 "bb_width_pct"
