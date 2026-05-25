@@ -1,8 +1,25 @@
 import logging
+import os
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+# Environment variables for tuning the A3 chop filter without code changes.
+# The retrainer does not simulate this filter during target generation, so
+# a high veto rate is a training/inference asymmetry; these knobs let us
+# tune the floor (or disable it) per environment while the asymmetry stays
+# open. See llm_reports/refactors/2026-05-25_configurable-chop-floor.md.
+ENV_FOREX_MIN_SL_PIPS = "RISK_FOREX_MIN_SL_PIPS"
+ENV_EQUITIES_MIN_SL_PCT = "RISK_EQUITIES_MIN_SL_PCT"
+ENV_CHOP_FILTER_ENABLED = "RISK_CHOP_FILTER_ENABLED"
+
+
+def _chop_filter_enabled() -> bool:
+    """RISK_CHOP_FILTER_ENABLED toggles the floor. Unset / 1 / true enables."""
+    raw = os.getenv(ENV_CHOP_FILTER_ENABLED, "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
 
 @dataclass
 class RiskProfile:
@@ -20,10 +37,12 @@ class RiskProfile:
             return cls(
                 sl_atr_multiplier=1.0,
                 tp_atr_multiplier=2.0,
-                min_sl_pips=2.0,
+                min_sl_pips=float(os.getenv(ENV_FOREX_MIN_SL_PIPS, "2.0")),
                 round_precision=5,
             )
-        return cls()
+        return cls(
+            min_sl_pct=float(os.getenv(ENV_EQUITIES_MIN_SL_PCT, "0.0015")),
+        )
 
 class RiskManager:
     """
@@ -51,9 +70,27 @@ class RiskManager:
         else:
             floor = entry_price * self.profile.min_sl_pct
 
-        # A3 chop filter: if the stop floor would override the ATR stop, skip entirely
+        # A3 chop filter: if the stop floor would override the ATR stop, skip
+        # entirely. RISK_CHOP_FILTER_ENABLED=0 disables the gate (useful for
+        # comparing live PF against the unfiltered training distribution).
         if sl_dist < floor:
-            return None
+            if _chop_filter_enabled():
+                logger.info(
+                    "[%s] A3 chop filter veto: sl_dist=%.6f < floor=%.6f "
+                    "(shortfall=%.6f)",
+                    symbol or "unknown",
+                    sl_dist,
+                    floor,
+                    floor - sl_dist,
+                )
+                return None
+            logger.info(
+                "[%s] A3 chop filter DISABLED (would have vetoed: "
+                "sl_dist=%.6f < floor=%.6f)",
+                symbol or "unknown",
+                sl_dist,
+                floor,
+            )
 
         return round(sl_dist, self.profile.round_precision), round(tp_dist, self.profile.round_precision)
 
