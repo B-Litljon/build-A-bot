@@ -37,9 +37,9 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import joblib
+import lightgbm as lgb
 import numpy as np
 import polars as pl
-from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import brier_score_loss
 from sklearn.model_selection import cross_val_predict, TimeSeriesSplit
 
@@ -48,6 +48,12 @@ from src.data.market_provider import MarketDataProvider
 from src.execution.risk_manager import RiskProfile
 from src.ml.feature_pipeline import FeaturePipeline
 from src.ml.features.v3_features import V3BaseFeatures, V3HTFFeatures, V3SessionFeatures
+from src.ml.regimes.hmm_regime import (
+    HMM_OUTPUT_COLS,
+    fit_regime_models,
+    predict_regime_probs,
+    save_hmm_models,
+)
 from src.core.notification_manager import NotificationManager
 
 logging.basicConfig(
@@ -109,29 +115,50 @@ def get_asset_config(data_source: str) -> dict:
 # Model Hyperparameters
 def get_hyperparameters(asset_class: str) -> Tuple[dict, dict]:
     """
-    Get hyperparameter configurations for Angel and Devil models based on asset class.
+    Get hyperparameter configurations for Angel and Devil LightGBM models.
+
+    Translated from the prior RandomForestClassifier dicts on 2026-05-23 as part
+    of the LightGBM-pilot experiment:
+      n_estimators 100 → 200 (paired with learning_rate=0.05 — boosting needs
+        more rounds to reach RF-equivalent capacity).
+      max_depth 10/8 retained as a *cap* on tree depth; num_leaves chosen below
+        the 2^max_depth ceiling to keep effective complexity in RF's vicinity.
+      min_samples_leaf 20 → min_child_samples 20 (direct equivalent).
+      subsample/colsample_bytree 0.8 = LightGBM-native generalization knobs
+        (RF gets the same effect for free via bootstrap sampling).
+      verbose=-1 silences LightGBM's per-iter chatter so the gate diagnostic
+        log stays readable.
     """
-    # min_samples_leaf=20 floor for forex: leaf=1 (Gemini 2026-05-23) memorized
-    # the 1,043-row Angel-approved subset, producing a Fold 3 separation gap that
-    # collapsed from +0.0718 → -0.0092 across a 10-hour window shift. leaf=50
-    # was the prior production floor but starves forex (~0.3% Angel approval).
-    # 20 is the defensible middle ground. See llm_reports/audits/2026-05-23.
     angel_params = {
-        "n_estimators": 100,
+        "objective": "binary",
+        "n_estimators": 200,
+        "learning_rate": 0.05,
         "max_depth": 10,
-        "min_samples_leaf": 20 if asset_class == "forex" else 50,
+        "num_leaves": 63,
+        "min_child_samples": 20 if asset_class == "forex" else 50,
         "class_weight": None if asset_class == "forex" else "balanced",
+        "subsample": 0.8,
+        "subsample_freq": 1,
+        "colsample_bytree": 0.8,
         "random_state": 42,
         "n_jobs": -1,
+        "verbose": -1,
     }
 
     devil_params = {
-        "n_estimators": 100,
+        "objective": "binary",
+        "n_estimators": 200,
+        "learning_rate": 0.05,
         "max_depth": 8,
-        "min_samples_leaf": 20 if asset_class == "forex" else 50,
+        "num_leaves": 31,
+        "min_child_samples": 20 if asset_class == "forex" else 50,
         "class_weight": None,
+        "subsample": 0.8,
+        "subsample_freq": 1,
+        "colsample_bytree": 0.8,
         "random_state": 42,
         "n_jobs": -1,
+        "verbose": -1,
     }
 
     return angel_params, devil_params
@@ -175,11 +202,20 @@ PROFIT_FACTOR_THRESHOLD = 1.2  # Min acceptable Profit Factor
 # "NO SIGNAL." 100 is the minimum sample for any honest PF claim.
 MIN_OOS_TRADES_FOR_PF = 100
 
+# Toggle for the HMM regime-feature experiment. When enabled, a per-symbol
+# 3-state GaussianHMM is fit on each fold's training window (no leakage) and
+# its posterior state probabilities are appended as 3 additional features.
+# Default off so a plain LightGBM swap can be evaluated without confounds.
+USE_HMM_FEATURES = os.getenv("RETRAIN_USE_HMM", "0").strip() == "1"
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # FEATURE COLUMNS (must match MLStrategy.feature_names and FeaturePipeline output)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-FEATURE_COLS: List[str] = [
+# Base features produced by FeaturePipeline. The HMM regime features (when
+# enabled) are appended downstream in validate_candidate() because their
+# fitting must respect each fold's temporal boundary.
+BASE_FEATURE_COLS: List[str] = [
     "rsi_14",
     "ppo",
     "natr_14",
@@ -208,6 +244,10 @@ FEATURE_COLS: List[str] = [
     "session_ny",
     "session_overlap",
 ]
+
+FEATURE_COLS: List[str] = (
+    BASE_FEATURE_COLS + HMM_OUTPUT_COLS if USE_HMM_FEATURES else BASE_FEATURE_COLS
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -576,16 +616,22 @@ def engineer_features_and_labels(
     # CLEANUP: Drop NaN/null rows (uses FeaturePipeline.clean_data)
     # ═══════════════════════════════════════════════════════════════════
     initial_count = len(df)
-    df = FeaturePipeline.clean_data(df, feature_cols=FEATURE_COLS + ["angel_target", "devil_target"])
+    # Clean on BASE features only — HMM regime probs (when enabled) are
+    # appended later inside validate_candidate so each fold fits its own HMM.
+    df = FeaturePipeline.clean_data(
+        df, feature_cols=BASE_FEATURE_COLS + ["angel_target", "devil_target"]
+    )
     dropped_count = initial_count - len(df)
 
     logger.info(
         f"Dropped {dropped_count:,} rows with nulls ({dropped_count / initial_count:.1%})"
     )
     logger.info(f"Final dataset: {len(df):,} rows")
-    logger.info(f"Feature columns: {FEATURE_COLS}")
+    logger.info(f"Base feature columns ({len(BASE_FEATURE_COLS)}): {BASE_FEATURE_COLS}")
+    if USE_HMM_FEATURES:
+        logger.info(f"HMM regime features ENABLED — will be appended per-fold: {HMM_OUTPUT_COLS}")
 
-    return df, FEATURE_COLS
+    return df, BASE_FEATURE_COLS
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -631,7 +677,7 @@ def refit_models(
     feature_cols: List[str],
     angel_params: Optional[dict] = None,
     devil_params: Optional[dict] = None,
-) -> Tuple[RandomForestClassifier, RandomForestClassifier, List[str], List[str]]:
+) -> Tuple["lgb.LGBMClassifier", "lgb.LGBMClassifier", List[str], List[str]]:
     """
     Refit Angel and Devil models with time-decay weighting.
 
@@ -681,7 +727,7 @@ def refit_models(
     # STEP 1: Train the Angel (Primary Model - Direction)
     # ═══════════════════════════════════════════════════════════════════
     logger.info("\n[Step 1/4] Training Angel model (Direction)...")
-    angel_model = RandomForestClassifier(**a_params)
+    angel_model = lgb.LGBMClassifier(**a_params)
     df_base = pl.DataFrame(X_base, schema=feature_cols).to_pandas()
     angel_model.fit(df_base, y_angel, sample_weight=sample_weights)
     logger.info(f"✓ Angel model trained on {len(feature_cols)} features")
@@ -720,7 +766,7 @@ def refit_models(
 
         for fold_train_idx, fold_val_idx in tss.split(X_base):
             fold_weights = sample_weights[fold_train_idx]
-            fold_angel = RandomForestClassifier(**a_params)
+            fold_angel = lgb.LGBMClassifier(**a_params)
             fold_angel.fit(
                 X_base[fold_train_idx],
                 y_angel[fold_train_idx],
@@ -735,7 +781,7 @@ def refit_models(
         head_missing = np.isnan(angel_probs_oof)
         if head_missing.sum() > 0:
             first_train_idx, _ = next(iter(tss.split(X_base)))
-            head_angel = RandomForestClassifier(**a_params)
+            head_angel = lgb.LGBMClassifier(**a_params)
             head_angel.fit(
                 X_base[first_train_idx],
                 y_angel[first_train_idx],
@@ -804,7 +850,7 @@ def refit_models(
     )
     logger.info(f"Devil feature space: {devil_features}")
 
-    devil_model = RandomForestClassifier(**d_params)
+    devil_model = lgb.LGBMClassifier(**d_params)
     df_devil = pl.DataFrame(X_devil, schema=devil_features).to_pandas()
     devil_model.fit(df_devil, y_devil_train, sample_weight=devil_weights)
     logger.info(
@@ -921,11 +967,12 @@ def validate_candidate(
     devil_params: Optional[dict] = None,
 ) -> Tuple[
     ValidationReport,
-    RandomForestClassifier,
-    RandomForestClassifier,
+    "lgb.LGBMClassifier",
+    "lgb.LGBMClassifier",
     List[str],
     List[str],
     float,
+    Optional[dict],
 ]:
     """
     Run expanding-window walk-forward cross-validation and apply the promotion gate.
@@ -979,6 +1026,16 @@ def validate_candidate(
     logger.info("WALK-FORWARD VALIDATION (3 EXPANDING FOLDS)")
     logger.info("=" * 70)
 
+    # If the HMM regime experiment is on, the active feature space is the
+    # base features plus the 3 HMM_OUTPUT_COLS. Each fold fits its own HMM
+    # on its training window only — no leakage from val into train.
+    if USE_HMM_FEATURES:
+        feature_cols = list(feature_cols) + list(HMM_OUTPUT_COLS)
+        logger.info(
+            "HMM regime features ENABLED — feature space expanded to %d cols: %s",
+            len(feature_cols), feature_cols[-len(HMM_OUTPUT_COLS):],
+        )
+
     # ───────────────────────────────────────────────────────────────────
     # Build date-based fold boundaries
     # ───────────────────────────────────────────────────────────────────
@@ -1000,10 +1057,13 @@ def validate_candidate(
     fold_metrics: List[FoldMetrics] = []
 
     # Placeholders for Fold 3 outputs (used for PF gate and fallback)
-    fold3_angel: Optional[RandomForestClassifier] = None
-    fold3_devil: Optional[RandomForestClassifier] = None
+    fold3_angel: Optional["lgb.LGBMClassifier"] = None
+    fold3_devil: Optional["lgb.LGBMClassifier"] = None
     fold3_angel_feats: Optional[List[str]] = None
     fold3_devil_feats: Optional[List[str]] = None
+    # Production HMM dict (fit on full data after the gate passes; persisted
+    # alongside Angel/Devil and consumed at inference by MLStrategy).
+    final_hmm_models: Optional[dict] = None
     profit_factor: float = 0.0
     final_win_rate: float = 0.0
     final_total_trades: int = 0
@@ -1032,6 +1092,14 @@ def validate_candidate(
             f"Train: {len(train_df):,} rows | "
             f"Val: {len(val_df):,} rows"
         )
+
+        # HMM regime augmentation — fit per-fold on train only, score both.
+        # This ordering preserves the temporal boundary: nothing val-side ever
+        # influences the HMM parameters.
+        if USE_HMM_FEATURES and len(train_df) > 0 and len(val_df) > 0:
+            fold_hmm_models = fit_regime_models(train_df)
+            train_df = predict_regime_probs(train_df, fold_hmm_models)
+            val_df = predict_regime_probs(val_df, fold_hmm_models)
 
         if len(train_df) == 0 or len(val_df) == 0:
             logger.warning(
@@ -1400,6 +1468,13 @@ def validate_candidate(
     # ───────────────────────────────────────────────────────────────────
     if gate_passed:
         logger.info("Gate passed — training final production model on full dataset")
+        # Fit a fresh HMM on the full dataset for production inference. This
+        # is the dict that gets persisted alongside Angel/Devil; MLStrategy
+        # loads it and applies it to live bars.
+        if USE_HMM_FEATURES:
+            logger.info("Fitting production HMM on full retraining window...")
+            final_hmm_models = fit_regime_models(df)
+            df = predict_regime_probs(df, final_hmm_models)
         final_angel, final_devil, final_angel_feats, final_devil_feats = refit_models(
             df, feature_cols, angel_params=angel_params, devil_params=devil_params
         )
@@ -1430,6 +1505,7 @@ def validate_candidate(
         final_angel_feats,
         final_devil_feats,
         production_threshold,
+        final_hmm_models,
     )
 
 
@@ -1440,10 +1516,11 @@ def validate_candidate(
 
 def promote_or_reject(
     report: ValidationReport,
-    angel_model: RandomForestClassifier,
-    devil_model: RandomForestClassifier,
+    angel_model: "lgb.LGBMClassifier",
+    devil_model: "lgb.LGBMClassifier",
     threshold: float = 0.20,
     asset_config: dict = None,
+    hmm_models: Optional[dict] = None,
 ) -> bool:
     """
     Promote or reject candidate models based on the validation report.
@@ -1478,6 +1555,10 @@ def promote_or_reject(
 
         save_models(angel_model, devil_model, asset_config)
         save_threshold(threshold, asset_config)
+        if hmm_models is not None:
+            asset_class = asset_config.get("asset_class", "equities")
+            hmm_path = Path("models") / asset_class / "hmm_latest.pkl"
+            save_hmm_models(hmm_models, hmm_path)
 
         notifier.send_retraining_report(report, promoted=True)
         return True
@@ -1498,8 +1579,8 @@ def promote_or_reject(
 
 
 def save_models(
-    angel_model: RandomForestClassifier,
-    devil_model: RandomForestClassifier,
+    angel_model: "lgb.LGBMClassifier",
+    devil_model: "lgb.LGBMClassifier",
     asset_config: dict,
 ) -> None:
     """
@@ -1654,8 +1735,8 @@ def main() -> int:
             f"| Asset config: {asset_config['tickers']} "
             f"| SL={asset_config['sl_mult']}× TP={asset_config['tp_mult']}× "
             f"max_hold={asset_config['max_hold']} survival={asset_config['survival_bars']} "
-            f"| Hyperparams: Angel Leaf={angel_params['min_samples_leaf']}/{angel_params['class_weight']} "
-            f"Devil Leaf={devil_params['min_samples_leaf']}/{devil_params['class_weight']}"
+            f"| Hyperparams: Angel Leaf={angel_params['min_child_samples']}/{angel_params['class_weight']} "
+            f"Devil Leaf={devil_params['min_child_samples']}/{devil_params['class_weight']}"
         )
 
         # ─── Phase 2: Fetch data ────────────────────────────────────────────
@@ -1693,6 +1774,7 @@ def main() -> int:
             angel_feats,
             devil_feats,
             optimal_threshold,
+            final_hmm_models,
         ) = validate_candidate(
             features_df,
             feature_cols,
@@ -1708,7 +1790,12 @@ def main() -> int:
         # If gate passed: angel_model/devil_model are trained on full 60 days
         # If gate failed: they are Fold 3 models (will NOT be saved)
         promoted = promote_or_reject(
-            report, angel_model, devil_model, optimal_threshold, asset_config
+            report,
+            angel_model,
+            devil_model,
+            optimal_threshold,
+            asset_config,
+            hmm_models=final_hmm_models,
         )
 
         if promoted:

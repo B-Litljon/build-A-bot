@@ -23,6 +23,7 @@ polars = "*"
 lightgbm = "*"
 simfin = "*"
 oandapyv20 = "*"
+hmmlearn = "*"
 
 [dev-packages]
 

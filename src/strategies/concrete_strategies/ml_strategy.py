@@ -36,6 +36,11 @@ from core.notification_manager import NotificationManager
 # CRITICAL: Import FeaturePipeline to prevent training/inference skew
 from ml.feature_pipeline import FeaturePipeline
 from ml.features.v3_features import V3BaseFeatures, V3HTFFeatures, V3SessionFeatures
+from ml.regimes.hmm_regime import (
+    HMM_OUTPUT_COLS,
+    load_hmm_models,
+    predict_regime_probs,
+)
 from ml.trainers.v3_rf_trainer import V3RandomForestTrainer
 
 logger = logging.getLogger(__name__)
@@ -149,43 +154,42 @@ class MLStrategy(BaseStrategy):
             ]
         )
 
-        # Feature columns (excluding absolute price columns to prevent leakage)
-        # V3.5 (2026-05-23): expanded from 18 to 22 features with UTC session indicators
-        self.feature_names = [
-            "rsi_14",
-            "ppo",
-            "natr_14",
-            "bb_pct_b",
-            "bb_width_pct",
-            "price_sma50_ratio",
-            "log_return",
-            "hour_of_day",
-            "dist_sma50",
-            "vol_rel",
-            # V3.3: HTF features
-            "htf_rsi_14",
-            "htf_trend_agreement",
-            "htf_vol_rel",
-            "htf_bb_pct_b",
-            # Phase 5: Microstructure features
-            "range_coil_10",
-            "bar_body_pct",
-            "bar_upper_wick_pct",
-            "bar_lower_wick_pct",
-            # V3.5: UTC session-activity indicators
-            "session_asia",
-            "session_london",
-            "session_ny",
-            "session_overlap",
-        ]
-
-        # Feature schema validation (Fix 2.6)
+        # Feature columns (excluding absolute price columns to prevent leakage).
+        # Source the schema from the trained model itself so a retrain that
+        # changes the feature space (e.g. enabling the HMM regime experiment
+        # via RETRAIN_USE_HMM=1) propagates here without a code edit.
         model_features = self.angel_trainer.feature_names_in_
-        if model_features is not None and list(model_features) != self.feature_names:
+        if model_features is None:
             raise RuntimeError(
-                f"Feature schema drift detected: strategy features {self.feature_names} "
-                f"do not match angel model features {list(model_features)}"
+                "Loaded Angel model exposes no feature_names_in_ — cannot "
+                "establish inference schema. Re-run retrainer with a model "
+                "type that records feature names (sklearn / LightGBM)."
             )
+        self.feature_names = list(model_features)
+        logger.info(
+            "MLStrategy feature schema sourced from model: %d features",
+            len(self.feature_names),
+        )
+
+        # If the model trained on HMM regime probs, load the per-symbol HMM
+        # artifact persisted alongside Angel/Devil and apply it at inference.
+        self.hmm_models: Optional[dict] = None
+        if any(c in self.feature_names for c in HMM_OUTPUT_COLS):
+            project_root = Path(__file__).resolve().parent.parent.parent.parent
+            hmm_path = project_root / "models" / self.asset_class / "hmm_latest.pkl"
+            try:
+                self.hmm_models = load_hmm_models(hmm_path)
+                fitted = sum(1 for m in self.hmm_models.values() if m is not None)
+                logger.info(
+                    "MLStrategy loaded HMM regime artifact: %s (%d/%d symbols fitted)",
+                    hmm_path, fitted, len(self.hmm_models),
+                )
+            except FileNotFoundError:
+                raise RuntimeError(
+                    f"Angel model expects HMM features but {hmm_path} is missing. "
+                    "Re-run the retrainer with RETRAIN_USE_HMM=1 so the HMM "
+                    "artifact is persisted alongside the model."
+                )
 
         # Validate metadata sidecar
         self._validate_metadata()
@@ -465,8 +469,14 @@ class MLStrategy(BaseStrategy):
             DataFrame with computed features, or None if insufficient data.
         """
         try:
-            # Use imported FeaturePipeline.run()
+            # Use imported FeaturePipeline.run(). clean_data filters its
+            # null-drop subset to columns that exist in the frame, so HMM
+            # cols added after this call don't interfere with base cleaning.
             features_df = self.pipeline.run(df, feature_cols=self.feature_names)
+
+            # Append HMM regime posteriors if the loaded model expects them.
+            if self.hmm_models is not None:
+                features_df = predict_regime_probs(features_df, self.hmm_models)
 
             return features_df
 
