@@ -25,7 +25,6 @@ import warnings
 from pathlib import Path
 from typing import Optional
 
-import numpy as np
 import polars as pl
 
 warnings.filterwarnings("ignore", message=".*join_asof.*")
@@ -384,9 +383,13 @@ class MLStrategy(BaseStrategy):
             if features_df is None or len(features_df) == 0:
                 return None
 
-            # Get latest bar's features for prediction
+            # Get latest bar's features for prediction. Pass a pandas
+            # DataFrame (with column names) so LightGBM does not emit a
+            # per-call UserWarning about missing feature names. Predictions
+            # are identical either way (positional matching), but the live
+            # log fills with warnings without this.
             latest_features_df = features_df[self.feature_names].tail(1)
-            latest_features = latest_features_df.to_numpy()
+            X_angel = latest_features_df.to_pandas()
 
             # Get current price for signal
             current_price = float(df["close"].tail(1)[0])
@@ -398,7 +401,7 @@ class MLStrategy(BaseStrategy):
             # ═══════════════════════════════════════════════════════════
             # STAGE 1: THE ANGEL (DIRECTION)
             # ═══════════════════════════════════════════════════════════
-            angel_prob = self.angel_trainer.predict_proba(latest_features)[0, 1]
+            angel_prob = self.angel_trainer.predict_proba(X_angel)[0, 1]
 
             if angel_prob < self.angel_threshold:
                 logger.debug(
@@ -411,11 +414,12 @@ class MLStrategy(BaseStrategy):
             # ═══════════════════════════════════════════════════════════
             # STAGE 2: THE DEVIL (CONVICTION)
             # ═══════════════════════════════════════════════════════════
-            # Build meta-feature set: original features + Angel's probability
-            angel_prob_col = np.array([[angel_prob]])
-            meta_features = np.hstack([latest_features, angel_prob_col])
+            # Build meta-feature frame: base features + Angel's probability,
+            # preserving column names so LightGBM does not warn here either.
+            X_devil = X_angel.copy()
+            X_devil["angel_prob"] = angel_prob
 
-            devil_prob = self.devil_trainer.predict_proba(meta_features)[0, 1]
+            devil_prob = self.devil_trainer.predict_proba(X_devil)[0, 1]
 
             if devil_prob < self.devil_threshold:
                 logger.debug(
