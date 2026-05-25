@@ -309,8 +309,17 @@ def fetch_training_data(
     logger.info("FETCHING TRAINING DATA")
     logger.info("=" * 70)
 
-    # Use timezone-aware UTC datetime
-    end_date = datetime.now(timezone.utc)
+    # Use timezone-aware UTC datetime. RETRAIN_END_DATE (YYYY-MM-DD) lets
+    # us shift the window backward for soak-readiness reruns — the audit
+    # report flagged single-window results as a deployment risk.
+    end_override = os.getenv("RETRAIN_END_DATE", "").strip()
+    if end_override:
+        end_date = datetime.strptime(end_override, "%Y-%m-%d").replace(
+            tzinfo=timezone.utc
+        )
+        logger.info(f"RETRAIN_END_DATE override active: {end_date.date()}")
+    else:
+        end_date = datetime.now(timezone.utc)
     start_date = end_date - timedelta(days=days_back)
 
     logger.info(f"Date range: {start_date.date()} to {end_date.date()}")
