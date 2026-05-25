@@ -22,9 +22,11 @@ import logging
 import os
 import threading
 import warnings
+from collections import defaultdict, deque
 from pathlib import Path
-from typing import Optional
+from typing import Deque, Dict, Optional
 
+import numpy as np
 import polars as pl
 
 warnings.filterwarnings("ignore", message=".*join_asof.*")
@@ -197,6 +199,19 @@ class MLStrategy(BaseStrategy):
         # (models/threshold.json).  Must be called AFTER self.devil_threshold is
         # set above so _load_threshold() can use it as a fallback.
         self.devil_threshold = self._load_threshold()
+
+        # Heartbeat state: every N bars per symbol, log a summary of the
+        # angel_prob distribution. Lets the operator see the model is
+        # actively evaluating even when no signals fire (most rejections
+        # happen at logger.debug, which the project's logging setup
+        # silently suppresses at INFO root level).
+        self._heartbeat_window: Dict[str, Deque[float]] = defaultdict(
+            lambda: deque(maxlen=30)
+        )
+        self._heartbeat_counter: Dict[str, int] = defaultdict(int)
+        self._heartbeat_every_n_bars = int(
+            os.getenv("MLSTRATEGY_HEARTBEAT_EVERY_N", "15")
+        )
 
     def _validate_metadata(self) -> None:
         """
@@ -402,6 +417,31 @@ class MLStrategy(BaseStrategy):
             # STAGE 1: THE ANGEL (DIRECTION)
             # ═══════════════════════════════════════════════════════════
             angel_prob = self.angel_trainer.predict_proba(X_angel)[0, 1]
+
+            # Heartbeat: track this bar's prob and periodically emit a
+            # per-symbol distribution summary so silence in the logs is
+            # distinguishable from a hung evaluation loop.
+            heartbeat_key = symbol or "_anon"
+            self._heartbeat_window[heartbeat_key].append(float(angel_prob))
+            self._heartbeat_counter[heartbeat_key] += 1
+            if self._heartbeat_counter[heartbeat_key] >= self._heartbeat_every_n_bars:
+                probs = list(self._heartbeat_window[heartbeat_key])
+                proposed = sum(1 for p in probs if p >= self.angel_threshold)
+                logger.info(
+                    "[%s] Heartbeat: last %d bars angel_prob "
+                    "median=%.3f p75=%.3f max=%.3f | proposed=%d/%d (%.1f%%) "
+                    "vs threshold=%.2f",
+                    heartbeat_key,
+                    len(probs),
+                    float(np.median(probs)),
+                    float(np.percentile(probs, 75)),
+                    float(np.max(probs)),
+                    proposed,
+                    len(probs),
+                    100.0 * proposed / len(probs),
+                    self.angel_threshold,
+                )
+                self._heartbeat_counter[heartbeat_key] = 0
 
             if angel_prob < self.angel_threshold:
                 logger.debug(
