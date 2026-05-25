@@ -22,6 +22,7 @@ from typing import Dict, List, Optional
 
 import polars as pl
 
+from core.notification_manager import NotificationManager
 from data.oanda_provider import OandaMarketProvider, _to_oanda_symbol
 from execution.oanda_order_manager import OandaOrderManager
 from execution.risk_manager import RiskManager
@@ -100,6 +101,9 @@ class OandaScalperOrchestrator:
         self._shutdown_event = asyncio.Event()
         self._stream_task: Optional[asyncio.Task] = None
 
+        # Discord webhook (silently no-ops when DISCORD_WEBHOOK_URL unset)
+        self._notifier = NotificationManager()
+
     # ── tick callback (runs on provider's blocking stream thread) ─────
 
     def _on_tick(self, symbol: str, bid: float, ask: float) -> None:
@@ -155,6 +159,11 @@ class OandaScalperOrchestrator:
         Wraps the blocking ``close_position`` HTTP call in an executor so
         the event loop never stalls.
         """
+        # Snapshot the position before we close+pop so we can describe it
+        # in the Discord alert.
+        with self._positions_lock:
+            pos_snapshot = self._positions.get(symbol, {}).copy()
+
         try:
             await asyncio.get_running_loop().run_in_executor(
                 None, self._order_manager.close_position, symbol
@@ -167,6 +176,18 @@ class OandaScalperOrchestrator:
         finally:
             with self._positions_lock:
                 self._positions.pop(symbol, None)
+
+        if pos_snapshot:
+            units = pos_snapshot.get("units", 0)
+            direction = "long" if units > 0 else "short"
+            self._notifier.send_oanda_trade_alert(
+                symbol=symbol,
+                direction=direction,
+                action="WATCHDOG_CLOSE",
+                price=pos_snapshot.get("entry", 0.0),
+                units=units,
+                reason="SL or TP breach detected by tick watchdog",
+            )
 
     # ── bar callback (runs on the asyncio loop) ───────────────────────
 
@@ -315,6 +336,21 @@ class OandaScalperOrchestrator:
             avg_price,
             sl_price,
             tp_price,
+        )
+
+        # Discord trade alert (no-op if webhook unset)
+        meta = signal.metadata or {}
+        self._notifier.send_oanda_trade_alert(
+            symbol=symbol,
+            direction=signal.direction,
+            action="ENTRY",
+            price=avg_price,
+            units=actual_units,
+            sl_price=sl_price,
+            tp_price=tp_price,
+            angel_prob=meta.get("angel_prob"),
+            devil_prob=meta.get("devil_prob"),
+            timestamp=str(meta.get("timestamp")) if meta.get("timestamp") else None,
         )
 
     # ── lifecycle ─────────────────────────────────────────────────────

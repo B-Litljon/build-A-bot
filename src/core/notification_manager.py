@@ -80,6 +80,74 @@ class NotificationManager:
         except Exception as e:
             logger.error(f"Failed to send Discord system message: {e}")
 
+    def send_oanda_trade_alert(
+        self,
+        *,
+        symbol: str,
+        direction: str,
+        action: str,
+        price: float,
+        units: int,
+        sl_price: Optional[float] = None,
+        tp_price: Optional[float] = None,
+        angel_prob: Optional[float] = None,
+        devil_prob: Optional[float] = None,
+        reason: Optional[str] = None,
+        timestamp: Optional[str] = None,
+    ) -> None:
+        """
+        Discord alert for the OANDA scalper path.
+
+        Decoupled from core.signal.Signal because the V5 forex strategy
+        emits a different Signal shape (strategies.base.Signal). Accepts
+        primitives so each orchestrator passes whatever fields it has.
+        """
+        if not self.webhook_url:
+            return
+
+        is_long = direction.lower() == "long"
+        if action == "ENTRY":
+            emoji = "📈" if is_long else "📉"
+            title = f"{emoji} OANDA SCALPER ENTRY: {direction.upper()} {symbol}"
+            color = 0x00FF00 if is_long else 0xFF0000
+        else:
+            title = f"🏁 OANDA SCALPER {action}: {symbol}"
+            color = 0x00A2FF
+
+        description = f"💵 **Price:** {price:.5f}\n"
+        description += f"📦 **Units:** {units}\n"
+
+        if angel_prob is not None and devil_prob is not None:
+            description += f"👼 **Angel:** {angel_prob * 100:.1f}%\n"
+            description += f"😈 **Devil:** {devil_prob * 100:.1f}%\n"
+
+        if action == "ENTRY" and sl_price is not None and tp_price is not None:
+            description += f"\n🛑 **SL:** {sl_price:.5f}\n"
+            description += f"🚀 **TP:** {tp_price:.5f}\n"
+
+        if reason:
+            description += f"\n📝 **Reason:** {reason}\n"
+
+        payload = {
+            "username": "Build-A-Bot V5 Scalper",
+            "embeds": [
+                {
+                    "title": title,
+                    "description": description,
+                    "color": color,
+                    "footer": {
+                        "text": f"Timestamp: {timestamp or datetime.utcnow().isoformat()}"
+                    },
+                }
+            ],
+        }
+
+        try:
+            response = requests.post(self.webhook_url, json=payload, timeout=5)
+            response.raise_for_status()
+        except Exception as e:
+            logger.error(f"Failed to send Discord OANDA trade alert: {e}")
+
     def send_retraining_report(self, report, promoted: bool):
         """
         Sends a detailed retraining report to Discord.
