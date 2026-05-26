@@ -104,6 +104,14 @@ class OandaScalperOrchestrator:
         # Discord webhook (silently no-ops when DISCORD_WEBHOOK_URL unset)
         self._notifier = NotificationManager()
 
+        # A3 chop-filter telemetry: track how often the RiskManager's chop
+        # filter vetoes a Devil-approved signal. The retrainer does NOT
+        # simulate this filter during target generation, so a high veto
+        # rate indicates a training/inference asymmetry that needs closing
+        # before the model can be trusted with real money.
+        self._devil_approved_total: int = 0
+        self._a3_chop_rejections: int = 0
+
     # ── tick callback (runs on provider's blocking stream thread) ─────
 
     def _on_tick(self, symbol: str, bid: float, ask: float) -> None:
@@ -241,6 +249,9 @@ class OandaScalperOrchestrator:
         if signal is None:
             return
 
+        # Devil approved this signal. Track it for A3 chop-filter telemetry.
+        self._devil_approved_total += 1
+
         # ── guard: do not trade while a close is pending ──
         with self._positions_lock:
             existing = self._positions.get(symbol)
@@ -268,9 +279,15 @@ class OandaScalperOrchestrator:
                     tp_price = signal.entry_price - tp_dist
 
         if sl_price is None or tp_price is None:
+            self._a3_chop_rejections += 1
+            ratio = 100.0 * self._a3_chop_rejections / max(self._devil_approved_total, 1)
             logger.warning(
-                "[%s] Bracket calculation rejected trade (A3 chop filter)",
+                "[%s] Bracket calculation rejected trade (A3 chop filter) | "
+                "running: %d / %d Devil-approved vetoed (%.1f%%)",
                 symbol,
+                self._a3_chop_rejections,
+                self._devil_approved_total,
+                ratio,
             )
             return
 
