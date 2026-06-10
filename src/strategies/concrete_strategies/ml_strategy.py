@@ -391,12 +391,29 @@ class MLStrategy(BaseStrategy):
             logger.debug(f"Insufficient data ({len(df)} < {self.warmup_period})")
             return None
 
+        symbol: Optional[str] = None  # resolved inside try; used in except
         try:
             # Generate features using imported FeatureEngineer
             features_df = self._generate_features(df)
 
             if features_df is None or len(features_df) == 0:
                 return None
+
+            # Guard: clean_data drops rows with null/NaN/Inf features. If
+            # the *newest* bar was dropped, the tail of features_df is a
+            # stale bar — scoring it against the current price would trade
+            # on the wrong bar. Skip the signal instead.
+            if "timestamp" in features_df.columns and "timestamp" in df.columns:
+                feat_ts = features_df["timestamp"].tail(1)[0]
+                raw_ts = df["timestamp"].tail(1)[0]
+                if feat_ts != raw_ts:
+                    logger.warning(
+                        "Latest bar (%s) dropped by feature cleaning — "
+                        "newest valid features are from %s; skipping signal",
+                        raw_ts,
+                        feat_ts,
+                    )
+                    return None
 
             # Get latest bar's features for prediction. Pass a pandas
             # DataFrame (with column names) so LightGBM does not emit a

@@ -292,6 +292,68 @@ class TestOandaScalperOrchestrator(unittest.TestCase):
         self.assertEqual(orch._positions["EUR_USD"]["units"], -1000)
         self.assertEqual(orch._positions["EUR_USD"]["entry"], 1.08440)
 
+    # ── (g) entry/watchdog race (H2 hardening) ─────────────────────────
+
+    def test_tick_watchdog_ignores_reversing_position(self):
+        """Ticks must not dispatch a close while a flip is in flight."""
+        orch, _, _, _, _ = self._make_orchestrator()
+        mock_loop = MagicMock()
+        mock_loop.is_running.return_value = True
+        orch._loop = mock_loop
+        orch._positions["EUR_USD"] = {
+            "entry": 1.08500, "sl": 1.08400, "tp": 1.08600,
+            "units": 1000, "state": "REVERSING",
+        }
+
+        with patch("asyncio.run_coroutine_threadsafe") as mock_run_coro:
+            orch._on_tick("EUR_USD", 1.08350, 1.08355)  # breaches old SL
+
+        mock_run_coro.assert_not_called()
+        self.assertEqual(orch._positions["EUR_USD"]["state"], "REVERSING")
+
+    def test_failed_flip_restores_old_position_state(self):
+        """Submit failure during a flip re-arms the watchdog (state OPEN)."""
+        orch, _, strategy, order_manager, risk_manager = self._make_orchestrator()
+        strategy.generate_signals.return_value = FakeSignal(direction="short")
+        risk_manager.calculate_bracket.return_value = (0.00050, 0.00150)
+        order_manager.submit_target_position.side_effect = RuntimeError("api down")
+        orch._positions["EUR_USD"] = {
+            "entry": 1.08000, "sl": 1.07900, "tp": 1.08300,
+            "units": 1000, "state": "OPEN",
+        }
+
+        for i in range(3):
+            asyncio.run(
+                orch._on_bar(self._bar_dict(timestamp=i, close=1.08000 + i * 0.001))
+            )
+
+        self.assertEqual(orch._positions["EUR_USD"]["state"], "OPEN")
+
+    def test_flip_to_flat_pops_record(self):
+        """Resulting net of zero after a fill clears the tracked position."""
+        orch, _, strategy, order_manager, risk_manager = self._make_orchestrator()
+        strategy.generate_signals.return_value = FakeSignal(direction="short")
+        risk_manager.calculate_bracket.return_value = (0.00050, 0.00150)
+        orch._positions["EUR_USD"] = {
+            "entry": 1.08000, "sl": 1.07900, "tp": 1.08300,
+            "units": 1000, "state": "OPEN",
+        }
+        order_manager.submit_target_position.return_value = {
+            "filled": 1000,
+            "avg_price": 1.08450,
+            "closed_units": 1000,
+            "opened_units": 0,
+            "position_units": 0,
+            "position_avg_price": 0.0,
+        }
+
+        for i in range(3):
+            asyncio.run(
+                orch._on_bar(self._bar_dict(timestamp=i, close=1.08000 + i * 0.001))
+            )
+
+        self.assertNotIn("EUR_USD", orch._positions)
+
     # ── helpers ────────────────────────────────────────────────────────
 
     @staticmethod

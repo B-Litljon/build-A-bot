@@ -98,7 +98,9 @@ class TestOandaTickHook(unittest.TestCase):
         self.assertIsNotNone(state)
         self.assertEqual(state["open"], 1.080025)   # mid
         self.assertEqual(state["close"], 1.080025)
-        self.assertEqual(state["volume"], 0)
+        # Opening tick counts toward volume (training/inference parity:
+        # OANDA candle volume is total tick count).
+        self.assertEqual(state["volume"], 1)
 
         # Second tick in same epoch — update existing bar
         provider._handle_tick(self._price_msg(bid="1.08010", ask="1.08015"))
@@ -106,7 +108,7 @@ class TestOandaTickHook(unittest.TestCase):
         self.assertEqual(state["high"], 1.080125)
         self.assertEqual(state["low"], 1.080025)
         self.assertEqual(state["close"], 1.080125)
-        self.assertEqual(state["volume"], 1)
+        self.assertEqual(state["volume"], 2)
 
     # ── (d) HEARTBEAT-like msg does not trigger tick_callback ──────────
 

@@ -200,7 +200,10 @@ class OandaMarketProvider(MarketDataProvider):
                     "high": mid,
                     "low": mid,
                     "close": mid,
-                    "volume": 0,
+                    # The opening tick counts: training data (OANDA candle
+                    # volume) is total tick count, so starting at 0 deflated
+                    # live vol_rel vs. the training distribution.
+                    "volume": 1,
                 }
             else:
                 state["high"] = max(state["high"], mid)

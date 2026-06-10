@@ -383,16 +383,40 @@ class OandaScalperOrchestrator:
             else -self._units_per_trade
         )
 
-        # ── guard: skip same-direction re-entry ──
+        # ── guard: same-direction re-entry / mark reversal in flight ──
+        # Re-checked under the lock immediately before submit: the position
+        # may have gone PENDING_CLOSE since the earlier guard (tick watchdog
+        # races bar processing). On a flip, mark the old position REVERSING
+        # so the tick watchdog cannot fire on its stale SL/TP mid-submit.
+        reversing = False
         with self._positions_lock:
             existing = self._positions.get(symbol)
-        if existing:
-            if existing["units"] > 0 and target_units > 0:
-                logger.info("[%s] Already long — skipping re-entry", symbol)
+            if existing:
+                if existing.get("state") != "OPEN":
+                    logger.info(
+                        "[%s] Position state changed to %s before submit — "
+                        "skipping entry",
+                        symbol,
+                        existing.get("state"),
+                    )
+                    return
+                if existing["units"] > 0 and target_units > 0:
+                    logger.info("[%s] Already long — skipping re-entry", symbol)
+                    return
+                if existing["units"] < 0 and target_units < 0:
+                    logger.info("[%s] Already short — skipping re-entry", symbol)
+                    return
+                existing["state"] = "REVERSING"
+                reversing = True
+
+        def _restore_open() -> None:
+            """Re-arm the watchdog on the old position after a failed flip."""
+            if not reversing:
                 return
-            if existing["units"] < 0 and target_units < 0:
-                logger.info("[%s] Already short — skipping re-entry", symbol)
-                return
+            with self._positions_lock:
+                current = self._positions.get(symbol)
+                if current is not None and current.get("state") == "REVERSING":
+                    current["state"] = "OPEN"
 
         # ── submit order (blocking HTTP → executor) ──
         try:
@@ -409,6 +433,7 @@ class OandaScalperOrchestrator:
                 e,
                 exc_info=True,
             )
+            _restore_open()
             return
 
         filled = result.get("filled", 0)
@@ -417,6 +442,7 @@ class OandaScalperOrchestrator:
                 "[%s] Order rejected / zero fill — not recording position",
                 symbol,
             )
+            _restore_open()
             return
 
         # ── record position state ──
@@ -431,6 +457,10 @@ class OandaScalperOrchestrator:
                 "not recording position",
                 symbol,
             )
+            # Broker is flat: drop any old record (a REVERSING leftover
+            # would block future entries and watchdog alike).
+            with self._positions_lock:
+                self._positions.pop(symbol, None)
             return
         with self._positions_lock:
             self._positions[symbol] = {
