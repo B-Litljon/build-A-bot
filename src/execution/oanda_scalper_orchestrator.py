@@ -119,6 +119,14 @@ class OandaScalperOrchestrator:
         # Watchdog close retry policy (C1 hardening)
         self._close_max_attempts = int(os.getenv("OANDA_CLOSE_MAX_ATTEMPTS", "5"))
 
+        # Stream liveness policy (C3 hardening). The provider's read
+        # timeout is the primary stall defense; this watchdog is the
+        # backstop that also flattens exposure if the stream goes quiet.
+        self._stream_stale_seconds = float(
+            os.getenv("OANDA_STREAM_STALE_SECONDS", "60")
+        )
+        self._liveness_task: Optional[asyncio.Task] = None
+
     # ── notifications ─────────────────────────────────────────────────
 
     def _notify(self, fn, **kwargs) -> None:
@@ -588,9 +596,57 @@ class OandaScalperOrchestrator:
             await self._prime_history()
 
             # Defensive: clear provider stop event in case it was set
-            self._provider._stop_event.clear()
+            self._provider.reset_stop()
 
             logger.info("Stream reconnect: priming complete, resuming stream")
+
+    async def _check_stream_liveness(self) -> None:
+        """
+        One liveness probe: if the stream has delivered nothing (not even
+        heartbeats) for longer than the stale threshold, flatten exposure
+        and force a reconnect.
+
+        REST and the pricing stream are separate connections, so the
+        flatten very likely still works even when the stream is wedged.
+        """
+        age = self._provider.seconds_since_last_message
+        if age is None or age <= self._stream_stale_seconds:
+            return
+
+        logger.critical(
+            "Pricing stream stale: no message for %.0fs (threshold %.0fs) — "
+            "flattening exposure and forcing reconnect",
+            age,
+            self._stream_stale_seconds,
+        )
+        self._notify(
+            self._notifier.send_system_message,
+            message=(
+                f"🚨 Pricing stream stale for {age:.0f}s — flattening open "
+                "positions and forcing a reconnect (SL/TP enforcement is "
+                "software-only and was blind during the stall)."
+            ),
+        )
+
+        with self._positions_lock:
+            has_positions = bool(self._positions)
+        if has_positions:
+            await self._flatten_all()
+
+        self._provider.force_disconnect("liveness watchdog: stream stale")
+
+    async def _liveness_watchdog(self) -> None:
+        """Periodic stream-liveness checks until shutdown."""
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(self._shutdown_event.wait(), timeout=10)
+                return  # shutdown signalled
+            except asyncio.TimeoutError:
+                pass
+            try:
+                await self._check_stream_liveness()
+            except Exception as e:
+                logger.error("Liveness check failed: %s", e, exc_info=True)
 
     async def run(self) -> None:
         """Start the orchestrator loop."""
@@ -620,6 +676,9 @@ class OandaScalperOrchestrator:
         # Run the pricing stream with reconnect-on-disconnect wrapper
         self._stream_task = asyncio.create_task(self._stream_with_retry())
 
+        # Backstop liveness watchdog (C3): flatten + reconnect on stall
+        self._liveness_task = asyncio.create_task(self._liveness_watchdog())
+
         logger.info(
             "OandaScalperOrchestrator started | symbols=%s warmup=%d",
             self._symbols,
@@ -632,6 +691,14 @@ class OandaScalperOrchestrator:
     async def shutdown(self) -> None:
         """Graceful shutdown: stop stream, flatten if configured."""
         logger.info("OandaScalperOrchestrator shutting down...")
+
+        if self._liveness_task and not self._liveness_task.done():
+            self._liveness_task.cancel()
+            try:
+                await self._liveness_task
+            except asyncio.CancelledError:
+                pass
+
         self._provider.stop_stream()
 
         if self._stream_task and not self._stream_task.done():
