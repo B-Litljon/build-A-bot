@@ -13,6 +13,7 @@ Design constraints:
 """
 
 import asyncio
+import functools
 import logging
 import os
 import signal as sig
@@ -24,7 +25,7 @@ import polars as pl
 
 from core.notification_manager import NotificationManager
 from data.oanda_provider import OandaMarketProvider, _to_oanda_symbol
-from execution.oanda_order_manager import OandaOrderManager
+from execution.oanda_order_manager import OandaOrderManager, OrderCloseError
 from execution.risk_manager import RiskManager
 from strategies.concrete_strategies.ml_strategy import MLStrategy
 
@@ -65,6 +66,7 @@ class OandaScalperOrchestrator:
         units_per_trade: int = 1000,
         warmup_period: Optional[int] = None,
         flatten_on_exit: bool = True,
+        notifier: Optional[NotificationManager] = None,
     ):
         self._symbols = symbols
         self._provider = provider
@@ -101,8 +103,10 @@ class OandaScalperOrchestrator:
         self._shutdown_event = asyncio.Event()
         self._stream_task: Optional[asyncio.Task] = None
 
-        # Discord webhook (silently no-ops when DISCORD_WEBHOOK_URL unset)
-        self._notifier = NotificationManager()
+        # Discord webhook (silently no-ops when DISCORD_WEBHOOK_URL unset).
+        # Injectable so tests can pass a mock — the real one posts to the
+        # production webhook whenever the env var is set.
+        self._notifier = notifier if notifier is not None else NotificationManager()
 
         # A3 chop-filter telemetry: track how often the RiskManager's chop
         # filter vetoes a Devil-approved signal. The retrainer does NOT
@@ -111,6 +115,28 @@ class OandaScalperOrchestrator:
         # before the model can be trusted with real money.
         self._devil_approved_total: int = 0
         self._a3_chop_rejections: int = 0
+
+        # Watchdog close retry policy (C1 hardening)
+        self._close_max_attempts = int(os.getenv("OANDA_CLOSE_MAX_ATTEMPTS", "5"))
+
+    # ── notifications ─────────────────────────────────────────────────
+
+    def _notify(self, fn, **kwargs) -> None:
+        """
+        Fire-and-forget a blocking notifier call off the event loop.
+
+        Discord posts are synchronous ``requests.post`` calls with a 5s
+        timeout; running them inline on the loop would stall bar
+        processing and queued watchdog closes for every symbol.
+        """
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            loop.run_in_executor(None, functools.partial(fn, **kwargs))
+        else:
+            try:
+                fn(**kwargs)
+            except Exception as e:
+                logger.error("Notification failed: %s", e)
 
     # ── tick callback (runs on provider's blocking stream thread) ─────
 
@@ -165,37 +191,85 @@ class OandaScalperOrchestrator:
         Coroutine running on the asyncio loop.
 
         Wraps the blocking ``close_position`` HTTP call in an executor so
-        the event loop never stalls.
+        the event loop never stalls. A failed close is retried with
+        exponential backoff; the position is only dropped from tracking
+        once the broker confirms (or reports already-flat). If every
+        attempt fails the position is parked in ``CLOSE_FAILED`` state —
+        still visible to ``_flatten_all`` on exit — and a manual-
+        intervention alert is sent.
         """
         # Snapshot the position before we close+pop so we can describe it
         # in the Discord alert.
         with self._positions_lock:
             pos_snapshot = self._positions.get(symbol, {}).copy()
 
-        try:
-            await asyncio.get_running_loop().run_in_executor(
-                None, self._order_manager.close_position, symbol
-            )
-            logger.info("[%s] Watchdog close completed", symbol)
-        except Exception as e:
-            logger.error(
-                "[%s] Watchdog close failed: %s", symbol, e, exc_info=True
-            )
-        finally:
+        units = pos_snapshot.get("units", 0)
+        direction = "long" if units > 0 else "short"
+        loop = asyncio.get_running_loop()
+
+        last_error: Optional[Exception] = None
+        for attempt in range(1, self._close_max_attempts + 1):
+            try:
+                await loop.run_in_executor(
+                    None, self._order_manager.close_position, symbol
+                )
+            except Exception as e:  # OrderCloseError or executor failure
+                last_error = e
+                logger.error(
+                    "[%s] Watchdog close attempt %d/%d failed: %s",
+                    symbol,
+                    attempt,
+                    self._close_max_attempts,
+                    e,
+                )
+                if attempt < self._close_max_attempts:
+                    await asyncio.sleep(2 ** (attempt - 1))
+                continue
+
+            # Success (close submitted, or broker already flat)
             with self._positions_lock:
                 self._positions.pop(symbol, None)
-
-        if pos_snapshot:
-            units = pos_snapshot.get("units", 0)
-            direction = "long" if units > 0 else "short"
-            self._notifier.send_oanda_trade_alert(
-                symbol=symbol,
-                direction=direction,
-                action="WATCHDOG_CLOSE",
-                price=pos_snapshot.get("entry", 0.0),
-                units=units,
-                reason="SL or TP breach detected by tick watchdog",
+            logger.info(
+                "[%s] Watchdog close completed (attempt %d)", symbol, attempt
             )
+            if pos_snapshot:
+                self._notify(
+                    self._notifier.send_oanda_trade_alert,
+                    symbol=symbol,
+                    direction=direction,
+                    action="WATCHDOG_CLOSE",
+                    price=pos_snapshot.get("entry", 0.0),
+                    units=units,
+                    reason="SL or TP breach detected by tick watchdog",
+                )
+            return
+
+        # All attempts exhausted — keep the position tracked so the exit
+        # flatten still sees it, and demand a human.
+        with self._positions_lock:
+            current = self._positions.get(symbol)
+            if current is not None:
+                current["state"] = "CLOSE_FAILED"
+        logger.critical(
+            "[%s] Watchdog close FAILED after %d attempts — position still "
+            "open at broker with no automated exit. Last error: %s",
+            symbol,
+            self._close_max_attempts,
+            last_error,
+        )
+        self._notify(
+            self._notifier.send_oanda_trade_alert,
+            symbol=symbol,
+            direction=direction,
+            action="CLOSE_FAILED",
+            price=pos_snapshot.get("entry", 0.0),
+            units=units,
+            reason=(
+                f"MANUAL INTERVENTION REQUIRED: watchdog close failed "
+                f"{self._close_max_attempts} times ({last_error}). Position "
+                f"remains open at broker without SL/TP enforcement."
+            ),
+        )
 
     # ── bar callback (runs on the asyncio loop) ───────────────────────
 
@@ -252,13 +326,16 @@ class OandaScalperOrchestrator:
         # Devil approved this signal. Track it for A3 chop-filter telemetry.
         self._devil_approved_total += 1
 
-        # ── guard: do not trade while a close is pending ──
+        # ── guard: do not trade unless any existing position is cleanly OPEN ──
+        # (PENDING_CLOSE = watchdog exit in flight; CLOSE_FAILED = stuck
+        # position awaiting manual intervention — never trade on top of it.)
         with self._positions_lock:
             existing = self._positions.get(symbol)
-            if existing and existing.get("state") == "PENDING_CLOSE":
+            if existing and existing.get("state") != "OPEN":
                 logger.info(
-                    "[%s] Signal generated but position PENDING_CLOSE — skipping",
+                    "[%s] Signal generated but position state=%s — skipping",
                     symbol,
+                    existing.get("state"),
                 )
                 return
 
@@ -335,8 +412,18 @@ class OandaScalperOrchestrator:
             return
 
         # ── record position state ──
-        avg_price = result.get("avg_price", signal.entry_price)
-        actual_units = filled if target_units > 0 else -filled
+        # Use the order manager's authoritative resulting net position, not
+        # the raw fill size: on a reversal the fill includes the closing leg
+        # (2× the position) and avg_price blends both legs.
+        avg_price = result.get("position_avg_price") or signal.entry_price
+        actual_units = result.get("position_units", 0)
+        if actual_units == 0:
+            logger.warning(
+                "[%s] Fill reported but resulting net position is flat — "
+                "not recording position",
+                symbol,
+            )
+            return
         with self._positions_lock:
             self._positions[symbol] = {
                 "entry": avg_price,
@@ -355,9 +442,10 @@ class OandaScalperOrchestrator:
             tp_price,
         )
 
-        # Discord trade alert (no-op if webhook unset)
+        # Discord trade alert (no-op if webhook unset; posted off-loop)
         meta = signal.metadata or {}
-        self._notifier.send_oanda_trade_alert(
+        self._notify(
+            self._notifier.send_oanda_trade_alert,
             symbol=symbol,
             direction=signal.direction,
             action="ENTRY",
@@ -371,6 +459,63 @@ class OandaScalperOrchestrator:
         )
 
     # ── lifecycle ─────────────────────────────────────────────────────
+
+    async def _reconcile_on_boot(self) -> None:
+        """
+        Reconcile local state with the broker before trading starts.
+
+        Policy (2026-06-09 ruling): any position found at OANDA on boot is
+        an orphan (crash recovery, failed watchdog close from a prior run)
+        with no known SL/TP — flatten it. If broker state cannot even be
+        *verified*, abort startup: never trade blind.
+        """
+        loop = asyncio.get_running_loop()
+        for symbol in self._symbols:
+            norm_sym = _to_oanda_symbol(symbol)
+
+            ok = await loop.run_in_executor(
+                None, self._order_manager.sync_position, norm_sym
+            )
+            if not ok:
+                raise RuntimeError(
+                    f"[{norm_sym}] Boot reconciliation failed: could not "
+                    "verify broker position state — refusing to start."
+                )
+
+            net = self._order_manager.get_net_position(norm_sym)
+            if net == 0:
+                continue
+
+            entry = self._order_manager.get_average_entry_price(norm_sym)
+            logger.warning(
+                "[%s] Boot reconciliation: orphaned position at broker "
+                "(net=%d, avg=%.5f) — flattening",
+                norm_sym,
+                net,
+                entry,
+            )
+            try:
+                await loop.run_in_executor(
+                    None, self._order_manager.close_position, norm_sym
+                )
+            except OrderCloseError as e:
+                raise RuntimeError(
+                    f"[{norm_sym}] Boot reconciliation: failed to flatten "
+                    f"orphaned position (net={net}): {e}"
+                ) from e
+
+            self._notify(
+                self._notifier.send_oanda_trade_alert,
+                symbol=norm_sym,
+                direction="long" if net > 0 else "short",
+                action="BOOT_FLATTEN",
+                price=entry,
+                units=net,
+                reason=(
+                    "Orphaned position found at broker during startup "
+                    "reconciliation — flattened (no known SL/TP)."
+                ),
+            )
 
     async def _prime_history(self) -> None:
         """Prime bar buffers with historical REST data to bypass cold warm-up."""
@@ -460,6 +605,10 @@ class OandaScalperOrchestrator:
             except (NotImplementedError, ValueError):
                 pass  # Windows or handler already registered
 
+        # Verify broker state before anything else — flattens orphans,
+        # raises if state can't be verified.
+        await self._reconcile_on_boot()
+
         self._provider.subscribe(
             self._symbols,
             self._on_bar,
@@ -518,13 +667,29 @@ class OandaScalperOrchestrator:
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
+        failed: List[str] = []
         for sym, result in zip(symbols, results):
             if isinstance(result, Exception):
-                logger.error(
-                    "[%s] Flatten close failed: %s", sym, result, exc_info=True
+                failed.append(sym)
+                logger.critical(
+                    "[%s] Flatten close failed on exit — position may "
+                    "remain open at broker: %s",
+                    sym,
+                    result,
                 )
             else:
                 logger.info("[%s] Flattened on exit", sym)
+
+        if failed:
+            # Synchronous on purpose: we are shutting down and the loop may
+            # not outlive a fire-and-forget executor job.
+            try:
+                self._notifier.send_system_message(
+                    "🚨 MANUAL INTERVENTION REQUIRED: exit flatten failed "
+                    f"for {', '.join(failed)} — verify positions at OANDA."
+                )
+            except Exception as e:
+                logger.error("Failed to send flatten-failure alert: %s", e)
 
         with self._positions_lock:
             self._positions.clear()

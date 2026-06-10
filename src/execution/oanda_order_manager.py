@@ -31,6 +31,10 @@ def _to_oanda_symbol(symbol: str) -> str:
     return symbol.replace("/", "_").upper()
 
 
+class OrderCloseError(Exception):
+    """A position close request failed at the broker (state untouched)."""
+
+
 class OandaOrderManager:
     """
     OANDA v20 net-position manager.
@@ -94,7 +98,7 @@ class OandaOrderManager:
 
     # ── broker sync ───────────────────────────────────────────────────
 
-    def sync_position(self, instrument: str) -> None:
+    def sync_position(self, instrument: str) -> bool:
         """
         Pull authoritative net-position state from OANDA's
         ``/v3/accounts/{id}/positions/{instrument}`` endpoint and
@@ -103,6 +107,10 @@ class OandaOrderManager:
         Under FIFO/no-hedging, exactly one of ``long`` or ``short`` will
         carry non-zero units for any given instrument; OANDA returns
         short units as a negative numeric string.
+
+        Returns True if state was refreshed from the broker, False if the
+        request failed (local state untouched — caller must not assume
+        the position is flat).
         """
         oanda_symbol = _to_oanda_symbol(instrument)
         try:
@@ -138,6 +146,7 @@ class OandaOrderManager:
                     self._net_positions[oanda_symbol],
                     self._avg_entry_prices[oanda_symbol],
                 )
+            return True
         except Exception as e:
             logger.error(
                 "[%s] OandaOrderManager.sync_position failed: %s",
@@ -145,6 +154,7 @@ class OandaOrderManager:
                 e,
                 exc_info=True,
             )
+            return False
 
     # ── FIFO close ────────────────────────────────────────────────────
 
@@ -155,8 +165,14 @@ class OandaOrderManager:
 
         Uses ``"ALL"`` semantics so the broker liquidates whatever is
         actually open, even if local state has drifted. Returns True if
-        a close request was submitted, False if already flat or on
-        error (state untouched on error so a retry can be attempted).
+        a close request was submitted, False if already flat.
+
+        Raises
+        ------
+        OrderCloseError
+            If the broker request fails. Local state is untouched so a
+            retry can be attempted; callers MUST treat the position as
+            still open.
 
         Note: ``oandapyV20.contrib.requests.PositionCloseRequest`` is
         bypassed here because its ``Units("ALL")`` validator raises
@@ -223,7 +239,9 @@ class OandaOrderManager:
                 e,
                 exc_info=True,
             )
-            return False
+            raise OrderCloseError(
+                f"close_position({oanda_symbol}) failed with net={net}: {e}"
+            ) from e
 
     # ── target-position entry / reversal ───────────────────────────────
 
@@ -243,12 +261,19 @@ class OandaOrderManager:
         -------
         dict
             ``{'filled': int, 'avg_price': float, 'closed_units': int,
-            'opened_units': int}``
+            'opened_units': int, 'position_units': int,
+            'position_avg_price': float}``
+
+            ``filled``/``avg_price`` describe the whole market order (on a
+            reversal that includes the closing leg). ``position_units`` and
+            ``position_avg_price`` are the authoritative resulting net
+            position — use these for position records.
         """
         oanda_symbol = _to_oanda_symbol(symbol)
 
         with self._state_lock:
             current_net = self.get_net_position(symbol)
+            current_avg = self._avg_entry_prices.get(oanda_symbol, 0.0)
 
         delta = target_units - current_net
 
@@ -258,6 +283,8 @@ class OandaOrderManager:
                 "avg_price": 0.0,
                 "closed_units": 0,
                 "opened_units": 0,
+                "position_units": current_net,
+                "position_avg_price": current_avg,
             }
 
         try:
@@ -287,6 +314,8 @@ class OandaOrderManager:
                     "avg_price": 0.0,
                     "closed_units": 0,
                     "opened_units": 0,
+                    "position_units": current_net,
+                    "position_avg_price": current_avg,
                 }
 
             fill_units = int(fill_tx.get("units", "0"))
@@ -335,6 +364,8 @@ class OandaOrderManager:
                     ) if trade_opened else fill_price
                     self._avg_entry_prices[oanda_symbol] = opened_price
 
+                position_avg_price = self._avg_entry_prices[oanda_symbol]
+
             logger.info(
                 "[%s] submit_target_position | target=%d delta=%d "
                 "fill_price=%.5f resulting_net=%d",
@@ -350,6 +381,8 @@ class OandaOrderManager:
                 "avg_price": fill_price,
                 "closed_units": closed_units,
                 "opened_units": opened_units,
+                "position_units": new_net,
+                "position_avg_price": position_avg_price,
             }
 
         except Exception as e:
@@ -366,4 +399,6 @@ class OandaOrderManager:
                 "avg_price": 0.0,
                 "closed_units": 0,
                 "opened_units": 0,
+                "position_units": current_net,
+                "position_avg_price": current_avg,
             }
