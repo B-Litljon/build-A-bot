@@ -1,0 +1,5 @@
+[tool.pytest.ini_options]
+# Only collect from tests/. The root-level test_*.py files are manual
+# probe scripts with import-time side effects (test_discord.py posts to
+# the live webhook on import) — a bare `pytest` must never collect them.
+testpaths = ["tests"]

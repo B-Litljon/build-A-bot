@@ -15,6 +15,7 @@ Usage:
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -44,7 +45,28 @@ from strategies.concrete_strategies.ml_strategy import MLStrategy  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_SYMBOLS = ["EUR/USD"]
+# Last-resort fallback only — the real default is the trained basket from
+# models/forex/metadata.json (see _trained_basket).
+FALLBACK_SYMBOLS = ["EUR/USD"]
+
+_METADATA_PATH = Path(__file__).resolve().parent / "models" / "forex" / "metadata.json"
+
+
+def _trained_basket() -> list[str]:
+    """
+    Instruments the promoted model was trained on.
+
+    Used as the default basket so launching with no --symbols never trades
+    an out-of-distribution pair (the model has only seen these).
+    """
+    try:
+        with open(_METADATA_PATH) as fh:
+            symbols = json.load(fh).get("trained_on_symbols") or []
+        if symbols:
+            return list(symbols)
+    except Exception as e:
+        logger.warning("Could not read trained basket from %s: %s", _METADATA_PATH, e)
+    return list(FALLBACK_SYMBOLS)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -55,8 +77,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--symbols",
         type=str,
-        default=os.getenv("OANDA_SYMBOLS", ",".join(DEFAULT_SYMBOLS)),
-        help="Comma-separated instrument list (default: EUR/USD)",
+        default=os.getenv("OANDA_SYMBOLS", ",".join(_trained_basket())),
+        help=(
+            "Comma-separated instrument list (default: the trained basket "
+            "from models/forex/metadata.json)"
+        ),
     )
     parser.add_argument(
         "--units",
@@ -107,7 +132,18 @@ async def _main() -> None:
 
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
     if not symbols:
-        symbols = list(DEFAULT_SYMBOLS)
+        symbols = _trained_basket()
+
+    # Warn loudly when trading instruments the model has never seen.
+    basket = {s.replace("/", "_").upper() for s in _trained_basket()}
+    for s in symbols:
+        if s.replace("/", "_").upper() not in basket:
+            logger.warning(
+                "Symbol %s is NOT in the trained basket %s — the model is "
+                "out of distribution on it",
+                s,
+                sorted(basket),
+            )
 
     # ── initialise components ──
     provider = OandaMarketProvider(

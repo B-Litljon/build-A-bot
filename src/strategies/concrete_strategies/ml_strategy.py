@@ -259,8 +259,9 @@ class MLStrategy(BaseStrategy):
         threshold_path = project_root / "models" / self.asset_class / "threshold.json"
         if not threshold_path.exists():
             logger.warning(
-                "_load_threshold: models/threshold.json not found — "
+                "_load_threshold: %s not found — "
                 "using constructor default devil_threshold=%.2f",
+                threshold_path,
                 self.devil_threshold,
             )
             return self.devil_threshold
@@ -330,12 +331,13 @@ class MLStrategy(BaseStrategy):
                         f"[HOT-RELOAD] Detected new Devil model: {self.devil_path}"
                     )
                     try:
-                        self.devil_trainer.load(str(self.devil_path))
-                        if hasattr(self.devil_trainer, "model") and hasattr(
-                            self.devil_trainer.model, "n_jobs"
-                        ):
-                            self.devil_trainer.model.n_jobs = 1
-                        self.devil_mtime = current_devil_mtime
+                        with self._reload_lock:
+                            self.devil_trainer.load(str(self.devil_path))
+                            if hasattr(self.devil_trainer, "model") and hasattr(
+                                self.devil_trainer.model, "n_jobs"
+                            ):
+                                self.devil_trainer.model.n_jobs = 1
+                            self.devil_mtime = current_devil_mtime
                         logger.info(f"[HOT-RELOAD] Devil model updated successfully")
                         reloaded = True
                     except Exception as e:
@@ -343,6 +345,31 @@ class MLStrategy(BaseStrategy):
 
             # Send notification if any model was reloaded
             if reloaded:
+                # Refresh the inference schema from the reloaded Angel — a
+                # retrain may change the feature space; predicting through a
+                # stale column list would silently misalign features.
+                new_features = self.angel_trainer.feature_names_in_
+                if new_features is not None and list(new_features) != self.feature_names:
+                    logger.warning(
+                        "[HOT-RELOAD] Feature schema changed: %d -> %d features",
+                        len(self.feature_names),
+                        len(new_features),
+                    )
+                    self.feature_names = list(new_features)
+
+                # Consistency check: Devil must be Angel's features + angel_prob.
+                devil_features = self.devil_trainer.feature_names_in_
+                expected = self.feature_names + ["angel_prob"]
+                if devil_features is not None and list(devil_features) != expected:
+                    msg = (
+                        "[HOT-RELOAD] SCHEMA MISMATCH: Devil features do not "
+                        "equal Angel features + angel_prob. Angel/Devil pair "
+                        "on disk is inconsistent — predictions are suspect "
+                        "until the next retrain completes."
+                    )
+                    logger.critical(msg)
+                    self.notification_manager.send_system_message(msg)
+
                 # Also reload the threshold — a retrain always produces a new
                 # threshold.json alongside the new model weights.
                 old_threshold = self.devil_threshold

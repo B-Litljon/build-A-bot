@@ -1,7 +1,7 @@
 import os
 import logging
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -136,7 +136,7 @@ class NotificationManager:
                     "description": description,
                     "color": color,
                     "footer": {
-                        "text": f"Timestamp: {timestamp or datetime.utcnow().isoformat()}"
+                        "text": f"Timestamp: {timestamp or datetime.now(timezone.utc).isoformat()}"
                     },
                 }
             ],

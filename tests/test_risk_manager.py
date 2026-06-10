@@ -53,5 +53,40 @@ class TestRiskManagerForex(unittest.TestCase):
         self.assertIsNotNone(bracket)
         self.assertEqual(bracket[0], 0.025)
 
+    def test_metals_percent_floor(self):
+        """XAU/XAG use a percent-of-price floor, not the meaningless pip floor."""
+        profile = RiskProfile(
+            min_sl_pips=2.0,
+            min_sl_pct_metals=0.0001,
+            sl_atr_multiplier=1.0,
+            round_precision=5,
+        )
+        rm = RiskManager(profile)
+
+        # XAU_USD at 2700: floor = 2700 * 0.0001 = 0.27.
+        # atr=0.10 -> sl_dist = 0.10 < 0.27 -> reject. (The old pip floor of
+        # 0.0002 would have passed this — the filter was a no-op on metals.)
+        self.assertIsNone(rm.calculate_bracket(2700.0, 0.10, symbol="XAU_USD"))
+
+        # atr=1.50 -> sl_dist = 1.50 >= 0.27 -> pass
+        bracket = rm.calculate_bracket(2700.0, 1.50, symbol="XAU_USD")
+        self.assertIsNotNone(bracket)
+        self.assertEqual(bracket[0], 1.50)
+
+        # Silver too: XAG_USD at 31.0, floor = 0.0031.
+        self.assertIsNone(rm.calculate_bracket(31.0, 0.001, symbol="XAG_USD"))
+        self.assertIsNotNone(rm.calculate_bracket(31.0, 0.05, symbol="XAG_USD"))
+
+    def test_metal_detection_does_not_catch_fiat(self):
+        """Fiat pairs still use the pip floor (XAU prefix only)."""
+        profile = RiskProfile(
+            min_sl_pips=2.0, min_sl_pct_metals=0.0001,
+            sl_atr_multiplier=0.5, round_precision=5,
+        )
+        rm = RiskManager(profile)
+        # EUR_USD must behave exactly as in test_forex_non_jpy_floor.
+        self.assertIsNone(rm.calculate_bracket(1.08000, 0.0003, symbol="EUR_USD"))
+        self.assertIsNotNone(rm.calculate_bracket(1.08000, 0.0005, symbol="EUR_USD"))
+
 if __name__ == "__main__":
     unittest.main()

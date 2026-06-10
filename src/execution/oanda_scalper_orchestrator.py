@@ -586,7 +586,11 @@ class OandaScalperOrchestrator:
 
             hist_bars = []
             for row in df.iter_rows(named=True):
-                assert row["timestamp"].tzinfo is not None
+                if row["timestamp"].tzinfo is None:
+                    raise ValueError(
+                        f"[{norm_sym}] Historical bar at {row['timestamp']} "
+                        "is timezone-naive — seam dedup would misbehave"
+                    )
                 hist_bars.append({**row, "symbol": norm_sym})
 
             self._bar_buffers[norm_sym].extend(hist_bars)

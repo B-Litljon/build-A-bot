@@ -12,7 +12,12 @@ logger = logging.getLogger(__name__)
 # open. See llm_reports/refactors/2026-05-25_configurable-chop-floor.md.
 ENV_FOREX_MIN_SL_PIPS = "RISK_FOREX_MIN_SL_PIPS"
 ENV_EQUITIES_MIN_SL_PCT = "RISK_EQUITIES_MIN_SL_PCT"
+ENV_METALS_MIN_SL_PCT = "RISK_METALS_MIN_SL_PCT"
 ENV_CHOP_FILTER_ENABLED = "RISK_CHOP_FILTER_ENABLED"
+
+# Metals quoted like forex pairs (XAU_USD etc.) where a 0.0001 "pip" is
+# meaningless — the floor for these uses a percent of price instead.
+_METAL_BASES = {"XAU", "XAG", "XPT", "XPD"}
 
 
 def _chop_filter_enabled() -> bool:
@@ -27,6 +32,10 @@ class RiskProfile:
     tp_atr_multiplier: float = 3.0
     min_sl_pct: float = 0.0015  # 0.15% absolute floor
     min_sl_pips: float = 2.0     # Default Forex pip floor (2.0 pips)
+    # Metals floor: % of price. Default 0.01% matches the relative scale of
+    # the 2-pip floor on the JPY crosses (2 pips on GBP/JPY ≈ 0.01% of price),
+    # so the chop filter has comparable bite across the trained basket.
+    min_sl_pct_metals: float = 0.0001
     risk_per_trade: float = 0.02 # 2% of account
     max_notional_cap: float = 100000.0
     round_precision: int = 4
@@ -38,6 +47,7 @@ class RiskProfile:
                 sl_atr_multiplier=1.0,
                 tp_atr_multiplier=2.0,
                 min_sl_pips=float(os.getenv(ENV_FOREX_MIN_SL_PIPS, "2.0")),
+                min_sl_pct_metals=float(os.getenv(ENV_METALS_MIN_SL_PCT, "0.0001")),
                 round_precision=5,
             )
         return cls(
@@ -64,7 +74,11 @@ class RiskManager:
         tp_dist = raw_atr * self.profile.tp_atr_multiplier
 
         # Determine the stop-loss floor
-        if symbol and self._is_forex_symbol(symbol):
+        if symbol and self._is_metal_symbol(symbol):
+            # Pip-based floors are meaningless for XAU/XAG (a 0.0001 "pip"
+            # on gold at ~$2,700 never fires) — use percent-of-price.
+            floor = entry_price * self.profile.min_sl_pct_metals
+        elif symbol and self._is_forex_symbol(symbol):
             pip_size = self._get_forex_pip_size(symbol)
             floor = self.profile.min_sl_pips * pip_size
         else:
@@ -97,6 +111,10 @@ class RiskManager:
     def _is_forex_symbol(self, symbol: str) -> bool:
         clean = symbol.replace("_", "").replace("/", "").upper()
         return len(clean) == 6 and clean.isalpha()
+
+    def _is_metal_symbol(self, symbol: str) -> bool:
+        clean = symbol.replace("_", "").replace("/", "").upper()
+        return len(clean) == 6 and clean[:3] in _METAL_BASES
 
     def _get_forex_pip_size(self, symbol: str) -> float:
         clean = symbol.replace("_", "").replace("/", "").upper()
