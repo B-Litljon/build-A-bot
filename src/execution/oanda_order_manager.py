@@ -22,6 +22,7 @@ from typing import Dict, Optional
 import oandapyV20
 import oandapyV20.endpoints.orders as v20_orders
 import oandapyV20.endpoints.positions as v20_positions
+from oandapyV20.exceptions import V20Error
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +148,28 @@ class OandaOrderManager:
                     self._avg_entry_prices[oanda_symbol],
                 )
             return True
+        except V20Error as e:
+            # A 404 / NO_SUCH_POSITION is OANDA's way of saying the
+            # instrument has never held a position this account-lifetime —
+            # i.e. it is flat. That is a *successful* sync, not a failure;
+            # treating it as one would make boot reconciliation refuse to
+            # start on a clean account.
+            if e.code == 404 and "NO_SUCH_POSITION" in str(e):
+                with self._state_lock:
+                    self._net_positions[oanda_symbol] = 0
+                    self._avg_entry_prices[oanda_symbol] = 0.0
+                logger.info(
+                    "[%s] OandaOrderManager sync | net=0 (no position on broker)",
+                    oanda_symbol,
+                )
+                return True
+            logger.error(
+                "[%s] OandaOrderManager.sync_position failed: %s",
+                oanda_symbol,
+                e,
+                exc_info=True,
+            )
+            return False
         except Exception as e:
             logger.error(
                 "[%s] OandaOrderManager.sync_position failed: %s",
