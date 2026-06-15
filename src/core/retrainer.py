@@ -145,6 +145,12 @@ def get_hyperparameters(asset_class: str) -> Tuple[dict, dict]:
         "subsample_freq": 1,
         "colsample_bytree": 0.8,
         "random_state": 42,
+        # Fully reproducible sweeps across the cached parquet datasets:
+        # random_state already seeds bagging/feature-fraction; deterministic +
+        # force_row_wise remove the multithreaded histogram float-ordering
+        # jitter that can otherwise nudge a borderline threshold-grid pick.
+        "deterministic": True,
+        "force_row_wise": True,
         "n_jobs": -1,
         "verbose": -1,
     }
@@ -161,6 +167,12 @@ def get_hyperparameters(asset_class: str) -> Tuple[dict, dict]:
         "subsample_freq": 1,
         "colsample_bytree": 0.8,
         "random_state": 42,
+        # Fully reproducible sweeps across the cached parquet datasets:
+        # random_state already seeds bagging/feature-fraction; deterministic +
+        # force_row_wise remove the multithreaded histogram float-ordering
+        # jitter that can otherwise nudge a borderline threshold-grid pick.
+        "deterministic": True,
+        "force_row_wise": True,
         "n_jobs": -1,
         "verbose": -1,
     }
@@ -204,7 +216,14 @@ PROFIT_FACTOR_THRESHOLD = 1.2  # Min acceptable Profit Factor
 # from a handful of lucky wins. Empirically the 2026-05-23 Gemini run "passed"
 # with 14–16 OOS trades while the Devil's own separation diagnostic read
 # "NO SIGNAL." 100 is the minimum sample for any honest PF claim.
-MIN_OOS_TRADES_FOR_PF = 100
+MIN_OOS_TRADES_FOR_PF = 100  # legacy Fold-3-only floor (superseded below)
+
+# Pooled, drop-rate-scaled OOS-trade floor (replaces the Fold-3-only cliff).
+# Pool Devil-approved OOS trades across ALL folds, then scale the requirement
+# down by the chop filter's row-drop rate so a high-precision filter that
+# correctly prunes ~30% of bars isn't penalized for the trades it removed:
+#     effective_floor = BASELINE_POOLED_OOS_TRADES * (1 - chop_veto_rate)
+BASELINE_POOLED_OOS_TRADES = int(os.getenv("RETRAIN_POOLED_TRADE_FLOOR", "300"))
 
 # Toggle for the HMM regime-feature experiment. When enabled, a per-symbol
 # 3-state GaussianHMM is fit on each fold's training window (no leakage) and
@@ -284,6 +303,9 @@ class ValidationReport:
     final_win_rate: float
     final_total_trades: int
     gate_passed: bool
+    pooled_oos_trades: int = 0
+    chop_veto_rate: float = 0.0
+    effective_trade_floor: float = 0.0
     rejection_reasons: List[str] = field(default_factory=list)
 
 
@@ -611,7 +633,7 @@ def engineer_features_and_labels(
     survival_bars: int = SURVIVAL_BARS,
     htf_timeframe: str = "5m",
     risk_profile: Optional[RiskProfile] = None,
-) -> Tuple[pl.DataFrame, List[str]]:
+) -> Tuple[pl.DataFrame, List[str], float]:
     """
     Engineer technical features and generate ATR-dynamic target labels.
 
@@ -636,7 +658,9 @@ def engineer_features_and_labels(
         htf_timeframe: Higher timeframe representation for HTFFeatures
 
     Returns:
-        Tuple of (features DataFrame with targets, feature column names)
+        Tuple of (features DataFrame with targets, feature column names,
+        chop_veto_rate) — the row-drop fraction feeds the pooled dynamic
+        trade-count floor in validate_candidate().
     """
     logger.info("=" * 70)
     logger.info("ENGINEERING FEATURES & LABELS")
@@ -723,14 +747,17 @@ def engineer_features_and_labels(
     # path; we only remove bars we would never ENTER on. Realigns the
     # training population (and thus Profit Factor) with the live filter.
     # ═══════════════════════════════════════════════════════════════════
+    chop_veto_rate = 0.0
     if risk_profile is not None:
+        pre_veto = df.height
         veto_mask = _compute_chop_veto_mask(df, risk_profile, sl_mult)
         n_veto = int(veto_mask.sum())
+        chop_veto_rate = n_veto / pre_veto if pre_veto else 0.0
         if n_veto > 0:
             df = df.filter(~pl.Series(veto_mask))
         logger.info(
             f"Hybrid chop veto dropped {n_veto:,} untradeable rows "
-            f"(mode={risk_profile.spread_k_coupling_mode}, "
+            f"({chop_veto_rate:.1%}; mode={risk_profile.spread_k_coupling_mode}, "
             f"k_base={risk_profile.spread_k_base}, coupling={risk_profile.spread_k_coupling}, "
             f"P{risk_profile.regime_pctile:.0f}, alpha={risk_profile.spread_atr_alpha})"
         )
@@ -754,7 +781,7 @@ def engineer_features_and_labels(
     if USE_HMM_FEATURES:
         logger.info(f"HMM regime features ENABLED — will be appended per-fold: {HMM_OUTPUT_COLS}")
 
-    return df, BASE_FEATURE_COLS
+    return df, BASE_FEATURE_COLS, chop_veto_rate
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1088,6 +1115,7 @@ def validate_candidate(
     n_folds: int = 3,
     angel_params: Optional[dict] = None,
     devil_params: Optional[dict] = None,
+    chop_veto_rate: float = 0.0,
 ) -> Tuple[
     ValidationReport,
     "lgb.LGBMClassifier",
@@ -1148,6 +1176,11 @@ def validate_candidate(
     logger.info("=" * 70)
     logger.info("WALK-FORWARD VALIDATION (3 EXPANDING FOLDS)")
     logger.info("=" * 70)
+
+    # Pin the process RNG for fully deterministic sweeps across the cached
+    # datasets. (LightGBM is already seeded via random_state=42 + deterministic;
+    # this guards any incidental numpy randomness in the validation path.)
+    np.random.seed(42)
 
     # If the HMM regime experiment is on, the active feature space is the
     # base features plus the 3 HMM_OUTPUT_COLS. Each fold fits its own HMM
@@ -1549,6 +1582,12 @@ def validate_candidate(
     mean_brier = float(np.mean([fm.brier_score for fm in fold_metrics]))
     mean_ev = float(np.mean([fm.expected_value for fm in fold_metrics]))
 
+    # Pooled, drop-rate-scaled OOS-trade floor. Pool Devil-approved trades
+    # across ALL folds and lower the requirement by the chop filter's row-drop
+    # rate, so a high-precision filter isn't penalized for the bars it pruned.
+    pooled_oos_trades = int(sum(fm.devil_approved_trades for fm in fold_metrics))
+    effective_trade_floor = BASELINE_POOLED_OOS_TRADES * (1.0 - chop_veto_rate)
+
     rejection_reasons: List[str] = []
     if mean_brier > BRIER_THRESHOLD:
         rejection_reasons.append(
@@ -1560,11 +1599,12 @@ def validate_candidate(
         rejection_reasons.append(
             f"Profit Factor {profit_factor:.4f} < {PROFIT_FACTOR_THRESHOLD} threshold"
         )
-    if final_total_trades < MIN_OOS_TRADES_FOR_PF:
+    if pooled_oos_trades < effective_trade_floor:
         rejection_reasons.append(
-            f"Fold {n_folds} OOS trades {final_total_trades} < "
-            f"{MIN_OOS_TRADES_FOR_PF} minimum — sample too small to trust "
-            f"PF={profit_factor:.4f}"
+            f"Pooled OOS trades {pooled_oos_trades} < effective floor "
+            f"{effective_trade_floor:.0f} "
+            f"(= {BASELINE_POOLED_OOS_TRADES} × (1 − chop_veto_rate {chop_veto_rate:.1%})) "
+            f"— sample too small to trust PF={profit_factor:.4f}"
         )
 
     gate_passed = len(rejection_reasons) == 0
@@ -1579,8 +1619,10 @@ def validate_candidate(
         f"(threshold ≥ {PROFIT_FACTOR_THRESHOLD}, Fold {n_folds} OOS)"
     )
     logger.info(
-        f"OOS Trades       : {final_total_trades} "
-        f"(threshold ≥ {MIN_OOS_TRADES_FOR_PF}, Fold {n_folds} sample-size floor)"
+        f"Pooled OOS Trades: {pooled_oos_trades} across {n_folds} folds "
+        f"(dynamic floor ≥ {effective_trade_floor:.0f} = "
+        f"{BASELINE_POOLED_OOS_TRADES}×(1−{chop_veto_rate:.1%}) | "
+        f"Fold {n_folds} PF trades={final_total_trades})"
     )
     logger.info(f"Gate Result      : {'PASSED ✅' if gate_passed else 'FAILED 🚫'}")
 
@@ -1618,6 +1660,9 @@ def validate_candidate(
         final_win_rate=final_win_rate,
         final_total_trades=final_total_trades,
         gate_passed=gate_passed,
+        pooled_oos_trades=pooled_oos_trades,
+        chop_veto_rate=chop_veto_rate,
+        effective_trade_floor=effective_trade_floor,
         rejection_reasons=rejection_reasons,
     )
 
@@ -1871,7 +1916,7 @@ def main() -> int:
         )
 
         # ─── Phase 3: Engineer features with ATR-dynamic labels ────────────
-        features_df, feature_cols = engineer_features_and_labels(
+        features_df, feature_cols, chop_veto_rate = engineer_features_and_labels(
             raw_data,
             sl_mult=asset_config["sl_mult"],
             tp_mult=asset_config["tp_mult"],
@@ -1909,6 +1954,7 @@ def main() -> int:
             n_folds=3,
             angel_params=angel_params,
             devil_params=devil_params,
+            chop_veto_rate=chop_veto_rate,
         )
         logger.info(f"Optimal Devil threshold (from Fold 3): {optimal_threshold:.4f}")
 

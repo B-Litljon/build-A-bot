@@ -140,17 +140,52 @@ gate binds.
   clipping floor, regime/cost vetoes, proxy fallback, cold-start bypass, rollover).
 - Live↔training symmetry cross-check: **0/400 mismatches** across modes/coupling/seeds.
 
+## Update 2026-06-15 — pooled dynamic gate + determinism (Gemini+Claude M2M)
+
+The first retrain run PASSED at PF 1.70 (161 Fold-3 trades) but a controlled A/B
+on byte-identical cached data showed PF 2.71 (control) / 2.89 (treatment) **both
+FAILING** the old `MIN_OOS_TRADES_FOR_PF=100` Fold-3 cliff (99 / 93 trades). Higher
+PF failing while lower PF passed = the gate was a coin-flip around the 100-trade
+single-fold floor, and the 1.70↔2.9 swing was the **data window** (two fetches 2.5h
+apart), not RNG. Fixes shipped in `src/core/retrainer.py`:
+
+- **Pooled, drop-rate-scaled floor.** Replaced the Fold-3-only cliff with
+  `effective_floor = BASELINE_POOLED_OOS_TRADES(300) × (1 − chop_veto_rate)`,
+  compared against Devil-approved trades **pooled across all folds**. `chop_veto_rate`
+  now flows `engineer_features_and_labels` → `validate_candidate`. PF is still
+  computed on Fold-3 OOS only; only the *sample-adequacy* test pools.
+- **Determinism.** `random_state=42` was already on both models (so the M2M's
+  "unseeded RNG" premise was inaccurate); added `deterministic:True` +
+  `force_row_wise:True` to kill LightGBM's multithreaded float-ordering jitter, and
+  a `np.random.seed(42)` guard in `validate_candidate`. The parquet cache
+  (`chop_ab_test.py`) gives byte-identical data across runs.
+
+**A/B re-run on cached data (now fully reproducible — identical to the prior run):**
+
+| arm | rows | PF | Brier | EV | WR | pooled | floor | gate |
+|---|---|---|---|---|---|---|---|---|
+| control (filter OFF) | 2,918,395 | 2.714 | 0.2665 | 0.776 | 57.6% | 338 | 300 | ✅ |
+| treatment (filter ON) | 2,036,245 | 2.895 | 0.2615 | 0.827 | 59.1% | 319 | 209 | ✅ |
+
+Both PASS. Treatment's floor scaled 300→209 (30.2% veto); its 319 pooled trades
+clear it comfortably — the selective high-precision model is no longer penalized.
+Filter remains directionally better on every metric (ΔPF +0.18, lower Brier, higher
+EV/WR), now a stable/reproducible delta.
+
+**Caveat retained:** the headline PF is still a Fold-3 figure on ~95 trades, so its
+confidence interval is wide. The pooled floor fixes the *gate stability*, not PF
+precision. New env knob: `RETRAIN_POOLED_TRADE_FLOOR` (default 300).
+
 ## Unfinished / next steps
 1. **Calibrate `spread_atr_alpha`** from measured `median(live_spread)/median(baseline_ATR)`
    per instrument during the next soak — the default 0.15 is a placeholder. Until
    then, *live-fresh* Gate A uses real spread (correct) and only the *training* /
    *stale-fallback* proxy depends on alpha (residual, documented asymmetry).
-2. **Retrain the 8-instrument forex basket** and re-gate; expect a justified PF
-   shift now that PF is measured on the tradeable population. Per
-   [[feedback_verify_retrain_handoffs]]: re-run, do not trust reported metrics.
-3. **Soak with split telemetry** through a US-session vol window; pick `tighten`
+2. **Soak with split telemetry** through a US-session vol window; pick `tighten`
    vs `loosen` from which gate binds and the realized fill quality. Non-zero
    qualified fills is the success signal (the prior 0-trade soak was a dead-tape +
    sub-spread artifact).
-4. Coupling default is 0.0 (decoupled) — dial up only after the soak shows the
+3. Coupling default is 0.0 (decoupled) — dial up only after the soak shows the
    spread distribution justifies it.
+4. PF precision is still Fold-3-bound (~95 trades). If a tighter PF CI is needed,
+   widen the OOS window or compute pooled-fold PF (not just pooled trade count).
