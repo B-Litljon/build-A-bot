@@ -18,15 +18,19 @@ import logging
 import os
 import signal as sig
 import threading
+import time
+from collections import deque
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
+from typing import Deque, Dict, List, Optional
 
+import numpy as np
 import polars as pl
+import talib
 
 from core.notification_manager import NotificationManager
 from data.oanda_provider import OandaMarketProvider, _to_oanda_symbol
 from execution.oanda_order_manager import OandaOrderManager, OrderCloseError
-from execution.risk_manager import RiskManager
+from execution.risk_manager import GATE_REGIME, GATE_SPREAD, RiskManager
 from strategies.concrete_strategies.ml_strategy import MLStrategy
 
 logger = logging.getLogger(__name__)
@@ -108,13 +112,39 @@ class OandaScalperOrchestrator:
         # production webhook whenever the env var is set.
         self._notifier = notifier if notifier is not None else NotificationManager()
 
-        # A3 chop-filter telemetry: track how often the RiskManager's chop
-        # filter vetoes a Devil-approved signal. The retrainer does NOT
-        # simulate this filter during target generation, so a high veto
-        # rate indicates a training/inference asymmetry that needs closing
-        # before the model can be trusted with real money.
+        # Chop-filter telemetry: track how often each gate of the dynamic
+        # hybrid floor vetoes a Devil-approved signal. Split per-gate so soak
+        # logs reveal which gate binds (cost vs regime).
         self._devil_approved_total: int = 0
-        self._a3_chop_rejections: int = 0
+        self._spread_gate_rejections: int = 0
+        self._regime_gate_rejections: int = 0
+        self._a3_chop_rejections: int = 0  # combined (spread + regime)
+
+        # ── Dynamic hybrid floor: per-symbol regime + spread state ──
+        # Stateful, drift-free NATR: a running Wilder ATR seeded once at boot
+        # from priming, then advanced O(1) per closed bar — no per-bar vector
+        # recompute over a shifting window. The deque feeds the regime gate and
+        # the volatility-scaled spread proxy in calculate_bracket().
+        self._natr_period = 14  # matches v3_features._NATR_PERIOD
+        try:
+            self._regime_window = int(self._risk_manager.profile.regime_window)
+        except (AttributeError, TypeError, ValueError):
+            self._regime_window = 260  # no/mocked risk manager
+        self._regime_natr: Dict[str, Deque[float]] = {
+            _to_oanda_symbol(s): deque(maxlen=self._regime_window) for s in symbols
+        }
+        self._wilder_atr: Dict[str, Optional[float]] = {
+            _to_oanda_symbol(s): None for s in symbols
+        }
+        self._regime_prev_close: Dict[str, Optional[float]] = {
+            _to_oanda_symbol(s): None for s in symbols
+        }
+        # Live spread capture (written lock-free from the tick thread).
+        self._latest_spread: Dict[str, float] = {}
+        self._latest_spread_ts: Dict[str, float] = {}
+        self._spread_stale_seconds = float(
+            os.getenv("RISK_SPREAD_STALE_SECONDS", "5")
+        )
 
         # Watchdog close retry policy (C1 hardening)
         self._close_max_attempts = int(os.getenv("OANDA_CLOSE_MAX_ATTEMPTS", "5"))
@@ -154,6 +184,11 @@ class OandaScalperOrchestrator:
 
         Callee must return in <50 µs and perform NO blocking I/O.
         """
+        # Capture the live spread for the cost gate. Plain dict assignment is
+        # atomic under the GIL — no lock, no blocking, sub-µs.
+        self._latest_spread[symbol] = ask - bid
+        self._latest_spread_ts[symbol] = time.monotonic()
+
         with self._positions_lock:
             pos = self._positions.get(symbol)
 
@@ -193,6 +228,64 @@ class OandaScalperOrchestrator:
                 "[%s] Watchdog breach but event loop not running — close skipped",
                 symbol,
             )
+
+    # ── dynamic hybrid floor: regime + spread helpers ────────────────
+
+    def _seed_regime(self, norm_sym: str, df: "pl.DataFrame") -> None:
+        """
+        Seed the per-symbol NATR deque + running Wilder ATR from primed bars.
+
+        One talib.NATR call over the priming frame (boot only — not per bar);
+        the running ATR is then advanced incrementally in ``_update_regime`` so
+        the series matches a continuous stream (no per-bar reseed drift).
+        """
+        if df.height < self._natr_period + 1:
+            return
+        high = df["high"].to_numpy()
+        low = df["low"].to_numpy()
+        close = df["close"].to_numpy()
+        natr = talib.NATR(high, low, close, timeperiod=self._natr_period)
+        valid = natr[np.isfinite(natr)]
+        if len(valid) == 0:
+            return
+        dq = self._regime_natr[norm_sym]
+        dq.clear()
+        for v in valid[-self._regime_window:]:
+            dq.append(float(v))
+        last_close = float(close[-1])
+        # Reconstruct the Wilder ATR state from the last NATR (= 100·ATR/close).
+        self._wilder_atr[norm_sym] = float(valid[-1]) * last_close / 100.0
+        self._regime_prev_close[norm_sym] = last_close
+        logger.info(
+            "[%s] Seeded regime NATR deque (%d/%d) + Wilder ATR state",
+            norm_sym, len(dq), self._regime_window,
+        )
+
+    def _update_regime(self, norm_sym: str, bar: dict) -> None:
+        """Advance the Wilder ATR by one closed bar (O(1)) and append NATR."""
+        high = float(bar["high"])
+        low = float(bar["low"])
+        close = float(bar["close"])
+        prev_close = self._regime_prev_close.get(norm_sym)
+        if prev_close is None:
+            prev_close = close
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        prev_atr = self._wilder_atr.get(norm_sym)
+        n = self._natr_period
+        atr = tr if prev_atr is None else (prev_atr * (n - 1) + tr) / n
+        self._wilder_atr[norm_sym] = atr
+        self._regime_prev_close[norm_sym] = close
+        if close > 0.0:
+            self._regime_natr[norm_sym].append(100.0 * atr / close)
+
+    def _get_spread(self, norm_sym: str) -> "tuple[Optional[float], bool]":
+        """Return (latest_spread, is_fresh) for the cost gate."""
+        ts = self._latest_spread_ts.get(norm_sym)
+        sp = self._latest_spread.get(norm_sym)
+        if ts is None or sp is None:
+            return None, False
+        fresh = (time.monotonic() - ts) <= self._spread_stale_seconds
+        return sp, fresh
 
     async def _watchdog_close(self, symbol: str) -> None:
         """
@@ -308,6 +401,9 @@ class OandaScalperOrchestrator:
             if len(buf) > self._max_bars:
                 buf.pop(0)
 
+        # ── advance the stateful regime NATR for this closed bar (O(1)) ──
+        self._update_regime(symbol, bar)
+
         n_bars = len(self._bar_buffers[symbol])
         if n_bars < self._warmup:
             logger.debug(
@@ -351,8 +447,14 @@ class OandaScalperOrchestrator:
         sl_price: Optional[float] = None
         tp_price: Optional[float] = None
         if self._risk_manager is not None:
+            spread, spread_fresh = self._get_spread(symbol)
             bracket = self._risk_manager.calculate_bracket(
-                signal.entry_price, signal.raw_sl_distance, symbol=symbol
+                signal.entry_price,
+                signal.raw_sl_distance,
+                symbol=symbol,
+                spread=spread,
+                spread_fresh=spread_fresh,
+                regime_series=self._regime_natr.get(symbol),
             )
             if bracket:
                 sl_dist, tp_dist = bracket
@@ -364,12 +466,20 @@ class OandaScalperOrchestrator:
                     tp_price = signal.entry_price - tp_dist
 
         if sl_price is None or tp_price is None:
+            gate = getattr(self._risk_manager, "last_veto_gate", GATE_SPREAD)
+            if gate == GATE_REGIME:
+                self._regime_gate_rejections += 1
+            else:  # GATE_SPREAD or GATE_STATIC (cost-side floors)
+                self._spread_gate_rejections += 1
             self._a3_chop_rejections += 1
             ratio = 100.0 * self._a3_chop_rejections / max(self._devil_approved_total, 1)
             logger.warning(
-                "[%s] Bracket calculation rejected trade (A3 chop filter) | "
-                "running: %d / %d Devil-approved vetoed (%.1f%%)",
+                "[%s] Bracket rejected (%s gate) | spread=%d regime=%d "
+                "(%d / %d Devil-approved vetoed, %.1f%%)",
                 symbol,
+                gate,
+                self._spread_gate_rejections,
+                self._regime_gate_rejections,
                 self._a3_chop_rejections,
                 self._devil_approved_total,
                 ratio,
@@ -582,7 +692,10 @@ class OandaScalperOrchestrator:
                 logger.warning("[%s] Historical bars returned empty", norm_sym)
                 continue
 
-            df = df.tail(self._warmup + 5)
+            # Keep enough tail to both warm the strategy and fully seed the
+            # regime NATR deque (window + Wilder warmup), in BAR count.
+            keep = max(self._warmup, self._regime_window) + self._natr_period + 5
+            df = df.tail(keep)
 
             hist_bars = []
             for row in df.iter_rows(named=True):
@@ -594,6 +707,7 @@ class OandaScalperOrchestrator:
                 hist_bars.append({**row, "symbol": norm_sym})
 
             self._bar_buffers[norm_sym].extend(hist_bars)
+            self._seed_regime(norm_sym, df)
             self._last_hist_ts[norm_sym] = df.select("timestamp").row(-1)[0]
             logger.info(
                 "[%s] Primed %d historical bars (tail) up to %s",

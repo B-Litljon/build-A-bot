@@ -45,7 +45,11 @@ from sklearn.model_selection import cross_val_predict, TimeSeriesSplit
 
 from src.data.factory import get_market_provider
 from src.data.market_provider import MarketDataProvider
-from src.execution.risk_manager import RiskProfile
+from src.execution.risk_manager import (
+    RiskProfile,
+    _chop_filter_enabled,
+    coupled_keff,
+)
 from src.ml.feature_pipeline import FeaturePipeline
 from src.ml.features.v3_features import V3BaseFeatures, V3HTFFeatures, V3SessionFeatures
 from src.ml.regimes.hmm_regime import (
@@ -504,6 +508,97 @@ def _compute_devil_survival_target(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# HYBRID CHOP VETO (symmetric with live RiskManager.calculate_bracket)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _compute_chop_veto_mask(
+    df: pl.DataFrame, profile: RiskProfile, sl_mult: float
+) -> np.ndarray:
+    """
+    Vectorized hybrid chop veto, mirroring ``RiskManager._evaluate_dynamic_gates``
+    so the model trains only on the live-tradeable population.
+
+    For each row, using the trailing ``regime_window`` of ``natr_14`` per symbol:
+      * pctile_rank = fraction of the window <= the current bar's NATR
+      * Gate B (regime): veto if ``pctile_rank < regime_pctile/100``
+      * Gate A (cost): veto if ``sl_mult·natr < k_eff · alpha · baseline_natr``
+        (the live inequality ``sl_dist < k_eff·spread_proxy`` with the
+        volatility-scaled proxy; ``close`` cancels on both sides). The spread
+        proxy scales with each era's *baseline* (median-window) volatility —
+        not a static historical constant — so it is era-robust.
+
+    Returns a boolean array (True = veto/drop) aligned to ``df`` rows. Rows are
+    dropped only as trade *entries*; the bracket walk in the target functions
+    still sees the full contiguous price path (so this must run AFTER target
+    generation, not before).
+    """
+    from numpy.lib.stride_tricks import sliding_window_view
+
+    n_total = df.height
+    veto = np.zeros(n_total, dtype=bool)
+    if not _chop_filter_enabled() or n_total == 0:
+        return veto
+
+    w = int(profile.regime_window)
+    mins = int(profile.regime_min_samples)
+    p_thresh = profile.regime_pctile / 100.0
+    alpha = profile.spread_atr_alpha
+
+    symbols = df["symbol"].to_numpy() if "symbol" in df.columns else np.zeros(n_total)
+    natr_all = df["natr_14"].to_numpy().astype(float)
+
+    for sym in np.unique(symbols):
+        idx = np.where(symbols == sym)[0]  # contiguous, time-ordered per symbol
+        natr = natr_all[idx]
+        m = len(natr)
+        # rank_actual feeds Gate B (regime); rank_eff feeds the coupling and is
+        # held neutral (0.5) until the window is warm — exactly as the live gate
+        # holds pctile_rank=0.5 below regime_min_samples.
+        rank_actual = np.full(m, 0.5)
+        rank_eff = np.full(m, 0.5)
+        baseline = np.full(m, np.nan)  # expanding/rolling median of the window
+
+        # Full-window region (vectorized): rows i >= w-1 (always warm: w >= mins).
+        if m >= w:
+            sw = sliding_window_view(natr, w)  # (m-w+1, w) → rows w-1 .. m-1
+            last = sw[:, -1]
+            fr = (sw <= last[:, None]).mean(axis=1)
+            rank_actual[w - 1:] = fr
+            rank_eff[w - 1:] = fr
+            baseline[w - 1:] = np.median(sw, axis=1)
+
+        # Expanding region (all earlier rows): baseline is always computable, so
+        # Gate A (cost) runs from the first bar; Gate B only once warm.
+        for i in range(0, min(w - 1, m)):
+            win = natr[: i + 1]
+            rank_actual[i] = float(np.mean(win <= natr[i]))
+            baseline[i] = float(np.median(win))
+            if (i + 1) >= mins:  # warm → real rank couples; else stay neutral 0.5
+                rank_eff[i] = rank_actual[i]
+
+        warm = (np.arange(m) + 1) >= mins
+
+        gate_b = np.zeros(m, dtype=bool)
+        if profile.regime_gate_enabled:
+            gate_b = warm & (rank_actual < p_thresh)
+
+        gate_a = np.zeros(m, dtype=bool)
+        if profile.spread_gate_enabled:
+            k_eff = coupled_keff(
+                profile.spread_k_base, profile.spread_k_coupling,
+                profile.spread_k_coupling_mode, rank_eff,
+            )
+            with np.errstate(invalid="ignore"):
+                gate_a = (sl_mult * natr) < (k_eff * alpha * baseline)
+            gate_a &= np.isfinite(baseline)
+
+        veto[idx] = gate_a | gate_b
+
+    return veto
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # FEATURE ENGINEERING & LABEL GENERATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -515,6 +610,7 @@ def engineer_features_and_labels(
     max_hold: int = MAX_HOLD_BARS,
     survival_bars: int = SURVIVAL_BARS,
     htf_timeframe: str = "5m",
+    risk_profile: Optional[RiskProfile] = None,
 ) -> Tuple[pl.DataFrame, List[str]]:
     """
     Engineer technical features and generate ATR-dynamic target labels.
@@ -620,6 +716,24 @@ def engineer_features_and_labels(
         f"{int(devil_targets_survival.sum())} survived / {len(devil_targets_survival)} total "
         f"({devil_targets_survival.mean():.1%} survival rate)"
     )
+
+    # ═══════════════════════════════════════════════════════════════════
+    # HYBRID CHOP VETO — drop untradeable entry rows (symmetric with live)
+    # Runs AFTER target generation so the bracket walk saw the full price
+    # path; we only remove bars we would never ENTER on. Realigns the
+    # training population (and thus Profit Factor) with the live filter.
+    # ═══════════════════════════════════════════════════════════════════
+    if risk_profile is not None:
+        veto_mask = _compute_chop_veto_mask(df, risk_profile, sl_mult)
+        n_veto = int(veto_mask.sum())
+        if n_veto > 0:
+            df = df.filter(~pl.Series(veto_mask))
+        logger.info(
+            f"Hybrid chop veto dropped {n_veto:,} untradeable rows "
+            f"(mode={risk_profile.spread_k_coupling_mode}, "
+            f"k_base={risk_profile.spread_k_base}, coupling={risk_profile.spread_k_coupling}, "
+            f"P{risk_profile.regime_pctile:.0f}, alpha={risk_profile.spread_atr_alpha})"
+        )
 
     # ═══════════════════════════════════════════════════════════════════
     # CLEANUP: Drop NaN/null rows (uses FeaturePipeline.clean_data)
@@ -1764,6 +1878,9 @@ def main() -> int:
             max_hold=asset_config["max_hold"],
             survival_bars=asset_config["survival_bars"],
             htf_timeframe=asset_config.get("htf_timeframe", "5m"),
+            # Same RiskProfile path that sources sl_mult/tp_mult → the chop
+            # veto simulated here is identical to the live execution gate.
+            risk_profile=RiskProfile.for_asset_class(asset_config["asset_class"]),
         )
 
         # ─── Phase 4: Walk-forward validation (3-fold expanding window) ────
