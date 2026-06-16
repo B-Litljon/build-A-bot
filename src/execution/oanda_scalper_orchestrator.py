@@ -146,6 +146,31 @@ class OandaScalperOrchestrator:
             os.getenv("RISK_SPREAD_STALE_SECONDS", "5")
         )
 
+        # ── Spread calibration sink (soak → empirical spread_atr_alpha) ──
+        # The live cost gate uses the real bid-ask spread, but the *training*
+        # / stale-fallback proxy is alpha·baseline_ATR with a placeholder
+        # alpha=0.15. To calibrate it from reality we sample (spread_pct,
+        # baseline_natr) once per CLOSED bar — off the <50µs tick path — and
+        # periodically log the per-instrument empirical alpha =
+        # median(spread_pct)/median(baseline_natr). spread_pct and the regime
+        # NATR share units (pct of price), so the ratio is dimensionless and
+        # directly comparable to RiskProfile.spread_atr_alpha. Bounded deques
+        # keep memory flat over multi-day soaks (recency-weighted, which is
+        # what we want).
+        self._spread_calib_maxlen = int(os.getenv("SPREAD_CALIB_MAXLEN", "20000"))
+        self._spread_calib_interval = int(
+            os.getenv("SPREAD_CALIB_INTERVAL_BARS", "60")
+        )
+        self._spread_pct_samples: Dict[str, Deque[float]] = {
+            _to_oanda_symbol(s): deque(maxlen=self._spread_calib_maxlen)
+            for s in symbols
+        }
+        self._baseline_natr_samples: Dict[str, Deque[float]] = {
+            _to_oanda_symbol(s): deque(maxlen=self._spread_calib_maxlen)
+            for s in symbols
+        }
+        self._spread_calib_bars = 0
+
         # Watchdog close retry policy (C1 hardening)
         self._close_max_attempts = int(os.getenv("OANDA_CLOSE_MAX_ATTEMPTS", "5"))
 
@@ -287,6 +312,51 @@ class OandaScalperOrchestrator:
         fresh = (time.monotonic() - ts) <= self._spread_stale_seconds
         return sp, fresh
 
+    def _sample_spread_calibration(self, norm_sym: str, close: float) -> None:
+        """
+        Record one (spread_pct, baseline_natr) sample for alpha calibration.
+
+        Called once per CLOSED bar (not per tick), so it never touches the
+        <50µs tick budget. Freshness is irrelevant here — the latest spread
+        observed during the bar is a fine once-a-minute sample. Both quantities
+        are in pct-of-price, so ``median(spread_pct)/median(baseline_natr)``
+        gives the empirical, dimensionless ``spread_atr_alpha``.
+        """
+        sp, _fresh = self._get_spread(norm_sym)
+        if sp is None or close <= 0.0:
+            return
+        regime = self._regime_natr.get(norm_sym)
+        if not regime:
+            return
+        baseline_natr = float(np.median(regime))
+        if baseline_natr <= 0.0:
+            return
+        self._spread_pct_samples[norm_sym].append(100.0 * sp / close)
+        self._baseline_natr_samples[norm_sym].append(baseline_natr)
+
+    def _log_spread_calibration(self) -> None:
+        """
+        Emit per-instrument empirical ``spread_atr_alpha`` from the soak so far.
+
+        Logged periodically (every ``SPREAD_CALIB_INTERVAL_BARS`` bars) and once
+        at shutdown. Grep ``SPREAD_CALIB`` in the soak log to read the converging
+        per-instrument alpha; the median over a US-session window is the value
+        to plug into ``RISK_SPREAD_ATR_ALPHA`` (or per-instrument overrides).
+        """
+        for norm_sym, spreads in self._spread_pct_samples.items():
+            if len(spreads) < 30:  # too few for a stable median yet
+                continue
+            baselines = self._baseline_natr_samples[norm_sym]
+            med_spread = float(np.median(spreads))
+            med_base = float(np.median(baselines))
+            alpha = med_spread / med_base if med_base > 0.0 else float("nan")
+            p25, p75 = (float(x) for x in np.percentile(spreads, [25, 75]))
+            logger.info(
+                "SPREAD_CALIB %s | n=%d med_spread_pct=%.5f [p25=%.5f p75=%.5f] "
+                "med_baseline_natr=%.5f alpha_emp=%.4f",
+                norm_sym, len(spreads), med_spread, p25, p75, med_base, alpha,
+            )
+
     async def _watchdog_close(self, symbol: str) -> None:
         """
         Coroutine running on the asyncio loop.
@@ -403,6 +473,12 @@ class OandaScalperOrchestrator:
 
         # ── advance the stateful regime NATR for this closed bar (O(1)) ──
         self._update_regime(symbol, bar)
+
+        # ── sample spread for empirical alpha calibration (off tick path) ──
+        self._sample_spread_calibration(symbol, bar["close"])
+        self._spread_calib_bars += 1
+        if self._spread_calib_bars % self._spread_calib_interval == 0:
+            self._log_spread_calibration()
 
         n_bars = len(self._bar_buffers[symbol])
         if n_bars < self._warmup:
@@ -839,6 +915,9 @@ class OandaScalperOrchestrator:
     async def shutdown(self) -> None:
         """Graceful shutdown: stop stream, flatten if configured."""
         logger.info("OandaScalperOrchestrator shutting down...")
+
+        # Final spread-calibration dump (durable even if flatten hangs below).
+        self._log_spread_calibration()
 
         if self._liveness_task and not self._liveness_task.done():
             self._liveness_task.cancel()
