@@ -1,7 +1,9 @@
 import logging
 import os
 from dataclasses import dataclass
+from datetime import datetime, time as dtime, timezone
 from typing import Optional, Sequence, Tuple
+from zoneinfo import ZoneInfo
 
 import numpy as np
 
@@ -28,6 +30,12 @@ ENV_SPREAD_ATR_ALPHA = "RISK_SPREAD_ATR_ALPHA"       # proxy spread / baseline A
 ENV_SPREAD_GATE_ENABLED = "RISK_SPREAD_GATE_ENABLED"
 ENV_REGIME_GATE_ENABLED = "RISK_REGIME_GATE_ENABLED"
 
+# Gate C — time-of-day blackout (e.g. the 5pm-NY daily rollover, when spreads
+# blow out ~10x and the model's signals are un-tradeable). Window is in
+# America/New_York local time so it tracks the rollover across DST.
+ENV_TIME_GATE_ENABLED = "RISK_TIME_GATE_ENABLED"
+ENV_BLACKOUT_ET = "RISK_BLACKOUT_ET"   # "HH:MM-HH:MM" in America/New_York
+
 # Coupling modes (the two competing financial theses, soak-selectable).
 COUPLING_TIGHTEN = "tighten"  # Claude: more cost discipline as vol expands
 COUPLING_LOOSEN = "loosen"    # Gemini: relax cost discipline in high-momentum runs
@@ -37,6 +45,29 @@ GATE_NONE = "none"
 GATE_SPREAD = "spread"  # Gate A — transaction-cost floor
 GATE_REGIME = "regime"  # Gate B — low-volatility regime floor
 GATE_STATIC = "static"  # legacy static floor (equities / no regime context)
+GATE_TIME = "time"      # Gate C — time-of-day blackout (e.g. NY 5pm rollover)
+
+# Gate C blackout is anchored to America/New_York so it tracks the 5pm rollover
+# across DST (≈21:00 UTC in summer, ≈22:00 UTC in winter). A fixed UTC hour
+# would silently drift an hour every DST change.
+_DEFAULT_BLACKOUT_ET = "16:55-17:30"
+try:
+    _NY_TZ: "Optional[ZoneInfo]" = ZoneInfo("America/New_York")
+except Exception:  # pragma: no cover — tzdata missing
+    _NY_TZ = None
+
+
+def _parse_blackout_et(spec: str) -> "Optional[Tuple[dtime, dtime]]":
+    """Parse ``"HH:MM-HH:MM"`` (America/New_York) → (start, end); None if bad."""
+    try:
+        start_s, end_s = spec.split("-")
+        sh, sm = (int(x) for x in start_s.strip().split(":"))
+        eh, em = (int(x) for x in end_s.strip().split(":"))
+        return dtime(sh, sm), dtime(eh, em)
+    except Exception:
+        logger.warning("Invalid RISK_BLACKOUT_ET=%r; Gate C disabled", spec)
+        return None
+
 
 # Metals quoted like forex pairs (XAU_USD etc.) where a 0.0001 "pip" is
 # meaningless — the floor for these uses a percent of price instead.
@@ -101,9 +132,15 @@ class RiskProfile:
     regime_min_samples: int = 60          # cold-start: below this, Gate B bypassed
     spread_atr_alpha: float = 0.15        # proxy spread = alpha * baseline ATR
 
+    # ── Gate C (time-of-day blackout) ── America/New_York window. None = no
+    # window parsed → gate no-ops. Populated by for_asset_class() from env.
+    blackout_start: Optional[dtime] = None
+    blackout_end: Optional[dtime] = None
+
     @classmethod
     def for_asset_class(cls, asset_class: str) -> "RiskProfile":
         if asset_class == "forex":
+            bo = _parse_blackout_et(os.getenv(ENV_BLACKOUT_ET, _DEFAULT_BLACKOUT_ET))
             return cls(
                 sl_atr_multiplier=1.0,
                 tp_atr_multiplier=2.0,
@@ -119,6 +156,8 @@ class RiskProfile:
                 regime_window=int(os.getenv(ENV_REGIME_WINDOW, "260")),
                 regime_min_samples=int(os.getenv(ENV_REGIME_MIN_SAMPLES, "60")),
                 spread_atr_alpha=float(os.getenv(ENV_SPREAD_ATR_ALPHA, "0.15")),
+                blackout_start=bo[0] if bo else None,
+                blackout_end=bo[1] if bo else None,
             )
         return cls(
             min_sl_pct=float(os.getenv(ENV_EQUITIES_MIN_SL_PCT, "0.0015")),
@@ -131,6 +170,10 @@ class RiskProfile:
     @property
     def regime_gate_enabled(self) -> bool:
         return _flag_enabled(ENV_REGIME_GATE_ENABLED)
+
+    @property
+    def time_gate_enabled(self) -> bool:
+        return _flag_enabled(ENV_TIME_GATE_ENABLED)
 
 class RiskManager:
     """
@@ -150,6 +193,7 @@ class RiskManager:
         spread: Optional[float] = None,
         spread_fresh: bool = False,
         regime_series: Optional[Sequence[float]] = None,
+        timestamp: Optional[datetime] = None,
     ) -> Optional[Tuple[float, float]]:
         """
         Apply multipliers and the chop filter to raw ATR volatility.
@@ -184,7 +228,8 @@ class RiskManager:
         # Dynamic hybrid floor (live forex passes a regime series).
         if regime_series is not None and len(regime_series) > 0:
             gate = self._evaluate_dynamic_gates(
-                entry_price, sl_dist, symbol, spread, spread_fresh, regime_series
+                entry_price, sl_dist, symbol, spread, spread_fresh,
+                regime_series, timestamp,
             )
             if gate != GATE_NONE:
                 self.last_veto_gate = gate
@@ -220,6 +265,7 @@ class RiskManager:
         spread: Optional[float],
         spread_fresh: bool,
         regime_series: Sequence[float],
+        timestamp: Optional[datetime] = None,
     ) -> str:
         """
         Coupled hybrid floor. Returns the gate that vetoes (GATE_REGIME /
@@ -227,6 +273,17 @@ class RiskManager:
         independently kill-switchable.
         """
         p = self.profile
+
+        # ── Gate C: time-of-day blackout (e.g. NY 5pm rollover blowout) ──
+        # Checked first and independent of vol warmth — the spread is toxic
+        # regardless of regime, so we never want to trade this window.
+        if p.time_gate_enabled and timestamp is not None and self._in_blackout(timestamp):
+            logger.info(
+                "[%s] Gate C (time) veto: signal inside NY blackout %s–%s ET",
+                symbol or "unknown", p.blackout_start, p.blackout_end,
+            )
+            return GATE_TIME
+
         arr = np.asarray(regime_series, dtype=float)
         arr = arr[np.isfinite(arr)]
         n = len(arr)
@@ -272,6 +329,23 @@ class RiskManager:
                 return GATE_SPREAD
 
         return GATE_NONE
+
+    def _in_blackout(self, timestamp: datetime) -> bool:
+        """True if ``timestamp`` is inside the America/New_York blackout window.
+
+        DST-correct: the window is defined in NY local time, so it tracks the
+        5pm rollover whether that is 21:00 UTC (summer) or 22:00 UTC (winter).
+        Naive timestamps are assumed UTC.
+        """
+        p = self.profile
+        if p.blackout_start is None or p.blackout_end is None or _NY_TZ is None:
+            return False
+        ts = timestamp if timestamp.tzinfo else timestamp.replace(tzinfo=timezone.utc)
+        ny = ts.astimezone(_NY_TZ).time()
+        start, end = p.blackout_start, p.blackout_end
+        if start <= end:
+            return start <= ny < end
+        return ny >= start or ny < end  # window wraps midnight
 
     def _is_forex_symbol(self, symbol: str) -> bool:
         clean = symbol.replace("_", "").replace("/", "").upper()

@@ -554,6 +554,13 @@ def _compute_chop_veto_mask(
     dropped only as trade *entries*; the bracket walk in the target functions
     still sees the full contiguous price path (so this must run AFTER target
     generation, not before).
+
+    TODO(symmetry): Gate C (time-of-day blackout, ``RiskManager._in_blackout``)
+    is NOT yet mirrored here. Live drops NY-rollover signals (≈16:55–17:30 ET);
+    training still labels them. Add a vectorized blackout mask on
+    ``df["timestamp"]`` (converted to America/New_York) next retrain so training
+    matches live. Until then the model may train on a few un-executable rollover
+    entries (small population, but breaks strict live↔training symmetry).
     """
     from numpy.lib.stride_tricks import sliding_window_view
 

@@ -30,7 +30,7 @@ import talib
 from core.notification_manager import NotificationManager
 from data.oanda_provider import OandaMarketProvider, _to_oanda_symbol
 from execution.oanda_order_manager import OandaOrderManager, OrderCloseError
-from execution.risk_manager import GATE_REGIME, GATE_SPREAD, RiskManager
+from execution.risk_manager import GATE_REGIME, GATE_SPREAD, GATE_TIME, RiskManager
 from strategies.concrete_strategies.ml_strategy import MLStrategy
 
 logger = logging.getLogger(__name__)
@@ -118,7 +118,8 @@ class OandaScalperOrchestrator:
         self._devil_approved_total: int = 0
         self._spread_gate_rejections: int = 0
         self._regime_gate_rejections: int = 0
-        self._a3_chop_rejections: int = 0  # combined (spread + regime)
+        self._time_gate_rejections: int = 0
+        self._a3_chop_rejections: int = 0  # combined (spread + regime + time)
 
         # ── Dynamic hybrid floor: per-symbol regime + spread state ──
         # Stateful, drift-free NATR: a running Wilder ATR seeded once at boot
@@ -531,6 +532,7 @@ class OandaScalperOrchestrator:
                 spread=spread,
                 spread_fresh=spread_fresh,
                 regime_series=self._regime_natr.get(symbol),
+                timestamp=datetime.now(timezone.utc),
             )
             if bracket:
                 sl_dist, tp_dist = bracket
@@ -545,17 +547,20 @@ class OandaScalperOrchestrator:
             gate = getattr(self._risk_manager, "last_veto_gate", GATE_SPREAD)
             if gate == GATE_REGIME:
                 self._regime_gate_rejections += 1
+            elif gate == GATE_TIME:
+                self._time_gate_rejections += 1
             else:  # GATE_SPREAD or GATE_STATIC (cost-side floors)
                 self._spread_gate_rejections += 1
             self._a3_chop_rejections += 1
             ratio = 100.0 * self._a3_chop_rejections / max(self._devil_approved_total, 1)
             logger.warning(
-                "[%s] Bracket rejected (%s gate) | spread=%d regime=%d "
+                "[%s] Bracket rejected (%s gate) | spread=%d regime=%d time=%d "
                 "(%d / %d Devil-approved vetoed, %.1f%%)",
                 symbol,
                 gate,
                 self._spread_gate_rejections,
                 self._regime_gate_rejections,
+                self._time_gate_rejections,
                 self._a3_chop_rejections,
                 self._devil_approved_total,
                 ratio,
