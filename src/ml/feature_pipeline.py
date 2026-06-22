@@ -21,9 +21,6 @@ from ml.core.interfaces import BaseFeatureGenerator, BaseTargetGenerator
 from ml.features.v3_features import V3BaseFeatures, V3HTFFeatures
 from ml.targets.v3_targets import V3DirectionalTarget
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s  %(levelname)-8s  %(message)s"
-)
 logger = logging.getLogger(__name__)
 
 _SRC_DIR = Path(__file__).resolve().parent.parent
@@ -74,6 +71,11 @@ class FeaturePipeline:
 
 
 def main() -> None:
+    # Configure logging only when run as a script — at module scope this
+    # hijacked root logging for every importer (including the live bot).
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s  %(levelname)-8s  %(message)s"
+    )
     _PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
     raw_files = sorted(_RAW_DIR.glob("*_1min.parquet"))
     if not raw_files:

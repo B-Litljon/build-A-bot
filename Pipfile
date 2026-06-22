@@ -26,6 +26,7 @@ oandapyv20 = "*"
 hmmlearn = "*"
 
 [dev-packages]
+pytest = "*"
 
 [requires]
 python_version = "3.12"

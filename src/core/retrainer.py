@@ -45,7 +45,11 @@ from sklearn.model_selection import cross_val_predict, TimeSeriesSplit
 
 from src.data.factory import get_market_provider
 from src.data.market_provider import MarketDataProvider
-from src.execution.risk_manager import RiskProfile
+from src.execution.risk_manager import (
+    RiskProfile,
+    _chop_filter_enabled,
+    coupled_keff,
+)
 from src.ml.feature_pipeline import FeaturePipeline
 from src.ml.features.v3_features import V3BaseFeatures, V3HTFFeatures, V3SessionFeatures
 from src.ml.regimes.hmm_regime import (
@@ -103,6 +107,12 @@ def get_asset_config(data_source: str) -> dict:
         
     return {
         "asset_class": asset_class,
+        # Output directory for the trained model. Defaults to models/<asset_class>
+        # (the production location). Override with RETRAIN_MODEL_DIR to train a
+        # SIDE model (e.g. a metals-only candidate) WITHOUT clobbering the
+        # promoted model — asset_class stays "forex" so every feature/gate/
+        # hyperparameter path is identical; only the save destination changes.
+        "model_dir": (os.getenv("RETRAIN_MODEL_DIR", "").strip() or f"models/{asset_class}"),
         "tickers": [t.strip() for t in os.getenv("RETRAIN_SYMBOLS", ",".join(default_tickers)).split(",") if t.strip()],
         "sl_mult": profile.sl_atr_multiplier,
         "tp_mult": profile.tp_atr_multiplier,
@@ -141,6 +151,12 @@ def get_hyperparameters(asset_class: str) -> Tuple[dict, dict]:
         "subsample_freq": 1,
         "colsample_bytree": 0.8,
         "random_state": 42,
+        # Fully reproducible sweeps across the cached parquet datasets:
+        # random_state already seeds bagging/feature-fraction; deterministic +
+        # force_row_wise remove the multithreaded histogram float-ordering
+        # jitter that can otherwise nudge a borderline threshold-grid pick.
+        "deterministic": True,
+        "force_row_wise": True,
         "n_jobs": -1,
         "verbose": -1,
     }
@@ -157,6 +173,12 @@ def get_hyperparameters(asset_class: str) -> Tuple[dict, dict]:
         "subsample_freq": 1,
         "colsample_bytree": 0.8,
         "random_state": 42,
+        # Fully reproducible sweeps across the cached parquet datasets:
+        # random_state already seeds bagging/feature-fraction; deterministic +
+        # force_row_wise remove the multithreaded histogram float-ordering
+        # jitter that can otherwise nudge a borderline threshold-grid pick.
+        "deterministic": True,
+        "force_row_wise": True,
         "n_jobs": -1,
         "verbose": -1,
     }
@@ -200,7 +222,14 @@ PROFIT_FACTOR_THRESHOLD = 1.2  # Min acceptable Profit Factor
 # from a handful of lucky wins. Empirically the 2026-05-23 Gemini run "passed"
 # with 14–16 OOS trades while the Devil's own separation diagnostic read
 # "NO SIGNAL." 100 is the minimum sample for any honest PF claim.
-MIN_OOS_TRADES_FOR_PF = 100
+MIN_OOS_TRADES_FOR_PF = 100  # legacy Fold-3-only floor (superseded below)
+
+# Pooled, drop-rate-scaled OOS-trade floor (replaces the Fold-3-only cliff).
+# Pool Devil-approved OOS trades across ALL folds, then scale the requirement
+# down by the chop filter's row-drop rate so a high-precision filter that
+# correctly prunes ~30% of bars isn't penalized for the trades it removed:
+#     effective_floor = BASELINE_POOLED_OOS_TRADES * (1 - chop_veto_rate)
+BASELINE_POOLED_OOS_TRADES = int(os.getenv("RETRAIN_POOLED_TRADE_FLOOR", "300"))
 
 # Toggle for the HMM regime-feature experiment. When enabled, a per-symbol
 # 3-state GaussianHMM is fit on each fold's training window (no leakage) and
@@ -280,6 +309,9 @@ class ValidationReport:
     final_win_rate: float
     final_total_trades: int
     gate_passed: bool
+    pooled_oos_trades: int = 0
+    chop_veto_rate: float = 0.0
+    effective_trade_floor: float = 0.0
     rejection_reasons: List[str] = field(default_factory=list)
 
 
@@ -504,6 +536,104 @@ def _compute_devil_survival_target(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# HYBRID CHOP VETO (symmetric with live RiskManager.calculate_bracket)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _compute_chop_veto_mask(
+    df: pl.DataFrame, profile: RiskProfile, sl_mult: float
+) -> np.ndarray:
+    """
+    Vectorized hybrid chop veto, mirroring ``RiskManager._evaluate_dynamic_gates``
+    so the model trains only on the live-tradeable population.
+
+    For each row, using the trailing ``regime_window`` of ``natr_14`` per symbol:
+      * pctile_rank = fraction of the window <= the current bar's NATR
+      * Gate B (regime): veto if ``pctile_rank < regime_pctile/100``
+      * Gate A (cost): veto if ``sl_mult·natr < k_eff · alpha · baseline_natr``
+        (the live inequality ``sl_dist < k_eff·spread_proxy`` with the
+        volatility-scaled proxy; ``close`` cancels on both sides). The spread
+        proxy scales with each era's *baseline* (median-window) volatility —
+        not a static historical constant — so it is era-robust.
+
+    Returns a boolean array (True = veto/drop) aligned to ``df`` rows. Rows are
+    dropped only as trade *entries*; the bracket walk in the target functions
+    still sees the full contiguous price path (so this must run AFTER target
+    generation, not before).
+
+    TODO(symmetry): Gate C (time-of-day blackout, ``RiskManager._in_blackout``)
+    is NOT yet mirrored here. Live drops NY-rollover signals (≈16:55–17:30 ET);
+    training still labels them. Add a vectorized blackout mask on
+    ``df["timestamp"]`` (converted to America/New_York) next retrain so training
+    matches live. Until then the model may train on a few un-executable rollover
+    entries (small population, but breaks strict live↔training symmetry).
+    """
+    from numpy.lib.stride_tricks import sliding_window_view
+
+    n_total = df.height
+    veto = np.zeros(n_total, dtype=bool)
+    if not _chop_filter_enabled() or n_total == 0:
+        return veto
+
+    w = int(profile.regime_window)
+    mins = int(profile.regime_min_samples)
+    p_thresh = profile.regime_pctile / 100.0
+    alpha = profile.spread_atr_alpha
+
+    symbols = df["symbol"].to_numpy() if "symbol" in df.columns else np.zeros(n_total)
+    natr_all = df["natr_14"].to_numpy().astype(float)
+
+    for sym in np.unique(symbols):
+        idx = np.where(symbols == sym)[0]  # contiguous, time-ordered per symbol
+        natr = natr_all[idx]
+        m = len(natr)
+        # rank_actual feeds Gate B (regime); rank_eff feeds the coupling and is
+        # held neutral (0.5) until the window is warm — exactly as the live gate
+        # holds pctile_rank=0.5 below regime_min_samples.
+        rank_actual = np.full(m, 0.5)
+        rank_eff = np.full(m, 0.5)
+        baseline = np.full(m, np.nan)  # expanding/rolling median of the window
+
+        # Full-window region (vectorized): rows i >= w-1 (always warm: w >= mins).
+        if m >= w:
+            sw = sliding_window_view(natr, w)  # (m-w+1, w) → rows w-1 .. m-1
+            last = sw[:, -1]
+            fr = (sw <= last[:, None]).mean(axis=1)
+            rank_actual[w - 1:] = fr
+            rank_eff[w - 1:] = fr
+            baseline[w - 1:] = np.median(sw, axis=1)
+
+        # Expanding region (all earlier rows): baseline is always computable, so
+        # Gate A (cost) runs from the first bar; Gate B only once warm.
+        for i in range(0, min(w - 1, m)):
+            win = natr[: i + 1]
+            rank_actual[i] = float(np.mean(win <= natr[i]))
+            baseline[i] = float(np.median(win))
+            if (i + 1) >= mins:  # warm → real rank couples; else stay neutral 0.5
+                rank_eff[i] = rank_actual[i]
+
+        warm = (np.arange(m) + 1) >= mins
+
+        gate_b = np.zeros(m, dtype=bool)
+        if profile.regime_gate_enabled:
+            gate_b = warm & (rank_actual < p_thresh)
+
+        gate_a = np.zeros(m, dtype=bool)
+        if profile.spread_gate_enabled:
+            k_eff = coupled_keff(
+                profile.spread_k_base, profile.spread_k_coupling,
+                profile.spread_k_coupling_mode, rank_eff,
+            )
+            with np.errstate(invalid="ignore"):
+                gate_a = (sl_mult * natr) < (k_eff * alpha * baseline)
+            gate_a &= np.isfinite(baseline)
+
+        veto[idx] = gate_a | gate_b
+
+    return veto
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # FEATURE ENGINEERING & LABEL GENERATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -515,7 +645,8 @@ def engineer_features_and_labels(
     max_hold: int = MAX_HOLD_BARS,
     survival_bars: int = SURVIVAL_BARS,
     htf_timeframe: str = "5m",
-) -> Tuple[pl.DataFrame, List[str]]:
+    risk_profile: Optional[RiskProfile] = None,
+) -> Tuple[pl.DataFrame, List[str], float]:
     """
     Engineer technical features and generate ATR-dynamic target labels.
 
@@ -540,7 +671,9 @@ def engineer_features_and_labels(
         htf_timeframe: Higher timeframe representation for HTFFeatures
 
     Returns:
-        Tuple of (features DataFrame with targets, feature column names)
+        Tuple of (features DataFrame with targets, feature column names,
+        chop_veto_rate) — the row-drop fraction feeds the pooled dynamic
+        trade-count floor in validate_candidate().
     """
     logger.info("=" * 70)
     logger.info("ENGINEERING FEATURES & LABELS")
@@ -622,6 +755,27 @@ def engineer_features_and_labels(
     )
 
     # ═══════════════════════════════════════════════════════════════════
+    # HYBRID CHOP VETO — drop untradeable entry rows (symmetric with live)
+    # Runs AFTER target generation so the bracket walk saw the full price
+    # path; we only remove bars we would never ENTER on. Realigns the
+    # training population (and thus Profit Factor) with the live filter.
+    # ═══════════════════════════════════════════════════════════════════
+    chop_veto_rate = 0.0
+    if risk_profile is not None:
+        pre_veto = df.height
+        veto_mask = _compute_chop_veto_mask(df, risk_profile, sl_mult)
+        n_veto = int(veto_mask.sum())
+        chop_veto_rate = n_veto / pre_veto if pre_veto else 0.0
+        if n_veto > 0:
+            df = df.filter(~pl.Series(veto_mask))
+        logger.info(
+            f"Hybrid chop veto dropped {n_veto:,} untradeable rows "
+            f"({chop_veto_rate:.1%}; mode={risk_profile.spread_k_coupling_mode}, "
+            f"k_base={risk_profile.spread_k_base}, coupling={risk_profile.spread_k_coupling}, "
+            f"P{risk_profile.regime_pctile:.0f}, alpha={risk_profile.spread_atr_alpha})"
+        )
+
+    # ═══════════════════════════════════════════════════════════════════
     # CLEANUP: Drop NaN/null rows (uses FeaturePipeline.clean_data)
     # ═══════════════════════════════════════════════════════════════════
     initial_count = len(df)
@@ -640,7 +794,7 @@ def engineer_features_and_labels(
     if USE_HMM_FEATURES:
         logger.info(f"HMM regime features ENABLED — will be appended per-fold: {HMM_OUTPUT_COLS}")
 
-    return df, BASE_FEATURE_COLS
+    return df, BASE_FEATURE_COLS, chop_veto_rate
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -974,6 +1128,7 @@ def validate_candidate(
     n_folds: int = 3,
     angel_params: Optional[dict] = None,
     devil_params: Optional[dict] = None,
+    chop_veto_rate: float = 0.0,
 ) -> Tuple[
     ValidationReport,
     "lgb.LGBMClassifier",
@@ -1034,6 +1189,11 @@ def validate_candidate(
     logger.info("=" * 70)
     logger.info("WALK-FORWARD VALIDATION (3 EXPANDING FOLDS)")
     logger.info("=" * 70)
+
+    # Pin the process RNG for fully deterministic sweeps across the cached
+    # datasets. (LightGBM is already seeded via random_state=42 + deterministic;
+    # this guards any incidental numpy randomness in the validation path.)
+    np.random.seed(42)
 
     # If the HMM regime experiment is on, the active feature space is the
     # base features plus the 3 HMM_OUTPUT_COLS. Each fold fits its own HMM
@@ -1435,6 +1595,12 @@ def validate_candidate(
     mean_brier = float(np.mean([fm.brier_score for fm in fold_metrics]))
     mean_ev = float(np.mean([fm.expected_value for fm in fold_metrics]))
 
+    # Pooled, drop-rate-scaled OOS-trade floor. Pool Devil-approved trades
+    # across ALL folds and lower the requirement by the chop filter's row-drop
+    # rate, so a high-precision filter isn't penalized for the bars it pruned.
+    pooled_oos_trades = int(sum(fm.devil_approved_trades for fm in fold_metrics))
+    effective_trade_floor = BASELINE_POOLED_OOS_TRADES * (1.0 - chop_veto_rate)
+
     rejection_reasons: List[str] = []
     if mean_brier > BRIER_THRESHOLD:
         rejection_reasons.append(
@@ -1446,11 +1612,12 @@ def validate_candidate(
         rejection_reasons.append(
             f"Profit Factor {profit_factor:.4f} < {PROFIT_FACTOR_THRESHOLD} threshold"
         )
-    if final_total_trades < MIN_OOS_TRADES_FOR_PF:
+    if pooled_oos_trades < effective_trade_floor:
         rejection_reasons.append(
-            f"Fold {n_folds} OOS trades {final_total_trades} < "
-            f"{MIN_OOS_TRADES_FOR_PF} minimum — sample too small to trust "
-            f"PF={profit_factor:.4f}"
+            f"Pooled OOS trades {pooled_oos_trades} < effective floor "
+            f"{effective_trade_floor:.0f} "
+            f"(= {BASELINE_POOLED_OOS_TRADES} × (1 − chop_veto_rate {chop_veto_rate:.1%})) "
+            f"— sample too small to trust PF={profit_factor:.4f}"
         )
 
     gate_passed = len(rejection_reasons) == 0
@@ -1465,8 +1632,10 @@ def validate_candidate(
         f"(threshold ≥ {PROFIT_FACTOR_THRESHOLD}, Fold {n_folds} OOS)"
     )
     logger.info(
-        f"OOS Trades       : {final_total_trades} "
-        f"(threshold ≥ {MIN_OOS_TRADES_FOR_PF}, Fold {n_folds} sample-size floor)"
+        f"Pooled OOS Trades: {pooled_oos_trades} across {n_folds} folds "
+        f"(dynamic floor ≥ {effective_trade_floor:.0f} = "
+        f"{BASELINE_POOLED_OOS_TRADES}×(1−{chop_veto_rate:.1%}) | "
+        f"Fold {n_folds} PF trades={final_total_trades})"
     )
     logger.info(f"Gate Result      : {'PASSED ✅' if gate_passed else 'FAILED 🚫'}")
 
@@ -1504,6 +1673,9 @@ def validate_candidate(
         final_win_rate=final_win_rate,
         final_total_trades=final_total_trades,
         gate_passed=gate_passed,
+        pooled_oos_trades=pooled_oos_trades,
+        chop_veto_rate=chop_veto_rate,
+        effective_trade_floor=effective_trade_floor,
         rejection_reasons=rejection_reasons,
     )
 
@@ -1566,7 +1738,8 @@ def promote_or_reject(
         save_threshold(threshold, asset_config)
         if hmm_models is not None:
             asset_class = asset_config.get("asset_class", "equities")
-            hmm_path = Path("models") / asset_class / "hmm_latest.pkl"
+            model_dir = Path(asset_config.get("model_dir") or f"models/{asset_class}")
+            hmm_path = model_dir / "hmm_latest.pkl"
             save_hmm_models(hmm_models, hmm_path)
 
         notifier.send_retraining_report(report, promoted=True)
@@ -1608,7 +1781,7 @@ def save_models(
     logger.info("=" * 70)
 
     asset_class = asset_config.get("asset_class", "equities")
-    model_dir = Path("models") / asset_class
+    model_dir = Path(asset_config.get("model_dir") or f"models/{asset_class}")
     model_dir.mkdir(parents=True, exist_ok=True)
 
     angel_path = model_dir / "angel_latest.pkl"
@@ -1681,7 +1854,7 @@ def save_threshold(threshold: float, asset_config: dict) -> None:
         asset_config: Asset configuration dictionary.
     """
     asset_class = asset_config.get("asset_class", "equities")
-    model_dir = Path("models") / asset_class
+    model_dir = Path(asset_config.get("model_dir") or f"models/{asset_class}")
     model_dir.mkdir(parents=True, exist_ok=True)
     threshold_path = model_dir / "threshold.json"
 
@@ -1757,13 +1930,16 @@ def main() -> int:
         )
 
         # ─── Phase 3: Engineer features with ATR-dynamic labels ────────────
-        features_df, feature_cols = engineer_features_and_labels(
+        features_df, feature_cols, chop_veto_rate = engineer_features_and_labels(
             raw_data,
             sl_mult=asset_config["sl_mult"],
             tp_mult=asset_config["tp_mult"],
             max_hold=asset_config["max_hold"],
             survival_bars=asset_config["survival_bars"],
             htf_timeframe=asset_config.get("htf_timeframe", "5m"),
+            # Same RiskProfile path that sources sl_mult/tp_mult → the chop
+            # veto simulated here is identical to the live execution gate.
+            risk_profile=RiskProfile.for_asset_class(asset_config["asset_class"]),
         )
 
         # ─── Phase 4: Walk-forward validation (3-fold expanding window) ────
@@ -1792,6 +1968,7 @@ def main() -> int:
             n_folds=3,
             angel_params=angel_params,
             devil_params=devil_params,
+            chop_veto_rate=chop_veto_rate,
         )
         logger.info(f"Optimal Devil threshold (from Fold 3): {optimal_threshold:.4f}")
 
@@ -1809,9 +1986,10 @@ def main() -> int:
 
         if promoted:
             asset_class = asset_config.get("asset_class", "equities")
+            saved_dir = asset_config.get("model_dir") or f"models/{asset_class}"
             logger.info("=" * 70)
             logger.info(f"✅ MODELS PROMOTED ({asset_class}) — Ready for next market open")
-            logger.info(f"  Models saved in: models/{asset_class}/")
+            logger.info(f"  Models saved in: {saved_dir}/")
             logger.info("=" * 70)
             return 0
         else:

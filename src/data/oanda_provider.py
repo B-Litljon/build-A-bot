@@ -15,6 +15,7 @@ import asyncio
 import logging
 import os
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional
 
@@ -23,6 +24,7 @@ import oandapyV20.endpoints.accounts as v20_accounts
 import oandapyV20.endpoints.instruments as v20_instruments
 import oandapyV20.endpoints.pricing as v20_pricing
 import polars as pl
+from oandapyV20.exceptions import StreamTerminated
 
 from data.market_provider import MarketDataProvider
 
@@ -104,9 +106,21 @@ class OandaMarketProvider(MarketDataProvider):
 
         self._environment = environment
         self._stream_gran = stream_granularity_minutes
+
+        # Read-inactivity timeout (C3 hardening). OANDA sends HEARTBEAT
+        # messages every ~5s, so any healthy stream delivers bytes far more
+        # often than this. A silently stalled TCP connection (half-open
+        # socket, no FIN) would otherwise block the stream iterator forever
+        # with SL/TP enforcement being software-only — requests' read
+        # timeout converts the stall into an exception the reconnect
+        # wrapper already handles.
+        self._stream_timeout = float(
+            os.getenv("OANDA_STREAM_TIMEOUT_SECONDS", "20")
+        )
         self._client = oandapyV20.API(
             access_token=self._api_key,
             environment=environment,
+            request_params={"timeout": self._stream_timeout},
         )
 
         # Streaming state — populated by subscribe()
@@ -115,6 +129,10 @@ class OandaMarketProvider(MarketDataProvider):
         self._symbols: List[str] = []
         self._stop_event = threading.Event()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+        # Liveness state (C3 hardening)
+        self._last_stream_msg: Optional[float] = None  # time.monotonic()
+        self._active_stream_req: Optional[v20_pricing.PricingStream] = None
 
         # Per-symbol tick accumulator: symbol → bar state dict
         self._tick_bars: Dict[str, dict] = {}
@@ -182,7 +200,10 @@ class OandaMarketProvider(MarketDataProvider):
                     "high": mid,
                     "low": mid,
                     "close": mid,
-                    "volume": 0,
+                    # The opening tick counts: training data (OANDA candle
+                    # volume) is total tick count, so starting at 0 deflated
+                    # live vol_rel vs. the training distribution.
+                    "volume": 1,
                 }
             else:
                 state["high"] = max(state["high"], mid)
@@ -345,15 +366,60 @@ class OandaMarketProvider(MarketDataProvider):
         self._stop_event.clear()
         params = {"instruments": ",".join(self._symbols)}
         req = v20_pricing.PricingStream(accountID=self._account_id, params=params)
+        self._active_stream_req = req
 
         try:
             for msg in self._client.request(req):
+                # Any message — PRICE or HEARTBEAT — proves the stream is
+                # alive; track it for the orchestrator's liveness watchdog.
+                self._last_stream_msg = time.monotonic()
                 if self._stop_event.is_set():
                     break
                 if msg.get("type") == "PRICE":
                     self._handle_tick(msg)
         except KeyboardInterrupt:
             logger.info("OandaMarketProvider stream stopped by user.")
+        except StreamTerminated as e:
+            logger.warning("OandaMarketProvider stream terminated: %s", e)
+        finally:
+            # Stream is down — stale-age is meaningless until it restarts.
+            self._last_stream_msg = None
+            self._active_stream_req = None
+
+    @property
+    def seconds_since_last_message(self) -> Optional[float]:
+        """
+        Age of the most recent stream message (heartbeats included), or
+        None when the stream is not running / not yet delivering.
+        """
+        last = self._last_stream_msg
+        if last is None:
+            return None
+        return time.monotonic() - last
+
+    def force_disconnect(self, reason: str = "forced disconnect") -> None:
+        """
+        Best-effort termination of the active pricing stream.
+
+        Used by the liveness watchdog when the stream has gone quiet but
+        the read timeout has not fired. May be a no-op if the stream
+        thread is blocked mid-read (the read timeout covers that case).
+        """
+        req = self._active_stream_req
+        if req is None:
+            return
+        try:
+            req.terminate(reason)
+        except Exception as e:
+            logger.warning(
+                "OandaMarketProvider.force_disconnect: terminate failed "
+                "(read timeout will recover the stream): %s",
+                e,
+            )
+
+    def reset_stop(self) -> None:
+        """Clear the stop flag so the stream loop can be restarted."""
+        self._stop_event.clear()
 
     def stop_stream(self) -> None:
         """Signal the stream loop to exit and flush all in-flight bars."""
