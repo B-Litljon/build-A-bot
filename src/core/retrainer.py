@@ -107,6 +107,12 @@ def get_asset_config(data_source: str) -> dict:
         
     return {
         "asset_class": asset_class,
+        # Output directory for the trained model. Defaults to models/<asset_class>
+        # (the production location). Override with RETRAIN_MODEL_DIR to train a
+        # SIDE model (e.g. a metals-only candidate) WITHOUT clobbering the
+        # promoted model — asset_class stays "forex" so every feature/gate/
+        # hyperparameter path is identical; only the save destination changes.
+        "model_dir": (os.getenv("RETRAIN_MODEL_DIR", "").strip() or f"models/{asset_class}"),
         "tickers": [t.strip() for t in os.getenv("RETRAIN_SYMBOLS", ",".join(default_tickers)).split(",") if t.strip()],
         "sl_mult": profile.sl_atr_multiplier,
         "tp_mult": profile.tp_atr_multiplier,
@@ -1732,7 +1738,8 @@ def promote_or_reject(
         save_threshold(threshold, asset_config)
         if hmm_models is not None:
             asset_class = asset_config.get("asset_class", "equities")
-            hmm_path = Path("models") / asset_class / "hmm_latest.pkl"
+            model_dir = Path(asset_config.get("model_dir") or f"models/{asset_class}")
+            hmm_path = model_dir / "hmm_latest.pkl"
             save_hmm_models(hmm_models, hmm_path)
 
         notifier.send_retraining_report(report, promoted=True)
@@ -1774,7 +1781,7 @@ def save_models(
     logger.info("=" * 70)
 
     asset_class = asset_config.get("asset_class", "equities")
-    model_dir = Path("models") / asset_class
+    model_dir = Path(asset_config.get("model_dir") or f"models/{asset_class}")
     model_dir.mkdir(parents=True, exist_ok=True)
 
     angel_path = model_dir / "angel_latest.pkl"
@@ -1847,7 +1854,7 @@ def save_threshold(threshold: float, asset_config: dict) -> None:
         asset_config: Asset configuration dictionary.
     """
     asset_class = asset_config.get("asset_class", "equities")
-    model_dir = Path("models") / asset_class
+    model_dir = Path(asset_config.get("model_dir") or f"models/{asset_class}")
     model_dir.mkdir(parents=True, exist_ok=True)
     threshold_path = model_dir / "threshold.json"
 
@@ -1979,9 +1986,10 @@ def main() -> int:
 
         if promoted:
             asset_class = asset_config.get("asset_class", "equities")
+            saved_dir = asset_config.get("model_dir") or f"models/{asset_class}"
             logger.info("=" * 70)
             logger.info(f"✅ MODELS PROMOTED ({asset_class}) — Ready for next market open")
-            logger.info(f"  Models saved in: models/{asset_class}/")
+            logger.info(f"  Models saved in: {saved_dir}/")
             logger.info("=" * 70)
             return 0
         else:
