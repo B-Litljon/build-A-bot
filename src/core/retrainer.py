@@ -117,7 +117,7 @@ def get_asset_config(data_source: str) -> dict:
         "sl_mult": profile.sl_atr_multiplier,
         "tp_mult": profile.tp_atr_multiplier,
         "max_hold": int(os.getenv("RETRAIN_MAX_HOLD", str(max_hold))),
-        "survival_bars": int(os.getenv("RETRAIN_SURVIVAL", "5")),
+        "survival_bars": int(os.getenv("RETRAIN_SURVIVAL_BARS", "5")),
         "timeframe_minutes": int(os.getenv("RETRAIN_TIMEFRAME_MINUTES", str(timeframe))),
         "htf_timeframe": os.getenv("RETRAIN_HTF_TIMEFRAME", htf_timeframe),
     }
@@ -197,6 +197,7 @@ SL_ATR_MULTIPLIER = 0.5
 TP_ATR_MULTIPLIER = 3.0
 MAX_HOLD_BARS = 45
 SURVIVAL_BARS = 5  # Phase 5.5: Devil survival window (bars)
+ANGEL_LOOKAHEAD = int(os.getenv("RETRAIN_ANGEL_LOOKAHEAD", "3"))  # bars ahead for angel momentum target
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # INFERENCE THRESHOLDS (must match MLStrategy)
@@ -704,13 +705,13 @@ def engineer_features_and_labels(
     # ═══════════════════════════════════════════════════════════════════
     df = df.with_columns(
         (
-            pl.col("close").shift(-3).over("symbol")
+            pl.col("close").shift(-ANGEL_LOOKAHEAD).over("symbol")
             > pl.col("close") + sl_mult * (pl.col("close") * pl.col("natr_14") / 100.0)
         )
         .cast(pl.Int8)
         .alias("angel_target")
     )
-    logger.info(f"Generated angel_target (ATR-relative 3-bar momentum with sl_mult={sl_mult})")
+    logger.info(f"Generated angel_target (ATR-relative {ANGEL_LOOKAHEAD}-bar momentum with sl_mult={sl_mult})")
 
     # ═══════════════════════════════════════════════════════════════════
     # DEVIL TARGETS (Phase 5.5 — Two-Target Architecture)
