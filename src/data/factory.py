@@ -1,13 +1,17 @@
 """
-Factory for MarketDataProvider instances.
+Factory for MarketDataProvider and FundamentalProvider instances.
 
-Reads the ``DATA_SOURCE`` environment variable and returns the
-appropriate provider.  Supported values:
-
+Market provider — reads ``DATA_SOURCE`` env:
     - ``alpaca``  (default) — Alpaca REST + WebSocket
     - ``polygon`` — Polygon.io REST + WebSocket
     - ``yahoo``   — Yahoo Finance (polling, **paper trading only**)
     - ``oanda``   — OANDA v20 REST + Streaming (forex, V5 scalper)
+
+Fundamental provider — reads ``FUNDAMENTAL_SOURCES`` env (comma-separated):
+    - ``simfin``           (default) — SimFin institutional fundamentals
+    - ``yfinance``/``yahoo`` — Yahoo Finance fundamentals
+    - ``none``             — no fundamentals (empty responses)
+    Multiple sources are chained: first non-empty result wins.
 """
 
 import logging
@@ -83,3 +87,63 @@ def get_market_provider() -> MarketDataProvider:
         f"Unknown DATA_SOURCE={source!r}. "
         f"Expected one of: alpaca, polygon, yahoo, oanda."
     )
+
+
+def get_fundamental_provider():
+    """
+    Build a FundamentalProvider from the ``FUNDAMENTAL_SOURCES`` env var.
+
+    ``FUNDAMENTAL_SOURCES`` is a comma-separated ordered list of source names.
+    The providers are chained: the first one to return a non-empty result wins.
+
+    Supported names
+    ---------------
+    simfin            SimFin institutional fundamentals (requires SIMFIN_API_KEY)
+    yfinance / yahoo  Yahoo Finance (no API key; unofficial)
+    none              No fundamentals — returns empty for every call
+
+    Defaults to ``simfin`` when the variable is unset, preserving today's
+    verified pipeline behaviour.
+
+    Raises
+    ------
+    ValueError
+        If any token in the list is not recognised.
+    """
+    from src.data.fundamentals import FundamentalProvider
+    from src.data.providers.composite_fundamentals import CompositeFundamentalProvider
+
+    raw = os.getenv("FUNDAMENTAL_SOURCES", "simfin").strip()
+
+    if not raw or raw.lower() == "none":
+        logger.info("Fundamental sources: none (empty responses)")
+        return CompositeFundamentalProvider([])
+
+    tokens = [t.strip().lower() for t in raw.split(",") if t.strip()]
+
+    _REGISTRY: dict[str, str] = {
+        "simfin": "src.data.providers.simfin_fundamentals.SimFinFundamentalProvider",
+        "yfinance": "src.data.providers.yf_fundamentals.YFinanceFundamentalProvider",
+        "yahoo": "src.data.providers.yf_fundamentals.YFinanceFundamentalProvider",
+    }
+
+    providers: list[FundamentalProvider] = []
+    for token in tokens:
+        if token == "none":
+            continue
+        if token not in _REGISTRY:
+            raise ValueError(
+                f"Unknown FUNDAMENTAL_SOURCES token {token!r}. "
+                f"Expected one of: {', '.join(sorted(_REGISTRY))}."
+            )
+        module_path, _, cls_name = _REGISTRY[token].rpartition(".")
+        import importlib
+        mod = importlib.import_module(module_path)
+        cls = getattr(mod, cls_name)
+        providers.append(cls())
+
+    logger.info(
+        "Fundamental sources: %s",
+        ", ".join(type(p).__name__ for p in providers) if providers else "none",
+    )
+    return CompositeFundamentalProvider(providers)

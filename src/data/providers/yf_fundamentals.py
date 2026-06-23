@@ -110,27 +110,69 @@ class YFinanceFundamentalProvider(FundamentalProvider):
 
     def get_quarterly_financials(self, symbol: str) -> pd.DataFrame:
         """
-        Return quarterly income-statement data for *symbol*.
+        Return quarterly income-statement + balance-sheet data for *symbol*,
+        normalized to the SimFin-style column names the V4 feature pipeline
+        expects.
 
-        Transposes yfinance's column-major layout (line items as rows,
-        dates as columns) so that dates become the index and line items
-        become columns.  Index is sorted descending — most recent first.
+        Pulls income statement (``quarterly_financials``) and balance sheet
+        (``quarterly_balance_sheet``) and merges them on the period-end index.
+        If the balance sheet fetch fails, the income statement is returned
+        alone (the never-raise contract is preserved).
+
+        Column mapping (yfinance native → contract name):
+
+        ====================================  =======================
+        yfinance name                         contract name
+        ====================================  =======================
+        Total Revenue                         Total Revenue  (unchanged)
+        Gross Profit                          Gross Profit   (unchanged)
+        Net Income                            Net Income     (unchanged)
+        Diluted Average Shares                Shares (Diluted)
+        Total Assets                          Total Assets   (unchanged)
+        Stockholders Equity                   Total Equity
+        Total Liabilities Net Minority Int.   Total Liabilities
+        ====================================  =======================
 
         Returns an empty DataFrame on any failure.
         """
+        # yfinance native → pipeline contract
+        _RENAME: dict[str, str] = {
+            "Diluted Average Shares": "Shares (Diluted)",
+            "Stockholders Equity": "Total Equity",
+            "Total Liabilities Net Minority Interest": "Total Liabilities",
+        }
+
         try:
-            raw = yf.Ticker(symbol).quarterly_financials
-            if raw is None or raw.empty:
+            ticker = yf.Ticker(symbol)
+
+            raw_inc = ticker.quarterly_financials
+            if raw_inc is None or raw_inc.empty:
                 logger.warning("No quarterly financials returned for %s.", symbol)
                 return pd.DataFrame()
 
-            # raw shape: rows = line items, columns = period-end dates
-            # After .T: rows = period-end dates, columns = line items
-            df = raw.T.copy()
-            df.index = pd.DatetimeIndex(df.index)
-            df.index.name = "period_end"
-            df = df.sort_index(ascending=False)
-            return df
+            inc = raw_inc.T.copy()
+            inc.index = pd.DatetimeIndex(inc.index)
+            inc.index.name = "period_end"
+
+            # Pull balance sheet and merge; degrade gracefully on failure
+            try:
+                raw_bs = ticker.quarterly_balance_sheet
+                if raw_bs is not None and not raw_bs.empty:
+                    bs = raw_bs.T.copy()
+                    bs.index = pd.DatetimeIndex(bs.index)
+                    bs.index.name = "period_end"
+                    # Keep only balance-sheet columns not already in income stmt
+                    bs_new_cols = [c for c in bs.columns if c not in inc.columns]
+                    inc = inc.join(bs[bs_new_cols], how="left")
+            except Exception as exc:
+                logger.warning(
+                    "get_quarterly_financials balance sheet failed for %s (income only): %s",
+                    symbol, exc,
+                )
+
+            inc = inc.rename(columns=_RENAME)
+            inc = inc.sort_index(ascending=False)
+            return inc
 
         except Exception as exc:
             logger.warning(
