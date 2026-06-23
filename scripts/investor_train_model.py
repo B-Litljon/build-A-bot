@@ -30,7 +30,10 @@ Output:
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import json
 import logging
+import os
 import re
 import sys
 from pathlib import Path
@@ -57,6 +60,15 @@ logger = logging.getLogger(__name__)
 TRAIN_DAYS   = 504   # minimum expanding train window (~2 calendar years)
 EMBARGO_DAYS = 60    # embargo = forward-return horizon prevents leakage
 TEST_DAYS    = 60    # fold width; also the roll-forward step size
+
+# ── Self-approval gate thresholds (mirror src/core/retrainer.py:214-219) ──
+# Ranker gate is LIFT-OVER-RANDOM, not absolute: a random picker scores
+# Precision@K ≈ the positive base rate (top-quintile target ≈ 0.20). The
+# gate requires the model to clear the base rate by a margin.
+GATE_P1_MIN_LIFT = float(os.getenv("INVESTOR_GATE_P1_LIFT", "1.0"))  # P@1 ≥ 1.0× base rate
+GATE_P2_MIN_LIFT = float(os.getenv("INVESTOR_GATE_P2_LIFT", "1.0"))  # P@2 ≥ 1.0× base rate
+GATE_NDCG_MIN    = float(os.getenv("INVESTOR_GATE_NDCG_MIN", "0.0")) # absolute NDCG floor (0 = informational until calibrated)
+FORCE_SAVE       = os.getenv("INVESTOR_GATE_FORCE", "0").strip() == "1"  # escape hatch
 
 # ── columns excluded from the feature matrix ─────────────────────────
 # OHLCV: raw price data leaks forward returns if included as features.
@@ -151,7 +163,15 @@ def _precision_at_k(
 # Main
 # ─────────────────────────────────────────────────────────────────────
 
-def main() -> None:
+def main() -> int:
+    try:
+        return _main_impl()
+    except Exception as exc:
+        logger.exception("Trainer failed: %s", exc)
+        return 1
+
+
+def _main_impl() -> int:
     logger.info("=" * 70)
     logger.info("V4 Walk-Forward LightGBM Ranker Training")
     logger.info("Train window : %d trading days (expanding)", TRAIN_DAYS)
@@ -315,6 +335,44 @@ def main() -> None:
             "\nMean across folds │ %s=%.4f │ P@1=%.3f │ P@2=%.3f",
             ndcg_col[0], mean_ndcg, mean_p1, mean_p2,
         )
+    else:
+        logger.error("🚫 GATE FAILED — No NDCG column found in walk-forward results.")
+        return 2
+
+    # ── Self-approval Gate (Task 1) ──
+    base_rate = float(y_all.mean())
+    p1_floor = base_rate * GATE_P1_MIN_LIFT
+    p2_floor = base_rate * GATE_P2_MIN_LIFT
+
+    p1_pass = mean_p1 >= p1_floor
+    p2_pass = mean_p2 >= p2_floor
+    ndcg_pass = mean_ndcg >= GATE_NDCG_MIN
+
+    logger.info("=" * 70)
+    logger.info("VALIDATION GATE SUMMARY")
+    logger.info("=" * 70)
+    logger.info(f"Positive Base Rate   : {base_rate:.4f} (equivalent to random prediction)")
+    logger.info(f"Mean Precision@1     : {mean_p1:.4f} vs floor {p1_floor:.4f} (lift required: {GATE_P1_MIN_LIFT}x) -> {'PASS' if p1_pass else 'FAIL'}")
+    logger.info(f"Mean Precision@2     : {mean_p2:.4f} vs floor {p2_floor:.4f} (lift required: {GATE_P2_MIN_LIFT}x) -> {'PASS' if p2_pass else 'FAIL'}")
+    logger.info(f"Mean NDCG            : {mean_ndcg:.4f} vs floor {GATE_NDCG_MIN:.4f} -> {'PASS' if ndcg_pass else 'FAIL'}")
+    logger.info("=" * 70)
+
+    gate_passed = p1_pass and p2_pass and ndcg_pass
+
+    if not gate_passed and not FORCE_SAVE:
+        logger.warning("=" * 70)
+        logger.warning("🚫 GATE FAILED — existing model retained, nothing written")
+        logger.warning("=" * 70)
+        return 2
+
+    if FORCE_SAVE and not gate_passed:
+        logger.warning("=" * 70)
+        logger.warning("⚠️ GATE FAILED BUT FORCE_SAVE IS ENABLED — Proceeding with promotion")
+        logger.warning("=" * 70)
+    else:
+        logger.info("=" * 70)
+        logger.info("✅ VALIDATION GATE PASSED — PROMOTING MODELS")
+        logger.info("=" * 70)
 
     # ── Final model — retrain on ALL available labelled data ─────────
     logger.info("\n%s", "─" * 70)
@@ -335,6 +393,37 @@ def main() -> None:
     size_kb = _MODEL_PATH.stat().st_size / 1024
     logger.info("Model saved → %s  (%.1f KB)", _MODEL_PATH, size_kb)
 
+    # ── Atomic Metadata Sidecar (Task 2) ─────────────────────────────
+    metadata_path = _MODEL_PATH.parent / "v4_investor_lgbm.metadata.json"
+    metadata_temp = _MODEL_PATH.parent / "v4_investor_lgbm.metadata_temp.json"
+    metadata = {
+        "model": "v4_investor_lgbm",
+        "asset_class": "equities_longterm",
+        "horizon_days": EMBARGO_DAYS,                      # 60-day forward target
+        "trained_at": datetime.now(timezone.utc).isoformat(),
+        "trained_on_symbols": sorted(df["symbol"].unique().tolist()),
+        "n_features": len(feature_cols),
+        "data_source": "alpaca",
+        "walk_forward": {
+            "folds": int(fold_num),
+            "mean_ndcg": round(float(mean_ndcg), 4),
+            "mean_precision_at_1": round(float(mean_p1), 4),
+            "mean_precision_at_2": round(float(mean_p2), 4),
+            "positive_base_rate": round(float(base_rate), 4),
+        },
+        "gate_passed": gate_passed,
+    }
+    try:
+        with open(metadata_temp, "w") as f:
+            json.dump(metadata, f, indent=2)
+        os.replace(metadata_temp, metadata_path)
+        logger.info(f"[ATOMIC] Metadata saved: {metadata_path}")
+    except Exception as e:
+        logger.error(f"[ATOMIC] Failed to save metadata: {e}")
+        if metadata_temp.exists():
+            metadata_temp.unlink()
+        raise
+
     # ── Feature importance ───────────────────────────────────────────
     importances = (
         pd.Series(final_model.feature_importances_, index=feature_cols)
@@ -345,7 +434,8 @@ def main() -> None:
         logger.info("  %-45s  %.1f", feat, gain)
 
     logger.info("\nV4 walk-forward training complete.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -527,6 +527,24 @@ def main(argv: list[str] | None = None) -> int:
             raise FileNotFoundError(f"Model artifact missing: {_MODEL_PATH}")
         booster = lgb.Booster(model_file=str(_MODEL_PATH))
 
+        # ── Low-risk lineage check ──
+        metadata_path = _MODEL_PATH.parent / "v4_investor_lgbm.metadata.json"
+        if metadata_path.exists():
+            try:
+                import json
+                with open(metadata_path, "r") as f:
+                    metadata = json.load(f)
+                trained_symbols = metadata.get("trained_on_symbols", [])
+                expected_symbols = sorted(UNIVERSE)
+                if trained_symbols != expected_symbols:
+                    logger.warning(
+                        "⚠️ LINEAGE WARNING: Model was trained on a different symbol universe than it is being run on. "
+                        "Trained on: %s | Expected: %s",
+                        trained_symbols, expected_symbols
+                    )
+            except Exception as e:
+                logger.warning("Failed to parse metadata sidecar for lineage check: %s", e)
+
         snapshot = latest_per_symbol(_INFERENCE_PATH, UNIVERSE)
         top_k, _ranked = predict_and_rank(booster, snapshot, TOP_K)
 
