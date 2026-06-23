@@ -55,9 +55,11 @@ from dotenv import load_dotenv
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _SRC_DIR = _PROJECT_ROOT / "src"
 sys.path.insert(0, str(_SRC_DIR))
+sys.path.insert(0, str(_PROJECT_ROOT / "scripts"))
 
 load_dotenv(_PROJECT_ROOT / ".env")
 
+from investor_universe import UNIVERSE
 from alpaca.common.exceptions import APIError  # noqa: E402
 from alpaca.data.historical.stock import StockHistoricalDataClient  # noqa: E402
 from alpaca.data.requests import StockLatestQuoteRequest  # noqa: E402
@@ -73,7 +75,6 @@ logging.basicConfig(
 logger = logging.getLogger("portfolio_orchestrator")
 
 # ── strategy configuration ────────────────────────────────────────────
-UNIVERSE: list[str] = ["AAPL", "MSFT", "NVDA", "JPM", "XOM", "WMT", "JNJ"]
 TOP_K: int = 2
 TARGET_WEIGHT: float = 0.50  # per top-K holding, applied to usable_equity
 

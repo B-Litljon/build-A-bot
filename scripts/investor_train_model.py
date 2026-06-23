@@ -65,8 +65,8 @@ TEST_DAYS    = 60    # fold width; also the roll-forward step size
 # Ranker gate is LIFT-OVER-RANDOM, not absolute: a random picker scores
 # Precision@K ≈ the positive base rate (top-quintile target ≈ 0.20). The
 # gate requires the model to clear the base rate by a margin.
-GATE_P1_MIN_LIFT = float(os.getenv("INVESTOR_GATE_P1_LIFT", "1.0"))  # P@1 ≥ 1.0× base rate
-GATE_P2_MIN_LIFT = float(os.getenv("INVESTOR_GATE_P2_LIFT", "1.0"))  # P@2 ≥ 1.0× base rate
+GATE_P1_MIN_LIFT = float(os.getenv("INVESTOR_GATE_P1_LIFT", "1.3"))  # P@1 ≥ 1.3× base rate
+GATE_P2_MIN_LIFT = float(os.getenv("INVESTOR_GATE_P2_LIFT", "1.2"))  # P@2 ≥ 1.2× base rate
 GATE_NDCG_MIN    = float(os.getenv("INVESTOR_GATE_NDCG_MIN", "0.0")) # absolute NDCG floor (0 = informational until calibrated)
 FORCE_SAVE       = os.getenv("INVESTOR_GATE_FORCE", "0").strip() == "1"  # escape hatch
 
@@ -82,6 +82,13 @@ _EXCLUDE_COLS = frozenset({
     "target_top_quintile",
     "open", "high", "low", "close", "volume",
 })
+
+FACTOR_COLS = [
+    "mom_3m", "mom_6m", "mom_12m", "mom_12_1", "reversal_1m",
+    "vol_60d", "vol_120d",
+    "roa", "debt_to_equity", "gross_profitability",
+    "gross_margin", "operating_margin", "net_margin", "ebitda_margin",
+]
 
 # ── LGBMRanker hyperparameters ────────────────────────────────────────
 LGBM_PARAMS: dict = dict(
@@ -202,7 +209,7 @@ def _main_impl() -> int:
     )
 
     # ── Build feature matrix ─────────────────────────────────────────
-    raw_feat_cols = [c for c in df.columns if c not in _EXCLUDE_COLS]
+    raw_feat_cols = [c for c in df.columns if c in FACTOR_COLS]
 
     # Sanitize column names: LightGBM text format chokes on spaces /
     # special characters when saving/loading the model.
@@ -411,7 +418,7 @@ def _main_impl() -> int:
             "mean_precision_at_2": round(float(mean_p2), 4),
             "positive_base_rate": round(float(base_rate), 4),
         },
-        "gate_passed": gate_passed,
+        "gate_passed": bool(gate_passed),
     }
     try:
         with open(metadata_temp, "w") as f:
