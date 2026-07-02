@@ -5,6 +5,8 @@
 #
 #   bash run_soak.sh                      # full trained basket, M1, practice
 #   bash run_soak.sh XAU_USD,XAG_USD      # restricted basket (e.g. metals-only)
+#   bash run_soak.sh "" 15                # full basket on M15 bars
+#   SOAK_GRANULARITY=15 bash run_soak.sh  # same, via env
 #
 # Stop with: kill "$(cat /tmp/soak.pid)"  (flattens positions on SIGTERM).
 set -euo pipefail
@@ -17,9 +19,12 @@ set -a; source .env; set +a
 export PYTHONPATH=src:.
 VENV=/home/tha_magick_man/.local/share/virtualenvs/build-A-bot-A3hTUWzK/bin/python
 SYMBOLS="${1:-}"
+GRANULARITY="${2:-${SOAK_GRANULARITY:-1}}"
+ARGS=(--daemon --env practice --granularity "$GRANULARITY")
 if [ -n "$SYMBOLS" ]; then
-  echo "Launching V5 soak (symbols=$SYMBOLS) -> $LOG"
-  exec "$VENV" -u run_oanda.py --daemon --env practice --symbols "$SYMBOLS" > "$LOG" 2>&1
+  ARGS+=(--symbols "$SYMBOLS")
+  echo "Launching V5 soak (symbols=$SYMBOLS granularity=${GRANULARITY}m) -> $LOG"
+else
+  echo "Launching V5 soak (full trained basket, granularity=${GRANULARITY}m) -> $LOG"
 fi
-echo "Launching V5 soak (full trained basket) -> $LOG"
-exec "$VENV" -u run_oanda.py --daemon --env practice > "$LOG" 2>&1
+exec "$VENV" -u run_oanda.py "${ARGS[@]}" > "$LOG" 2>&1

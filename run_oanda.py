@@ -49,7 +49,23 @@ logger = logging.getLogger(__name__)
 # models/forex/metadata.json (see _trained_basket).
 FALLBACK_SYMBOLS = ["EUR/USD"]
 
-_METADATA_PATH = Path(__file__).resolve().parent / "models" / "forex" / "metadata.json"
+# Model artifact directory. OANDA_MODEL_DIR redirects the whole artifact set
+# (pkls + metadata.json + threshold.json) to a side model — e.g. models/forex_m15
+# — without touching the promoted models/forex. Mirrors RETRAIN_MODEL_DIR on
+# the training side.
+_MODEL_DIR = Path(__file__).resolve().parent / (
+    os.getenv("OANDA_MODEL_DIR", "").strip() or "models/forex"
+)
+_METADATA_PATH = _MODEL_DIR / "metadata.json"
+
+# Per-granularity strategy profile: base minutes → (HTF resample string, warmup bars).
+# Warmup must cover the HTF SMA-50: 260 M1 bars = 52 5m bars; 300 M5 bars = 50 30m
+# bars; 260 M15 bars = 65 1h bars.
+_GRANULARITY_PROFILES: dict[int, tuple[str, int]] = {
+    1: ("5m", 260),
+    5: ("30m", 300),
+    15: ("1h", 260),
+}
 
 
 def _trained_basket() -> list[str]:
@@ -67,6 +83,16 @@ def _trained_basket() -> list[str]:
     except Exception as e:
         logger.warning("Could not read trained basket from %s: %s", _METADATA_PATH, e)
     return list(FALLBACK_SYMBOLS)
+
+
+def _trained_timeframe() -> int | None:
+    """Bar granularity (minutes) the promoted model was trained on, if known."""
+    try:
+        with open(_METADATA_PATH) as fh:
+            return json.load(fh).get("timeframe_minutes")
+    except Exception as e:
+        logger.warning("Could not read trained timeframe from %s: %s", _METADATA_PATH, e)
+        return None
 
 
 def _parse_args() -> argparse.Namespace:
@@ -112,6 +138,7 @@ def _parse_args() -> argparse.Namespace:
         "--granularity",
         type=int,
         default=1,
+        choices=sorted(_GRANULARITY_PROFILES),
         help="Stream granularity/timeframe in minutes (default: 1)",
     )
     return parser.parse_args()
@@ -145,6 +172,16 @@ async def _main() -> None:
                 sorted(basket),
             )
 
+    # Warn loudly when streaming at a granularity the model wasn't trained on.
+    trained_tf = _trained_timeframe()
+    if trained_tf is not None and args.granularity != trained_tf:
+        logger.warning(
+            "Streaming at %d-minute granularity but the model was trained on "
+            "%d-minute bars — the model is out of distribution on this timeframe",
+            args.granularity,
+            trained_tf,
+        )
+
     # ── initialise components ──
     provider = OandaMarketProvider(
         environment=args.env,
@@ -152,10 +189,11 @@ async def _main() -> None:
     )
     order_manager = OandaOrderManager(environment=args.env)
     
-    htf_tf = "30m" if args.granularity == 5 else "5m"
-    warmup_pd = 300 if args.granularity == 5 else 260
+    htf_tf, warmup_pd = _GRANULARITY_PROFILES[args.granularity]
     strategy = MLStrategy(
         asset_class="forex",
+        angel_path=_MODEL_DIR / "angel_latest.pkl",
+        devil_path=_MODEL_DIR / "devil_latest.pkl",
         timeframe=args.granularity,
         htf_timeframe=htf_tf,
         warmup_period=warmup_pd,

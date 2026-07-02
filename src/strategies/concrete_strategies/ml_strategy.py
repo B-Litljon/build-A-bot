@@ -216,9 +216,11 @@ class MLStrategy(BaseStrategy):
     def _validate_metadata(self) -> None:
         """
         Validate that the loaded model matches the expected asset class using the metadata sidecar.
+
+        The sidecar lives next to the model artifacts (angel_path's directory) so
+        side models (e.g. models/forex_m15/) carry their own metadata.
         """
-        project_root = Path(__file__).resolve().parent.parent.parent.parent
-        metadata_path = project_root / "models" / self.asset_class / "metadata.json"
+        metadata_path = self.angel_path.parent / "metadata.json"
         
         if not metadata_path.exists():
             logger.warning(
@@ -245,7 +247,8 @@ class MLStrategy(BaseStrategy):
 
     def _load_threshold(self) -> float:
         """
-        Load the Devil model's optimal threshold from models/<asset_class>/threshold.json.
+        Load the Devil model's optimal threshold from the model directory's
+        threshold.json (next to the pkl artifacts, so side models carry their own).
 
         Written by retrainer.save_threshold() after a successful validation gate.
         Falls back to self.devil_threshold (the value passed to __init__) if the
@@ -254,9 +257,7 @@ class MLStrategy(BaseStrategy):
         Returns:
             float: The production threshold for Devil approval decisions.
         """
-        # Search relative to project root (4 levels up from this file in src/)
-        project_root = Path(__file__).resolve().parent.parent.parent.parent
-        threshold_path = project_root / "models" / self.asset_class / "threshold.json"
+        threshold_path = self.angel_path.parent / "threshold.json"
         if not threshold_path.exists():
             logger.warning(
                 "_load_threshold: %s not found — "

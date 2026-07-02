@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import sys
+import time
 import warnings
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -356,37 +357,56 @@ def fetch_training_data(
 
     logger.info(f"Date range: {start_date.date()} to {end_date.date()}")
     logger.info(f"Symbols: {', '.join(symbols)}")
-    logger.info(f"Timeframe: 1-minute bars")
+    logger.info(f"Timeframe: {timeframe_minutes}-minute bars")
 
     all_frames: List[pl.DataFrame] = []
+    failed_symbols: List[str] = []
+
+    # OANDA intermittently rejects burst requests with a 401 ("Insufficient
+    # authorization") that succeeds seconds later; the provider returns an
+    # empty frame on any error, so retry-on-empty covers both cases.
+    fetch_retries = int(os.getenv("RETRAIN_FETCH_RETRIES", "3"))
 
     for ticker in symbols:
-        try:
-            # Fetch bars using generic provider
-            df = provider.get_historical_bars(
-                symbol=ticker,
-                timeframe_minutes=timeframe_minutes,
-                start=start_date,
-                end=end_date,
-            )
+        df = None
+        for attempt in range(1, fetch_retries + 1):
+            try:
+                df = provider.get_historical_bars(
+                    symbol=ticker,
+                    timeframe_minutes=timeframe_minutes,
+                    start=start_date,
+                    end=end_date,
+                )
+            except Exception as e:
+                df = None
+                logger.error(f"Error fetching {ticker} (attempt {attempt}/{fetch_retries}): {e}")
+            if df is not None and not df.is_empty():
+                break
+            logger.warning(f"No data returned for {ticker} (attempt {attempt}/{fetch_retries})")
+            if attempt < fetch_retries:
+                time.sleep(5 * attempt)
 
-            if df is None or df.is_empty():
-                logger.warning(f"No data returned for {ticker}")
-                continue
-
-            # Ensure column names are lowercase
-            df.columns = [col.lower() for col in df.columns]
-
-            # Add symbol column if not present
-            if "symbol" not in df.columns:
-                df = df.with_columns(pl.lit(ticker).alias("symbol"))
-
-            all_frames.append(df)
-            logger.info(f"Fetched {len(df):,} bars for {ticker}")
-
-        except Exception as e:
-            logger.error(f"Error fetching {ticker}: {e}")
+        if df is None or df.is_empty():
+            failed_symbols.append(ticker)
             continue
+
+        # Ensure column names are lowercase
+        df.columns = [col.lower() for col in df.columns]
+
+        # Add symbol column if not present
+        if "symbol" not in df.columns:
+            df = df.with_columns(pl.lit(ticker).alias("symbol"))
+
+        all_frames.append(df)
+        logger.info(f"Fetched {len(df):,} bars for {ticker}")
+
+    if failed_symbols:
+        # Training on a silently shrunk basket corrupts the experiment AND the
+        # metadata sidecar (trained_on_symbols would claim the full list).
+        raise ValueError(
+            f"Fetch failed for {failed_symbols} after {fetch_retries} attempts — "
+            "refusing to train on a partial basket"
+        )
 
     if not all_frames:
         raise ValueError("No data fetched for any symbol")
@@ -1827,6 +1847,7 @@ def save_models(
     metadata = {
         "asset_class": asset_class,
         "timeframe_minutes": asset_config.get("timeframe_minutes", 1),
+        "htf_timeframe": asset_config.get("htf_timeframe", "5m"),
         "trained_at": datetime.now(timezone.utc).isoformat(),
         "trained_on_symbols": asset_config.get("tickers", []),
         "data_source": os.getenv("DATA_SOURCE", "alpaca").strip().lower(),
