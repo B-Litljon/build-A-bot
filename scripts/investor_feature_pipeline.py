@@ -168,8 +168,8 @@ def main(argv: list[str] | None = None) -> None:
     df = df.sort_values(["symbol", "date"]).reset_index(drop=True)
     logger.info("Symbols: %s", sorted(df["symbol"].unique().tolist()))
 
-    # ── Stage 1 — Momentum features ─────────────────────────────────
-    logger.info("\n[Stage 1/4] Computing momentum features ...")
+    # ── Stage 1 — Momentum & Volatility features ──────────────────────
+    logger.info("\n[Stage 1/4] Computing momentum & volatility features ...")
     for col_name, window in MOM_WINDOWS.items():
         df[col_name] = df.groupby("symbol")["close"].pct_change(periods=window)
         n_valid = df[col_name].notna().sum()
@@ -178,29 +178,31 @@ def main(argv: list[str] | None = None) -> None:
             col_name, window, n_valid, len(df),
         )
 
-    # ── Stage 2 — Macro trend features ──────────────────────────────
-    logger.info("\n[Stage 2/4] Computing macro trend features ...")
+    # Trailing standard deviations of daily returns
+    daily_ret = df.groupby("symbol")["close"].pct_change()
+    df["vol_60d"] = daily_ret.groupby(df["symbol"]).transform(
+        lambda x: x.rolling(60, min_periods=60).std()
+    )
+    df["vol_120d"] = daily_ret.groupby(df["symbol"]).transform(
+        lambda x: x.rolling(120, min_periods=120).std()
+    )
+    logger.info("  vol_60d     non-null rows: %d / %d", df["vol_60d"].notna().sum(), len(df))
+    logger.info("  vol_120d    non-null rows: %d / %d", df["vol_120d"].notna().sum(), len(df))
 
-    for raw_col, sma_col, roc_col in [
-        ("VIX", "vix_sma_20", "vix_roc_20"),
-        ("10Y_YIELD", "yield_sma_20", "yield_roc_20"),
-    ]:
-        df[sma_col] = df.groupby("symbol")[raw_col].transform(
-            lambda x: x.rolling(window=MACRO_WINDOW, min_periods=MACRO_WINDOW).mean()
-        )
-        df[roc_col] = df.groupby("symbol")[raw_col].transform(
-            lambda x: x.pct_change(periods=MACRO_WINDOW)
-        )
-        logger.info(
-            "  %-15s  SMA non-null: %d | ROC non-null: %d",
-            raw_col,
-            df[sma_col].notna().sum(),
-            df[roc_col].notna().sum(),
-        )
+    # Classic momentum (skipping recent month) & short-term reversal
+    df["mom_12_1"] = df.groupby("symbol")["close"].transform(
+        lambda x: x.shift(21) / x.shift(252) - 1
+    )
+    df["reversal_1m"] = df.groupby("symbol")["close"].transform(
+        lambda x: x / x.shift(21) - 1
+    )
+    logger.info("  mom_12_1    non-null rows: %d / %d", df["mom_12_1"].notna().sum(), len(df))
+    logger.info("  reversal_1m non-null rows: %d / %d", df["reversal_1m"].notna().sum(), len(df))
 
-    # ── Stage 3 — Fundamental ratio features ────────────────────────
-    logger.info("\n[Stage 3/4] Computing fundamental ratio features ...")
+    # ── Stage 2 — Fundamental & Quality ratio features ──────────────
+    logger.info("\n[Stage 2/4] Computing fundamental & quality ratio features ...")
 
+    # Margin ratios
     if _REVENUE_COL in df.columns:
         for ratio_col, numerator_col in _NUMERATOR_COLS.items():
             if numerator_col in df.columns:
@@ -214,6 +216,46 @@ def main(argv: list[str] | None = None) -> None:
         logger.warning(
             "  '%s' column missing — skipping all margin ratios.", _REVENUE_COL
         )
+
+    # Quality ratios
+    if "Net Income" in df.columns and "Total Assets" in df.columns:
+        df["roa"] = df["Net Income"] / df["Total Assets"].replace(0, float("nan"))
+        logger.info("  roa                   non-null rows: %d / %d", df["roa"].notna().sum(), len(df))
+    else:
+        logger.warning("  Missing 'Net Income' or 'Total Assets' — skipping roa.")
+        df["roa"] = float("nan")
+
+    if "Total Liabilities" in df.columns and "Total Equity" in df.columns:
+        df["debt_to_equity"] = df["Total Liabilities"] / df["Total Equity"].replace(0, float("nan"))
+        logger.info("  debt_to_equity        non-null rows: %d / %d", df["debt_to_equity"].notna().sum(), len(df))
+    else:
+        logger.warning("  Missing 'Total Liabilities' or 'Total Equity' — skipping debt_to_equity.")
+        df["debt_to_equity"] = float("nan")
+
+    if "Gross Profit" in df.columns and "Total Assets" in df.columns:
+        df["gross_profitability"] = df["Gross Profit"] / df["Total Assets"].replace(0, float("nan"))
+        logger.info("  gross_profitability   non-null rows: %d / %d", df["gross_profitability"].notna().sum(), len(df))
+    else:
+        logger.warning("  Missing 'Gross Profit' or 'Total Assets' — skipping gross_profitability.")
+        df["gross_profitability"] = float("nan")
+
+    # ── Stage 3 — Cross-sectional rank-normalization ──────────────────
+    logger.info("\n[Stage 3/4] Performing cross-sectional rank-normalization ...")
+
+    FACTOR_COLS = [
+        "mom_3m", "mom_6m", "mom_12m", "mom_12_1", "reversal_1m",
+        "vol_60d", "vol_120d",
+        "roa", "debt_to_equity", "gross_profitability",
+        "gross_margin", "operating_margin", "net_margin", "ebitda_margin",
+    ]
+
+    for f in FACTOR_COLS:
+        if f in df.columns:
+            # Rank within each date to convert to percentile ranks [0, 1]
+            df[f] = df.groupby("date")[f].rank(pct=True)
+            logger.info("  Rank-normalised: %s (non-null: %d)", f, df[f].notna().sum())
+        else:
+            logger.warning("  Factor '%s' not found — cannot rank-normalise.", f)
 
     # ── Stage 4 — Forward return and cross-sectional target ──────────
     logger.info("\n[Stage 4/4] Computing forward return and cross-sectional target ...")
@@ -231,30 +273,30 @@ def main(argv: list[str] | None = None) -> None:
     # Cross-sectional target: 1 if top quintile on that date, 0 otherwise.
     # Groups by date — each daily slice contains one row per symbol.
     # _top_k_label handles edge cases (ties, small groups).
-    df["target_top_k"] = (
+    df["target_top_quintile"] = (
         df.groupby("date")["forward_return_60d"]
         .transform(_top_k_label)
     )
 
-    n_target = df["target_top_k"].notna().sum()
-    n_positive = (df["target_top_k"] == 1).sum()
+    n_target = df["target_top_quintile"].notna().sum()
+    n_positive = (df["target_top_quintile"] == 1).sum()
     logger.info(
-        "  target_top_k: %d labelled rows | positive rate: %.1f%%",
+        "  target_top_quintile: %d labelled rows | positive rate: %.1f%%",
         n_target,
         n_positive / n_target * 100 if n_target > 0 else 0,
     )
 
     # ── Embargo handling ─────────────────────────────────────────────
-    # Rows where target_top_k is NaN are the final ~60 trading
+    # Rows where target_top_quintile is NaN are the final ~60 trading
     # days where we cannot compute the forward return.
     #   Training mode  : drop them (no usable label).
     #   Inference mode : KEEP them — today's row lives here and is the
     #                    row the orchestrator will predict on.  The
-    #                    forward_return_60d / target_top_k columns
+    #                    forward_return_60d / target_top_quintile columns
     #                    will simply be NaN for those rows; downstream
     #                    inference excludes them as features anyway.
     if inference_mode:
-        n_embargo = int(df["target_top_k"].isna().sum())
+        n_embargo = int(df["target_top_quintile"].isna().sum())
         logger.info(
             "\nInference mode — retaining %d embargo rows (NaN target). "
             "Total rows: %d.",
@@ -262,7 +304,7 @@ def main(argv: list[str] | None = None) -> None:
         )
     else:
         pre_drop = len(df)
-        df = df.dropna(subset=["target_top_k"])
+        df = df.dropna(subset=["target_top_quintile"])
         logger.info(
             "\nDropped %d embargo rows (NaN target). Remaining: %d rows.",
             pre_drop - len(df), len(df),
@@ -271,8 +313,8 @@ def main(argv: list[str] | None = None) -> None:
     # ── Label distribution audit (training only — meaningless on NaN) ─
     if not inference_mode:
         total = len(df)
-        pos = int((df["target_top_k"] == 1).sum())
-        neg = int((df["target_top_k"] == 0).sum())
+        pos = int((df["target_top_quintile"] == 1).sum())
+        neg = int((df["target_top_quintile"] == 0).sum())
         logger.info(
             "Target distribution — positive (Q5): %d (%.1f%%) | "
             "negative: %d (%.1f%%)",
@@ -282,7 +324,7 @@ def main(argv: list[str] | None = None) -> None:
 
         logger.info("Per-symbol positive rate:")
         for sym, grp in df.groupby("symbol"):
-            rate = (grp["target_top_k"] == 1).mean() * 100
+            rate = (grp["target_top_quintile"] == 1).mean() * 100
             logger.info("  %-6s  %.1f%%", sym, rate)
     else:
         # In inference mode, log the most recent observation date so
@@ -291,6 +333,12 @@ def main(argv: list[str] | None = None) -> None:
             "Inference snapshot — most recent date in frame: %s",
             df["date"].max().date().isoformat(),
         )
+
+    # ── Select Only Allow-Listed Columns to Persist ──────────────────
+    keep_cols = ["date", "symbol", "forward_return_60d", "target_top_quintile"] + [
+        f for f in FACTOR_COLS if f in df.columns
+    ]
+    df = df[keep_cols]
 
     # ── Save ─────────────────────────────────────────────────────────
     df = df.set_index("date")

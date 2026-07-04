@@ -38,11 +38,13 @@ from dotenv import load_dotenv
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _SRC_DIR = _PROJECT_ROOT / "src"
 sys.path.insert(0, str(_SRC_DIR))
+sys.path.insert(0, str(_PROJECT_ROOT / "scripts"))
 
 load_dotenv(_PROJECT_ROOT / ".env")
 
-from data.providers.simfin_fundamentals import SimFinFundamentalProvider  # noqa: E402
+from investor_universe import UNIVERSE
 from data.providers.yf_macro import YFinanceMacroProvider  # noqa: E402
+from data.factory import get_fundamental_provider  # noqa: E402
 
 # ── logging ───────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -53,7 +55,6 @@ logger = logging.getLogger(__name__)
 logging.getLogger("yfinance").setLevel(logging.WARNING)
 
 # ── V4 universe configuration ─────────────────────────────────────────
-UNIVERSE: list[str] = ["AAPL", "MSFT", "NVDA", "JPM", "XOM", "WMT", "JNJ"]
 MACRO_INDICATORS: list[str] = ["VIX", "10Y_YIELD"]
 
 _END_DATE = datetime.now(timezone.utc)
@@ -181,7 +182,7 @@ def main() -> None:
     logger.info("Lag      : %d days (SEC reporting safety margin)", _FUNDAMENTAL_LAG_DAYS)
     logger.info("=" * 70)
 
-    fundamental_provider = SimFinFundamentalProvider()
+    fundamental_provider = get_fundamental_provider()
     macro_provider = YFinanceMacroProvider()
 
     # ── Stage 1 — Macro series ────────────────────────────────────────
