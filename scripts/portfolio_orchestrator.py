@@ -59,7 +59,7 @@ sys.path.insert(0, str(_PROJECT_ROOT / "scripts"))
 
 load_dotenv(_PROJECT_ROOT / ".env")
 
-from investor_universe import UNIVERSE
+from investor_universe import SECTORS, UNIVERSE
 from alpaca.common.exceptions import APIError  # noqa: E402
 from alpaca.data.historical.stock import StockHistoricalDataClient  # noqa: E402
 from alpaca.data.requests import StockLatestQuoteRequest  # noqa: E402
@@ -75,8 +75,14 @@ logging.basicConfig(
 logger = logging.getLogger("portfolio_orchestrator")
 
 # ── strategy configuration ────────────────────────────────────────────
-TOP_K: int = 2
-TARGET_WEIGHT: float = 0.50  # per top-K holding, applied to usable_equity
+# Diversified basket: top-8 ranked names, equal-weighted, max 2 per GICS
+# sector. Walk-forward evidence (2026-07-03, 96-name universe): P@8 lift
+# 1.47x uncapped / 1.38x sector-capped vs 1.67x at P@1 — the edge decays
+# gently with depth, while the deep basket rescues the cold folds (worst
+# fold P@1 0.00 vs P@8 0.24). Diversification is structural, not luck.
+TOP_K: int = 8
+SECTOR_CAP: int = 2           # max holdings per GICS sector
+TARGET_WEIGHT: float = 1.0 / TOP_K  # per holding, applied to usable_equity
 
 # Reserve 1% of equity as a cash buffer so penny-rounding across multiple
 # notional orders cannot exceed buying power. Without this, allocating
@@ -257,10 +263,28 @@ def predict_and_rank(
             "  %-6s  score=%+.4f  close=%s", row["symbol"], row["score"], close_str
         )
 
-    top_k = ranked.head(k)["symbol"].tolist()
+    # Greedy sector-capped selection: walk the ranking top-down, skip any
+    # name whose sector already has SECTOR_CAP picks.
+    top_k: list[str] = []
+    per_sector: dict[str, int] = {}
+    for _, row in ranked.iterrows():
+        sector = SECTORS.get(row["symbol"], "unknown")
+        if per_sector.get(sector, 0) >= SECTOR_CAP:
+            logger.info(
+                "  skipping %-6s (sector %s already at cap %d)",
+                row["symbol"], sector, SECTOR_CAP,
+            )
+            continue
+        top_k.append(row["symbol"])
+        per_sector[sector] = per_sector.get(sector, 0) + 1
+        if len(top_k) == k:
+            break
+
     logger.info(
-        "Top %d (target weight %.0f%% each): %s", k, TARGET_WEIGHT * 100, top_k
+        "Top %d, max %d/sector (target weight %.1f%% each): %s",
+        k, SECTOR_CAP, TARGET_WEIGHT * 100, top_k,
     )
+    logger.info("Sector spread: %s", per_sector)
     return top_k, ranked
 
 
@@ -396,7 +420,7 @@ def execute_rebalance(
                 symbol=symbol,
                 side=OrderSide.BUY,
                 notional=round(delta, 2),
-                reason=f"buy ${delta:.2f} → 50% target (current=${current_mv:.2f})",
+                reason=f"buy ${delta:.2f} → target (current=${current_mv:.2f})",
             ))
             continue
 
@@ -420,7 +444,7 @@ def execute_rebalance(
                 symbol=symbol,
                 side=OrderSide.BUY,
                 notional=round(target_value, 2),
-                reason="re-establish 50% target after full close",
+                reason="re-establish target weight after full close",
             ))
             continue
 
@@ -432,7 +456,7 @@ def execute_rebalance(
             side=OrderSide.SELL,
             qty=sell_qty,
             reason=(
-                f"sell {sell_qty:.4f} @ ~${price:.2f} → 50% target "
+                f"sell {sell_qty:.4f} @ ~${price:.2f} → target "
                 f"(current=${current_mv:.2f}, overweight=${-delta:.2f})"
             ),
         ))

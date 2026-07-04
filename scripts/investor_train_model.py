@@ -67,6 +67,7 @@ TEST_DAYS    = 60    # fold width; also the roll-forward step size
 # gate requires the model to clear the base rate by a margin.
 GATE_P1_MIN_LIFT = float(os.getenv("INVESTOR_GATE_P1_LIFT", "1.3"))  # P@1 ≥ 1.3× base rate
 GATE_P2_MIN_LIFT = float(os.getenv("INVESTOR_GATE_P2_LIFT", "1.2"))  # P@2 ≥ 1.2× base rate
+GATE_P8_MIN_LIFT = float(os.getenv("INVESTOR_GATE_P8_LIFT", "1.1"))  # P@8 ≥ 1.1× base — the depth we deploy (orchestrator TOP_K=8)
 GATE_NDCG_MIN    = float(os.getenv("INVESTOR_GATE_NDCG_MIN", "0.0")) # absolute NDCG floor (0 = informational until calibrated)
 FORCE_SAVE       = os.getenv("INVESTOR_GATE_FORCE", "0").strip() == "1"  # escape hatch
 
@@ -304,6 +305,7 @@ def _main_impl() -> int:
         scores = model.predict(X_test)
         p_at_1 = _precision_at_k(test_df, scores, k=1)
         p_at_2 = _precision_at_k(test_df, scores, k=2)
+        p_at_8 = _precision_at_k(test_df, scores, k=8)  # deployed basket depth
 
         logger.info(
             "Fold %2d │ Train → %s (%4d dates, %5d rows) │ "
@@ -324,6 +326,7 @@ def _main_impl() -> int:
             ndcg_key or "ndcg": final_ndcg,
             "precision_at_1": p_at_1,
             "precision_at_2": p_at_2,
+            "precision_at_8": p_at_8,
         })
 
         fold_num += 1
@@ -338,6 +341,7 @@ def _main_impl() -> int:
         mean_ndcg = results_df[ndcg_col[0]].mean()
         mean_p1   = results_df["precision_at_1"].mean()
         mean_p2   = results_df["precision_at_2"].mean()
+        mean_p8   = results_df["precision_at_8"].mean()
         logger.info(
             "\nMean across folds │ %s=%.4f │ P@1=%.3f │ P@2=%.3f",
             ndcg_col[0], mean_ndcg, mean_p1, mean_p2,
@@ -350,9 +354,11 @@ def _main_impl() -> int:
     base_rate = float(y_all.mean())
     p1_floor = base_rate * GATE_P1_MIN_LIFT
     p2_floor = base_rate * GATE_P2_MIN_LIFT
+    p8_floor = base_rate * GATE_P8_MIN_LIFT
 
     p1_pass = mean_p1 >= p1_floor
     p2_pass = mean_p2 >= p2_floor
+    p8_pass = mean_p8 >= p8_floor
     ndcg_pass = mean_ndcg >= GATE_NDCG_MIN
 
     logger.info("=" * 70)
@@ -361,10 +367,11 @@ def _main_impl() -> int:
     logger.info(f"Positive Base Rate   : {base_rate:.4f} (equivalent to random prediction)")
     logger.info(f"Mean Precision@1     : {mean_p1:.4f} vs floor {p1_floor:.4f} (lift required: {GATE_P1_MIN_LIFT}x) -> {'PASS' if p1_pass else 'FAIL'}")
     logger.info(f"Mean Precision@2     : {mean_p2:.4f} vs floor {p2_floor:.4f} (lift required: {GATE_P2_MIN_LIFT}x) -> {'PASS' if p2_pass else 'FAIL'}")
+    logger.info(f"Mean Precision@8     : {mean_p8:.4f} vs floor {p8_floor:.4f} (lift required: {GATE_P8_MIN_LIFT}x, deployed basket depth) -> {'PASS' if p8_pass else 'FAIL'}")
     logger.info(f"Mean NDCG            : {mean_ndcg:.4f} vs floor {GATE_NDCG_MIN:.4f} -> {'PASS' if ndcg_pass else 'FAIL'}")
     logger.info("=" * 70)
 
-    gate_passed = p1_pass and p2_pass and ndcg_pass
+    gate_passed = p1_pass and p2_pass and p8_pass and ndcg_pass
 
     if not gate_passed and not FORCE_SAVE:
         logger.warning("=" * 70)
@@ -416,6 +423,7 @@ def _main_impl() -> int:
             "mean_ndcg": round(float(mean_ndcg), 4),
             "mean_precision_at_1": round(float(mean_p1), 4),
             "mean_precision_at_2": round(float(mean_p2), 4),
+            "mean_precision_at_8": round(float(mean_p8), 4),
             "positive_base_rate": round(float(base_rate), 4),
         },
         "gate_passed": bool(gate_passed),
