@@ -52,6 +52,7 @@ from src.execution.risk_manager import (
     coupled_keff,
 )
 from src.ml.feature_pipeline import FeaturePipeline
+from src.ml.feature_stats import compute_feature_stats, save_feature_stats
 from src.ml.features.v3_features import (
     V3BaseFeatures,
     V3CostFeatures,
@@ -2135,6 +2136,11 @@ def main() -> int:
         if promoted:
             asset_class = asset_config.get("asset_class", "equities")
             saved_dir = asset_config.get("model_dir") or f"models/{asset_class}"
+            # Feature-distribution sidecar for the drift probe
+            # (scripts/probe_model.py). Computed from the exact post-veto,
+            # post-clean population the promoted models trained on.
+            stats = compute_feature_stats(features_df, feature_cols)
+            save_feature_stats(stats, saved_dir)
             logger.info("=" * 70)
             logger.info(f"✅ MODELS PROMOTED ({asset_class}) — Ready for next market open")
             logger.info(f"  Models saved in: {saved_dir}/")
