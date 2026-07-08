@@ -189,6 +189,11 @@ async def _main() -> None:
     )
     order_manager = OandaOrderManager(environment=args.env)
     
+    # Forex volatility is a fraction of Equities. Use a derived 2.0 pips stop-loss floor
+    # so the chop filter doesn't reject everything.
+    # Set round_precision=5 since Forex pairs are quoted to 5 decimal places natively.
+    risk_profile = RiskProfile.for_asset_class("forex")
+
     htf_tf, warmup_pd = _GRANULARITY_PROFILES[args.granularity]
     strategy = MLStrategy(
         asset_class="forex",
@@ -197,13 +202,29 @@ async def _main() -> None:
         timeframe=args.granularity,
         htf_timeframe=htf_tf,
         warmup_period=warmup_pd,
+        # cost_ratio feature baseline must use the same window as the live
+        # regime gate — one source of truth for both sides.
+        regime_window=risk_profile.regime_window,
     )
-    
-    # Forex volatility is a fraction of Equities. Use a derived 2.0 pips stop-loss floor
-    # so the chop filter doesn't reject everything.
-    # Set round_precision=5 since Forex pairs are quoted to 5 decimal places natively.
-    risk_profile = RiskProfile.for_asset_class("forex")
-    risk_manager = RiskManager(profile=risk_profile)
+
+    # Per-instrument spread alphas shipped with the model (spread_alphas.json,
+    # written by the retrainer on gate pass). Used by Gate A's stale-spread
+    # proxy branch; fresh tick spreads always win. Absent → flat env alpha.
+    alpha_overrides = None
+    try:
+        with open(_MODEL_DIR / "spread_alphas.json") as fh:
+            alpha_overrides = json.load(fh).get("alphas") or None
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.warning("Could not read spread_alphas.json: %s", e)
+    logger.info(
+        "Gate A spread proxy mode: %s",
+        f"per-instrument ({len(alpha_overrides)} alphas)"
+        if alpha_overrides
+        else f"flat alpha={risk_profile.spread_atr_alpha}",
+    )
+    risk_manager = RiskManager(profile=risk_profile, alpha_overrides=alpha_overrides)
 
     orchestrator = OandaScalperOrchestrator(
         symbols=symbols,

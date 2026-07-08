@@ -168,6 +168,97 @@ class V3SessionFeatures(BaseFeatureGenerator):
         )
 
 
+class V3CostFeatures(BaseFeatureGenerator):
+    """
+    Per-instrument spread-cost feature: ``cost_ratio``.
+
+        cost_ratio = alpha_sym * baseline_natr / natr_14
+
+    where ``alpha_sym`` is the instrument's empirically measured spread cost
+    as a fraction of a typical move (baked from live SPREAD_CALIB samples by
+    scripts/bake_spread_alphas.py) and ``baseline_natr`` is the per-symbol
+    rolling median of ``natr_14`` over ``regime_window`` bars.
+
+    This is exactly the live Gate A inequality rearranged
+    (``sl_dist < k_eff * alpha * baseline_ATR``), so the model sees the same
+    quantity the cost gate thresholds on.  Time-varying: when current
+    volatility rises above baseline, the ratio falls — trading gets cheaper.
+
+    Symmetry contract: computed from bar data + the alpha table ONLY, in both
+    training and live.  The live per-tick spread is deliberately NOT used here
+    (training can never see it); the tick spread keeps its existing job as
+    Gate A's hard veto input.
+
+    Notes:
+      * ``alpha_table is None`` → generate() is a NO-OP (df returned
+        unchanged).  The generator is always present in pipelines; model dirs
+        without a ``spread_alphas.json`` behave bit-identically to before this
+        feature existed.
+      * ``min_samples=1`` (expanding median below a full window) is
+        REQUIRED: a strict window would null ``cost_ratio`` across the whole
+        live warmup buffer, clean_data would drop every row, and the
+        strategy's latest-bar staleness guard would silently return None
+        forever.  It also matches the training chop-veto baseline
+        (expanding-then-rolling median in retrainer._compute_chop_veto_mask).
+      * TA-Lib NATR emits float NaN (not null) for its first bars; polars
+        rolling aggregates skip nulls but PROPAGATE NaN, so we fill_nan(None)
+        here — clean_data runs too late.
+      * Known, accepted divergence from the training veto: numpy's median
+        yields NaN on windows containing leading NaNs (Gate A then skips via
+        isfinite) while this feature skips them; affects only roughly the
+        first regime_window + NATR-period bars per symbol.
+      * ``alpha_table`` is intentionally a mutable attribute — live
+        hot-reload swaps it in place after a retrain lands.
+    """
+
+    def __init__(
+        self,
+        alpha_table: Optional[dict] = None,
+        default_alpha: float = 0.15,
+        regime_window: int = 260,
+    ):
+        self.alpha_table = alpha_table
+        self.default_alpha = default_alpha
+        self.regime_window = regime_window
+        self._warned_missing: set = set()
+
+    def generate(self, df: pl.DataFrame) -> pl.DataFrame:
+        if not self.alpha_table:
+            return df
+        if "natr_14" not in df.columns:
+            raise ValueError(
+                "V3CostFeatures requires 'natr_14' — order it after "
+                "V3BaseFeatures in the pipeline."
+            )
+
+        natr = pl.col("natr_14").fill_nan(None)
+        baseline = natr.rolling_median(
+            window_size=self.regime_window, min_samples=1
+        )
+        if "symbol" in df.columns:
+            # Pooled training frames are already sorted (symbol, timestamp)
+            # by V3BaseFeatures; live single-symbol frames are time-ordered.
+            baseline = baseline.over("symbol")
+            missing = set(df["symbol"].unique().to_list()) - set(self.alpha_table)
+            new_missing = missing - self._warned_missing
+            if new_missing:
+                logger.warning(
+                    "V3CostFeatures: no alpha for %s — using default_alpha=%.4f",
+                    sorted(new_missing), self.default_alpha,
+                )
+                self._warned_missing |= new_missing
+            alpha = pl.col("symbol").replace_strict(
+                self.alpha_table, default=self.default_alpha,
+                return_dtype=pl.Float64,
+            )
+        else:
+            alpha = pl.lit(self.default_alpha, dtype=pl.Float64)
+
+        # natr_14 == 0 → Inf; clean_data nulls it and drops the row
+        # (degenerate-volatility bars — correct to skip).
+        return df.with_columns((alpha * baseline / natr).alias("cost_ratio"))
+
+
 class V3HTFFeatures(BaseFeatureGenerator):
     """
     Compute higher-timeframe features and join them onto the 1m DataFrame

@@ -36,7 +36,12 @@ from core.notification_manager import NotificationManager
 
 # CRITICAL: Import FeaturePipeline to prevent training/inference skew
 from ml.feature_pipeline import FeaturePipeline
-from ml.features.v3_features import V3BaseFeatures, V3HTFFeatures, V3SessionFeatures
+from ml.features.v3_features import (
+    V3BaseFeatures,
+    V3CostFeatures,
+    V3HTFFeatures,
+    V3SessionFeatures,
+)
 from ml.regimes.hmm_regime import (
     HMM_OUTPUT_COLS,
     load_hmm_models,
@@ -80,6 +85,7 @@ class MLStrategy(BaseStrategy):
         htf_timeframe: str = "5m",
         angel_trainer=None,
         devil_trainer=None,
+        regime_window: int = 260,  # must match RiskProfile.regime_window
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -146,12 +152,27 @@ class MLStrategy(BaseStrategy):
         # Initialize notification manager for hot-reload alerts
         self.notification_manager = NotificationManager()
 
+        # Per-instrument spread-cost table (spread_alphas.json in the model
+        # dir, written by the retrainer on gate pass). None → V3CostFeatures
+        # is a no-op and the pipeline is bit-identical to the pre-cost era.
+        spread_table, self._spread_table_mtime = self._load_spread_table()
+
         # Initialize feature pipeline (imported, not duplicated!)
+        # V3CostFeatures must follow V3BaseFeatures (needs natr_14). Keep a
+        # handle so hot-reload can swap the alpha table in place.
+        self._cost_gen = V3CostFeatures(
+            alpha_table=spread_table["alphas"] if spread_table else None,
+            default_alpha=(
+                spread_table.get("default_alpha", 0.15) if spread_table else 0.15
+            ),
+            regime_window=regime_window,
+        )
         self.pipeline = FeaturePipeline(
             feature_generators=[
                 V3BaseFeatures(),
                 V3HTFFeatures(timeframe=htf_timeframe),
                 V3SessionFeatures(),
+                self._cost_gen,
             ]
         )
 
@@ -171,6 +192,18 @@ class MLStrategy(BaseStrategy):
             "MLStrategy feature schema sourced from model: %d features",
             len(self.feature_names),
         )
+
+        # If the model trained on cost_ratio, the spread table is REQUIRED —
+        # fail loudly at boot rather than obscurely at column selection on
+        # the first bar. (Same philosophy as the HMM guard below; note we
+        # load from angel_path.parent so side model dirs carry their own.)
+        if "cost_ratio" in self.feature_names and spread_table is None:
+            raise RuntimeError(
+                f"Angel model expects the 'cost_ratio' feature but "
+                f"{self.angel_path.parent / 'spread_alphas.json'} is missing "
+                "or unreadable. Retrain with RETRAIN_SPREAD_TABLE so the "
+                "table is persisted alongside the model, or restore the file."
+            )
 
         # If the model trained on HMM regime probs, load the per-symbol HMM
         # artifact persisted alongside Angel/Devil and apply it at inference.
@@ -286,6 +319,50 @@ class MLStrategy(BaseStrategy):
             )
             return self.devil_threshold
 
+    def _load_spread_table(self) -> tuple:
+        """
+        Load the per-instrument spread-alpha table from the model directory's
+        spread_alphas.json (next to the pkl artifacts, so side models carry
+        their own — model and cost assumptions must travel together).
+
+        Written by retrainer.save_spread_table() on gate pass; baked from live
+        SPREAD_CALIB measurements by scripts/bake_spread_alphas.py.
+
+        Returns:
+            (table dict or None, file mtime or 0.0). None means no table —
+            V3CostFeatures no-ops and the feature space has no cost_ratio.
+        """
+        table_path = self.angel_path.parent / "spread_alphas.json"
+        if not table_path.exists():
+            logger.info(
+                "_load_spread_table: %s not found — cost_ratio feature "
+                "disabled (pre-cost model dir)",
+                table_path,
+            )
+            return None, 0.0
+        try:
+            with open(table_path, "r") as fh:
+                table = json.load(fh)
+            if not isinstance(table.get("alphas"), dict) or not table["alphas"]:
+                raise ValueError("no 'alphas' mapping")
+            logger.info(
+                "_load_spread_table: loaded %d instrument alphas from %s "
+                "(denomination=%sm): %s",
+                len(table["alphas"]),
+                table_path,
+                table.get("denomination_minutes"),
+                {k: round(v, 4) for k, v in sorted(table["alphas"].items())},
+            )
+            return table, os.path.getmtime(table_path)
+        except Exception as exc:
+            logger.warning(
+                "_load_spread_table: failed to read %s (%s) — cost_ratio "
+                "feature disabled",
+                table_path,
+                exc,
+            )
+            return None, 0.0
+
     @property
     def warmup_period(self) -> int:
         """Returns minimum candles required for indicators to warm up."""
@@ -382,6 +459,40 @@ class MLStrategy(BaseStrategy):
                         self.devil_threshold,
                     )
 
+                # Reload the spread-alpha table when it changed on disk or the
+                # refreshed schema newly requires cost_ratio (a cost-aware
+                # retrain landed over a pre-cost model dir).
+                table_path = self.angel_path.parent / "spread_alphas.json"
+                table_mtime = (
+                    os.path.getmtime(table_path) if table_path.exists() else 0.0
+                )
+                needs_cost = "cost_ratio" in self.feature_names
+                if table_mtime != self._spread_table_mtime or (
+                    needs_cost and self._cost_gen.alpha_table is None
+                ):
+                    new_table, self._spread_table_mtime = self._load_spread_table()
+                    with self._reload_lock:
+                        self._cost_gen.alpha_table = (
+                            new_table["alphas"] if new_table else None
+                        )
+                        if new_table:
+                            self._cost_gen.default_alpha = new_table.get(
+                                "default_alpha", 0.15
+                            )
+                    logger.info(
+                        "[HOT-RELOAD] Spread table %s",
+                        "updated" if new_table else "removed/unreadable",
+                    )
+                if needs_cost and self._cost_gen.alpha_table is None:
+                    msg = (
+                        "[HOT-RELOAD] SCHEMA MISMATCH: model expects "
+                        "cost_ratio but spread_alphas.json is missing from "
+                        f"{self.angel_path.parent} — predictions will fail "
+                        "until the table is restored."
+                    )
+                    logger.critical(msg)
+                    self.notification_manager.send_system_message(msg)
+
                 alert_message = (
                     "🔄 [HOT-RELOAD] New model weights ingested from disk. "
                     f"Angel: {self.angel_path.name}, Devil: {self.devil_path.name} "
@@ -472,10 +583,18 @@ class MLStrategy(BaseStrategy):
             if self._heartbeat_counter[heartbeat_key] >= self._heartbeat_every_n_bars:
                 probs = list(self._heartbeat_window[heartbeat_key])
                 proposed = sum(1 for p in probs if p >= self.angel_threshold)
+                # Surface the model's view of trading cost when the cost
+                # feature is active — lets the operator read per-instrument
+                # affordability straight off the heartbeat.
+                cost_note = ""
+                if "cost_ratio" in features_df.columns:
+                    cost_note = " | cost_ratio=%.3f" % float(
+                        features_df["cost_ratio"].tail(1)[0]
+                    )
                 logger.info(
                     "[%s] Heartbeat: last %d bars angel_prob "
                     "median=%.3f p75=%.3f max=%.3f | proposed=%d/%d (%.1f%%) "
-                    "vs threshold=%.2f",
+                    "vs threshold=%.2f%s",
                     heartbeat_key,
                     len(probs),
                     float(np.median(probs)),
@@ -485,6 +604,7 @@ class MLStrategy(BaseStrategy):
                     len(probs),
                     100.0 * proposed / len(probs),
                     self.angel_threshold,
+                    cost_note,
                 )
                 self._heartbeat_counter[heartbeat_key] = 0
 

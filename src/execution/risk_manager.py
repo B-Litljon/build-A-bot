@@ -179,8 +179,17 @@ class RiskManager:
     """
     The Shield: Enforces institutional-grade safety nets and dynamic sizing.
     """
-    def __init__(self, profile: RiskProfile = RiskProfile()):
+    def __init__(
+        self,
+        profile: RiskProfile = RiskProfile(),
+        alpha_overrides: Optional[dict] = None,
+    ):
         self.profile = profile
+        # Per-instrument spread alphas ({symbol: alpha_emp}, from the model
+        # dir's spread_alphas.json). Used ONLY in Gate A's stale-spread proxy
+        # branch — a fresh live tick spread always wins. Symbols not listed
+        # fall back to the flat profile.spread_atr_alpha.
+        self._alpha_overrides: dict = alpha_overrides or {}
         # Which gate vetoed the most recent calculate_bracket() call (read by
         # the orchestrator for split telemetry). GATE_NONE when it passed.
         self.last_veto_gate: str = GATE_NONE
@@ -318,8 +327,16 @@ class RiskManager:
             else:
                 # Volatility-scaled proxy (matches the training-side proxy):
                 # baseline ATR (median of window) converted from NATR% to price.
+                # Per-instrument measured alpha when the model dir shipped a
+                # spread table; flat profile value otherwise.
+                alpha = self._alpha_overrides.get(symbol, p.spread_atr_alpha)
                 baseline_atr_abs = float(np.median(arr)) * entry_price / 100.0
-                spread_proxy, src = p.spread_atr_alpha * baseline_atr_abs, "proxy"
+                spread_proxy = alpha * baseline_atr_abs
+                src = (
+                    f"proxy/alpha={alpha:.3f}"
+                    if symbol in self._alpha_overrides
+                    else "proxy"
+                )
             floor = k_eff * spread_proxy
             if sl_dist < floor:
                 logger.info(

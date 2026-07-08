@@ -52,7 +52,12 @@ from src.execution.risk_manager import (
     coupled_keff,
 )
 from src.ml.feature_pipeline import FeaturePipeline
-from src.ml.features.v3_features import V3BaseFeatures, V3HTFFeatures, V3SessionFeatures
+from src.ml.features.v3_features import (
+    V3BaseFeatures,
+    V3CostFeatures,
+    V3HTFFeatures,
+    V3SessionFeatures,
+)
 from src.ml.regimes.hmm_regime import (
     HMM_OUTPUT_COLS,
     fit_regime_models,
@@ -238,6 +243,34 @@ BASELINE_POOLED_OOS_TRADES = int(os.getenv("RETRAIN_POOLED_TRADE_FLOOR", "300"))
 # Default off so a plain LightGBM swap can be evaluated without confounds.
 USE_HMM_FEATURES = os.getenv("RETRAIN_USE_HMM", "0").strip() == "1"
 
+# Per-instrument spread-cost table (2026-07-07 cost-awareness experiment).
+# Points at a JSON baked by scripts/bake_spread_alphas.py from live
+# SPREAD_CALIB measurements. When set:
+#   * the chop-veto Gate A uses each instrument's measured alpha instead of
+#     the flat profile.spread_atr_alpha (0.15) — fixes a real train/live
+#     asymmetry where training kept e.g. GBP_NZD (alpha ~0.90) setups that
+#     live always vetoes;
+#   * V3CostFeatures appends a ``cost_ratio`` feature so the model can SEE
+#     cost and learn to suppress conviction on untradeable instruments;
+#   * on gate pass the table is copied into model_dir/spread_alphas.json so
+#     model + cost assumptions travel together (live loads it from there).
+# Unset → prod retrains are bit-identical to before this experiment.
+_SPREAD_TABLE_PATH = os.getenv("RETRAIN_SPREAD_TABLE", "").strip()
+
+
+def _load_spread_table(path: str) -> Optional[dict]:
+    """Parse a bake_spread_alphas.py JSON table; raise on malformed input."""
+    with open(path, "r") as fh:
+        table = json.load(fh)
+    if "alphas" not in table or not isinstance(table["alphas"], dict):
+        raise ValueError(f"Spread table {path} has no 'alphas' mapping")
+    return table
+
+
+SPREAD_TABLE: Optional[dict] = (
+    _load_spread_table(_SPREAD_TABLE_PATH) if _SPREAD_TABLE_PATH else None
+)
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # FEATURE COLUMNS (must match MLStrategy.feature_names and FeaturePipeline output)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -276,7 +309,9 @@ BASE_FEATURE_COLS: List[str] = [
 ]
 
 FEATURE_COLS: List[str] = (
-    BASE_FEATURE_COLS + HMM_OUTPUT_COLS if USE_HMM_FEATURES else BASE_FEATURE_COLS
+    BASE_FEATURE_COLS
+    + (["cost_ratio"] if SPREAD_TABLE else [])
+    + (HMM_OUTPUT_COLS if USE_HMM_FEATURES else [])
 )
 
 
@@ -561,7 +596,10 @@ def _compute_devil_survival_target(
 
 
 def _compute_chop_veto_mask(
-    df: pl.DataFrame, profile: RiskProfile, sl_mult: float
+    df: pl.DataFrame,
+    profile: RiskProfile,
+    sl_mult: float,
+    alpha_table: Optional[dict] = None,
 ) -> np.ndarray:
     """
     Vectorized hybrid chop veto, mirroring ``RiskManager._evaluate_dynamic_gates``
@@ -575,6 +613,13 @@ def _compute_chop_veto_mask(
         volatility-scaled proxy; ``close`` cancels on both sides). The spread
         proxy scales with each era's *baseline* (median-window) volatility —
         not a static historical constant — so it is era-robust.
+
+    ``alpha_table`` (2026-07-07): optional per-instrument spread alphas
+    ({symbol: alpha_emp} from a bake_spread_alphas.py table). When provided,
+    each symbol's measured alpha replaces the flat ``profile.spread_atr_alpha``
+    in Gate A — instruments the table doesn't list fall back to the profile
+    value. This fixes the asymmetry where training priced GBP_NZD (measured
+    ~0.90) at the flat 0.15 and kept setups live always vetoes.
 
     Returns a boolean array (True = veto/drop) aligned to ``df`` rows. Rows are
     dropped only as trade *entries*; the bracket walk in the target functions
@@ -598,12 +643,14 @@ def _compute_chop_veto_mask(
     w = int(profile.regime_window)
     mins = int(profile.regime_min_samples)
     p_thresh = profile.regime_pctile / 100.0
-    alpha = profile.spread_atr_alpha
 
     symbols = df["symbol"].to_numpy() if "symbol" in df.columns else np.zeros(n_total)
     natr_all = df["natr_14"].to_numpy().astype(float)
 
     for sym in np.unique(symbols):
+        # Per-instrument measured alpha when a table is provided; flat profile
+        # value otherwise (and for symbols the table doesn't list).
+        alpha = (alpha_table or {}).get(str(sym), profile.spread_atr_alpha)
         idx = np.where(symbols == sym)[0]  # contiguous, time-ordered per symbol
         natr = natr_all[idx]
         m = len(natr)
@@ -649,6 +696,14 @@ def _compute_chop_veto_mask(
             gate_a &= np.isfinite(baseline)
 
         veto[idx] = gate_a | gate_b
+        # Per-symbol diagnostics — critical when alpha_table is active: an
+        # expensive instrument (GBP_NZD ~0.90) should thin dramatically.
+        logger.info(
+            "  Chop veto [%s]: alpha=%.4f | gate_a=%d gate_b=%d | vetoed %d/%d (%.1f%%)",
+            sym, alpha, int(gate_a.sum()), int(gate_b.sum()),
+            int((gate_a | gate_b).sum()), m,
+            100.0 * (gate_a | gate_b).mean() if m else 0.0,
+        )
 
     return veto
 
@@ -666,6 +721,7 @@ def engineer_features_and_labels(
     survival_bars: int = SURVIVAL_BARS,
     htf_timeframe: str = "5m",
     risk_profile: Optional[RiskProfile] = None,
+    alpha_table: Optional[dict] = None,
 ) -> Tuple[pl.DataFrame, List[str], float]:
     """
     Engineer technical features and generate ATR-dynamic target labels.
@@ -708,6 +764,16 @@ def engineer_features_and_labels(
             V3BaseFeatures(),
             V3HTFFeatures(timeframe=htf_timeframe),
             V3SessionFeatures(),
+            # No-op when alpha_table is None; needs natr_14 → after V3Base.
+            V3CostFeatures(
+                alpha_table=alpha_table,
+                default_alpha=(
+                    risk_profile.spread_atr_alpha if risk_profile else 0.15
+                ),
+                regime_window=(
+                    risk_profile.regime_window if risk_profile else 260
+                ),
+            ),
         ]
     )
     for gen in pipeline.feature_generators:
@@ -783,7 +849,9 @@ def engineer_features_and_labels(
     chop_veto_rate = 0.0
     if risk_profile is not None:
         pre_veto = df.height
-        veto_mask = _compute_chop_veto_mask(df, risk_profile, sl_mult)
+        veto_mask = _compute_chop_veto_mask(
+            df, risk_profile, sl_mult, alpha_table=alpha_table
+        )
         n_veto = int(veto_mask.sum())
         chop_veto_rate = n_veto / pre_veto if pre_veto else 0.0
         if n_veto > 0:
@@ -799,10 +867,15 @@ def engineer_features_and_labels(
     # CLEANUP: Drop NaN/null rows (uses FeaturePipeline.clean_data)
     # ═══════════════════════════════════════════════════════════════════
     initial_count = len(df)
+    # cost_ratio exists iff an alpha_table was provided (V3CostFeatures is a
+    # no-op otherwise) — include it in cleaning and the returned schema so it
+    # reaches the models. Keyed off the function param, not the module global,
+    # so behavior follows what was actually computed.
+    base_cols = BASE_FEATURE_COLS + (["cost_ratio"] if alpha_table else [])
     # Clean on BASE features only — HMM regime probs (when enabled) are
     # appended later inside validate_candidate so each fold fits its own HMM.
     df = FeaturePipeline.clean_data(
-        df, feature_cols=BASE_FEATURE_COLS + ["angel_target", "devil_target"]
+        df, feature_cols=base_cols + ["angel_target", "devil_target"]
     )
     dropped_count = initial_count - len(df)
 
@@ -810,11 +883,11 @@ def engineer_features_and_labels(
         f"Dropped {dropped_count:,} rows with nulls ({dropped_count / initial_count:.1%})"
     )
     logger.info(f"Final dataset: {len(df):,} rows")
-    logger.info(f"Base feature columns ({len(BASE_FEATURE_COLS)}): {BASE_FEATURE_COLS}")
+    logger.info(f"Base feature columns ({len(base_cols)}): {base_cols}")
     if USE_HMM_FEATURES:
         logger.info(f"HMM regime features ENABLED — will be appended per-fold: {HMM_OUTPUT_COLS}")
 
-    return df, BASE_FEATURE_COLS, chop_veto_rate
+    return df, base_cols, chop_veto_rate
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1756,6 +1829,8 @@ def promote_or_reject(
 
         save_models(angel_model, devil_model, asset_config)
         save_threshold(threshold, asset_config)
+        if SPREAD_TABLE is not None:
+            save_spread_table(_SPREAD_TABLE_PATH, asset_config)
         if hmm_models is not None:
             asset_class = asset_config.get("asset_class", "equities")
             model_dir = Path(asset_config.get("model_dir") or f"models/{asset_class}")
@@ -1895,6 +1970,35 @@ def save_threshold(threshold: float, asset_config: dict) -> None:
     )
 
 
+def save_spread_table(source_path: str, asset_config: dict) -> None:
+    """
+    Copy the per-instrument spread-alpha table into the model directory as
+    ``spread_alphas.json`` so the model and its cost assumptions travel
+    together.  MLStrategy / run_oanda load it from the model dir — a model
+    trained against one cost table must never run against another.
+
+    Written atomically, same pattern as save_threshold().
+    """
+    asset_class = asset_config.get("asset_class", "equities")
+    model_dir = Path(asset_config.get("model_dir") or f"models/{asset_class}")
+    model_dir.mkdir(parents=True, exist_ok=True)
+    table_path = model_dir / "spread_alphas.json"
+
+    with open(source_path, "r") as f:
+        table = json.load(f)
+
+    temp_path = model_dir / "spread_alphas_temp.json"
+    with open(temp_path, "w") as f:
+        json.dump(table, f, indent=2)
+    os.replace(temp_path, table_path)
+
+    logger.info(
+        f"[ATOMIC] Spread table saved: {table_path} "
+        f"({len(table.get('alphas', {}))} instruments, "
+        f"denomination={table.get('denomination_minutes')}m)"
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1950,6 +2054,28 @@ def main() -> int:
             timeframe_minutes=asset_config["timeframe_minutes"]
         )
 
+        # ─── Phase 2.5: Per-instrument spread-cost table (optional) ────────
+        spread_alphas: Optional[dict] = None
+        if SPREAD_TABLE is not None:
+            spread_alphas = SPREAD_TABLE["alphas"]
+            denom = SPREAD_TABLE.get("denomination_minutes")
+            if denom != asset_config["timeframe_minutes"]:
+                logger.warning(
+                    "⚠️  SPREAD TABLE DENOMINATION MISMATCH: table measured on "
+                    "%s-minute bars but retraining on %s-minute bars. Baseline "
+                    "NATR is timeframe-dependent — these alphas are NOT valid "
+                    "here. Re-bake from a soak at this granularity.",
+                    denom, asset_config["timeframe_minutes"],
+                )
+            logger.info(
+                "Per-instrument spread table ACTIVE (%s): %s",
+                _SPREAD_TABLE_PATH,
+                {k: round(v, 4) for k, v in sorted(spread_alphas.items())},
+            )
+            logger.info(
+                "cost_ratio feature enabled → %d features", len(FEATURE_COLS)
+            )
+
         # ─── Phase 3: Engineer features with ATR-dynamic labels ────────────
         features_df, feature_cols, chop_veto_rate = engineer_features_and_labels(
             raw_data,
@@ -1961,6 +2087,7 @@ def main() -> int:
             # Same RiskProfile path that sources sl_mult/tp_mult → the chop
             # veto simulated here is identical to the live execution gate.
             risk_profile=RiskProfile.for_asset_class(asset_config["asset_class"]),
+            alpha_table=spread_alphas,
         )
 
         # ─── Phase 4: Walk-forward validation (3-fold expanding window) ────
