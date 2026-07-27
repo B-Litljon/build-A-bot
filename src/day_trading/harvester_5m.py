@@ -22,6 +22,25 @@ Usage:
 Environment Variables:
     ALPACA_API_KEY    — Alpaca API key
     ALPACA_SECRET_KEY — Alpaca API secret
+
+Step 1 of the (dormant) V4.0 day-trade experiment. Fetches TWO datasets
+because this model reasons at two scales at once: 5-minute bars for the actual
+decision, daily bars for "how big is a normal day for this stock".
+
+Glossary:
+    DAY_TRADE_UNIVERSE -- the 7-symbol basket this experiment used.
+    DAYS_BACK -- 365 trading days of 5-minute history.
+    DAILY_WARMUP_DAYS -- 30 EXTRA days of daily bars beyond that window. Needed
+        because a 14-period daily volatility measure must already be warm on the
+        very first 5-minute training bar; without the padding the earliest rows
+        would carry null daily context and be dropped.
+    TIMEFRAME_5MIN / TIMEFRAME_DAILY -- the two bar sizes fetched.
+    DATA_FEED -- IEX (free tier), so volume figures are partial.
+    _FILE_PREFIX -- "dt_", namespacing every artifact so this experiment can
+        never collide with the main scalper's data.
+    _RAW_DIR -- data/raw/, output location.
+
+Writes: data/raw/dt_<SYMBOL>_5min.parquet and data/raw/dt_<SYMBOL>_daily.parquet
 """
 
 from __future__ import annotations

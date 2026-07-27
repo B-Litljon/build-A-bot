@@ -10,6 +10,28 @@ Usage:
 Outputs:
     - data/drift_report.json: Regime-specific drift analysis
     - Console: Human-readable drift summary
+
+Splits performance by volatility band rather than reporting one average. A
+model can look fine overall while being badly wrong in exactly the conditions
+that matter -- averaging hides that; bucketing exposes it.
+
+Historical note: this is where live_orchestrator's ATR_KILL_SWITCH_THRESHOLD
+(0.5204) came from -- the high-volatility band where calibration broke down.
+
+⚠️ Part of the dormant Alpaca replay pipeline. The current drift tool is
+scripts/probe_model.py, which compares live feature distributions against a
+saved training snapshot and needs no replay data at all.
+
+Glossary:
+    EVALUATION_PATH / SIGNAL_LEDGER_PATH / BARS_PATH -- inputs under data/;
+        note the ledger is expected as PARQUET here while resolver.py writes
+        CSV, so these two are not interchangeable.
+    OUTPUT_PATH -- data/drift_report.json, the only file written.
+    CALIBRATION_TOLERANCE -- 0.20. If predicted win rate and actual win rate
+        diverge by more than 20% within a volatility band, that band is flagged
+        and a safety switch is recommended.
+    regime -- here simply a volatility band (bucketed ATR), NOT the hidden-state
+        model in src/ml/regimes/. Same word, different meaning.
 """
 
 from __future__ import annotations

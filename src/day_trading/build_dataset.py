@@ -34,6 +34,20 @@ for all symbols.  Its _precompute() method uses `.over("symbol")` for
 gap_pct shift arithmetic, so it correctly handles the full multi-symbol
 table.  Each per-symbol call to `.generate()` then joins only the daily
 rows relevant to that symbol via `by="symbol"` in join_asof.
+
+Step 2 of the dormant V4.0 day-trade experiment: raw bars in, one model-ready
+training table out. Runs the feature generators and the target labeller per
+symbol, then concatenates.
+
+Glossary:
+    UNIVERSE -- the symbol list processed (matches harvester_5m's basket).
+    _RAW_DIR / _PROCESSED_DIR -- data/raw/ (input) and data/processed/ (output).
+    OUTPUT_PATH -- data/processed/dt_training_data.parquet, the single output.
+    _METADATA_COLS -- columns kept alongside the features for inspection and
+        joining (timestamps, symbol, prices) but NOT fed to the model.
+    Per-symbol processing -- each symbol's features and labels are computed
+        independently before concatenation, so one symbol's history can never
+        leak into another's indicators.
 """
 
 from __future__ import annotations

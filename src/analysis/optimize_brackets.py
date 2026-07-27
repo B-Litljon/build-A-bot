@@ -7,6 +7,26 @@ combinations against real Angel/Devil signals on recent OOS data.
 
 Usage (from project root):
     python -m src.analysis.optimize_brackets
+
+Offline parameter sweep, not part of live trading. Holds the model's signals
+fixed and asks only "what stop/target/hold would have made the most of them?"
+
+⚠️ Reading this output as a prediction is the classic trap: sweeping 100
+combinations against one fixed history and keeping the best is curve-fitting.
+Treat the winner as a hypothesis to test on fresh data, not a setting to adopt.
+MIN_TRADES exists to blunt the worst of it.
+
+Glossary:
+    SL_MULTIPLIERS / TP_MULTIPLIERS / MAX_HOLD_OPTIONS -- the grid:
+        4 stop widths x 5 target widths x 5 hold limits = 100 combinations,
+        each simulated against every signal.
+    ANGEL_THRESHOLD / DEVIL_THRESHOLD -- 0.40 / 0.50, held FIXED. Only bracket
+        geometry is swept; the model's opinions are the input, not the variable.
+    MODEL_PATHS -- candidate model locations, tried in order.
+    TICKERS -- the legacy 5-symbol equities basket.
+    MIN_TRADES -- 10. Combinations producing fewer trades are discarded, since
+        a handful of lucky wins otherwise tops the table.
+    _HDR / _SEP -- result-table formatting only.
 """
 
 from __future__ import annotations

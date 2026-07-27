@@ -7,6 +7,29 @@ for the Random Forest model on imbalanced data.
 
 Usage:
     python src/analysis/optimize_threshold.py
+
+Offline sweep of the decision cut-off. On imbalanced data the default 0.50 is
+rarely right -- if only 1 bar in 20 is a genuine opportunity, demanding 50%
+confidence rejects nearly everything.
+
+⚠️ OLDEST script in src/analysis: single-model (pre-Angel/Devil), fixed
+percentage brackets, and its own hardcoded FEATURE_COLS. The live equivalent of
+this job is retrainer._find_optimal_threshold, which sweeps per retrain and
+writes threshold.json.
+
+Glossary:
+    PROJECT_ROOT / DATA_PATH / MODEL_PATH -- resolved paths to
+        data/processed/training_data.parquet and the old
+        src/ml/models/rf_model.joblib.
+    SPLIT_DATE -- 2024-01-01. Everything before is training, after is test.
+        A DATE split, not a random one: shuffling time series lets the model
+        learn from its own future.
+    FEATURE_COLS -- this script's OWN hardcoded feature list, independent of
+        the current pipeline's. Verify it still matches before trusting output.
+    TP_MULT / SL_MULT -- 1.005 / 0.998, i.e. +0.5% / -0.2% fixed brackets.
+        Legacy percentages, not the volatility-scaled brackets used now.
+    TIMEOUT_BARS -- 15 bars before an unresolved trade is abandoned.
+    THRESHOLDS -- the candidate cut-offs swept, 0.30 to 0.50.
 """
 
 import sys
