@@ -5,8 +5,9 @@ spinning up Alpaca clients, models, or websocket streams. SymbolContext and
 LiveOrchestrator are constructed via ``__new__`` to bypass their heavy
 ``__init__`` chains; only the attributes the handler reads are populated.
 
-Two suites live here: the original state-machine tests, and the thread-ownership
-regression tests added 2026-07-26 with the concurrency fix.
+Three suites live here: the original state-machine tests, the thread-ownership
+regression tests added 2026-07-26 with the concurrency fix, and the
+trade-persistence regression tests added 2026-07-27.
 
 Glossary:
     __new__ construction -- SymbolContext and LiveOrchestrator are built without
@@ -30,16 +31,28 @@ Glossary:
         mocked models and broker.
     natr_14 = 0.05 -- chosen so the volatility kill switch passes AND the
         minimum-stop floor fires, exercising both paths in one cycle.
+    TestTradePersistence -- pins the ownership rule that whoever writes
+        authoritative position state persists it. Uses the REAL _save_state
+        against a real file in a temp cwd (STATE_FILE is a relative path), so
+        assertions are about the file the live bot would actually write rather
+        than about a mock having been called.
+    fill_lands_during_submission -- the fast-fill simulation: asyncio.to_thread
+        is patched so the BUY fill is processed on the loop while
+        _handle_signal is still awaiting the submission, which is the real
+        ordering that lets a stale requested-qty clobber the filled qty.
 """
 
 import asyncio
+import json
 import os
 import sys
+import tempfile
 import threading
 import types
 import unittest
 from collections import deque
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
@@ -50,6 +63,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 
 from execution.live_orchestrator import (  # noqa: E402
     MIN_HISTORY_BARS,
+    STATE_FILE,
     LiveOrchestrator,
     SymbolContext,
     SymbolState,
@@ -337,7 +351,12 @@ class TestThreadOwnership(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(ctx.sl_price, 100.0 - 100.0 * 0.0015, places=6)
         self.assertEqual(ctx.entry_qty, 95.0)  # capped by cash*0.95/price
         self.assertIsNotNone(ctx.htf_cache)
-        orch._save_state.assert_called_once()
+        # No persist on this path: the symbol is still PENDING and
+        # _save_state serializes only IN_TRADE symbols, so a call here could
+        # never record the trade. Persistence is owned by the fill handler
+        # (see TestTradePersistence). This previously asserted
+        # assert_called_once, which pinned the no-op save as if it worked.
+        orch._save_state.assert_not_called()
 
     async def test_htf_cache_propagates_on_angel_reject(self):
         """A cold-path HTF recompute must reach ctx even when the Angel
@@ -369,6 +388,170 @@ class TestThreadOwnership(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ctx.htf_cache.htf_rsi_14, 55.0)
         self.assertEqual(ctx.last_atr, 0.05)
         self.assertIsNone(ctx.last_conviction)
+
+
+class TestTradePersistence(unittest.IsolatedAsyncioTestCase):
+    """Regression tests for the trade-persistence seam (2026-07-27).
+
+    _save_state serializes only IN_TRADE symbols, and _load_state uses that
+    file on startup to re-inject SL/TP for positions Alpaca still shows open.
+    For crypto the software watchdog is the ONLY exit mechanism, so a position
+    missing from the file restarts unprotected.
+
+    These use the REAL _save_state against a real file in a temp working
+    directory, so they assert on the artifact the live bot would actually
+    write rather than on a mock having been called.
+    """
+
+    def setUp(self) -> None:
+        # STATE_FILE is a relative path, so chdir redirects the real write.
+        self._tmp = tempfile.TemporaryDirectory()
+        self._prev_cwd = os.getcwd()
+        os.chdir(self._tmp.name)
+
+    def tearDown(self) -> None:
+        os.chdir(self._prev_cwd)
+        self._tmp.cleanup()
+
+    @staticmethod
+    def _saved() -> dict:
+        """Parse active_trades.json; {} when it was never written."""
+        path = Path(STATE_FILE)
+        if not path.exists():
+            return {}
+        with open(path) as fh:
+            return json.load(fh)
+
+    @staticmethod
+    def _bar(end_ts: datetime) -> types.SimpleNamespace:
+        return types.SimpleNamespace(
+            symbol="BTC/USD",
+            timestamp=end_ts,
+            open=100.0,
+            high=100.5,
+            low=99.5,
+            close=100.0,
+            volume=10.0,
+        )
+
+    def _persisting_orch(self, ctx, features_df=None):
+        """Orchestrator with the REAL _save_state bound to it."""
+        if features_df is None:
+            orch = _make_orch(ctx)
+        else:
+            orch = _make_inference_orch(ctx, features_df)
+            orch._enter_cooling = AsyncMock()
+        orch._save_state = types.MethodType(LiveOrchestrator._save_state, orch)
+        return orch
+
+    async def test_buy_fill_persists_trade_with_authoritative_qty(self):
+        """Symptom 1: a filled trade must reach active_trades.json.
+
+        Before the fix, _handle_signal's save ran while the symbol was still
+        PENDING (which _save_state filters out) and the fill branch never
+        saved at all — so a crash between the fill and the next unrelated
+        save left an open position invisible to _load_state.
+        """
+        end_ts = datetime(2026, 7, 26, 12, 3, tzinfo=timezone.utc)
+        ctx = _make_ctx()
+        ctx.aggregator.add_bar.return_value = True
+        ctx.aggregator.history_df = _make_history_df(MIN_HISTORY_BARS, end_ts)
+        orch = self._persisting_orch(ctx, _make_features_df(end_ts))
+
+        await orch._on_bar(self._bar(end_ts))
+
+        # Order submitted, but still PENDING — correctly not yet persisted.
+        orch._trading_client.submit_order.assert_called_once()
+        self.assertEqual(ctx.state, SymbolState.PENDING)
+        self.assertEqual(self._saved(), {})
+
+        # filled_qty deliberately differs from the submitted 95.0.
+        await orch._on_trade_update(
+            _make_event("fill", "BUY", filled_qty=93.5, filled_avg_price=100.25)
+        )
+
+        self.assertEqual(ctx.state, SymbolState.IN_TRADE)
+        saved = self._saved()
+        self.assertIn("BTC/USD", saved, "filled trade never reached the state file")
+        self.assertEqual(saved["BTC/USD"]["qty"], 93.5)
+        # The floored SL must persist too — it is what the watchdog monitors.
+        self.assertAlmostEqual(
+            saved["BTC/USD"]["sl_price"], 100.0 - 100.0 * 0.0015, places=6
+        )
+
+    async def test_fast_fill_during_await_is_not_clobbered(self):
+        """Symptom 2: ctx.lock is released across the submission await, so the
+        fill can be processed first. The post-await seed must not overwrite
+        the authoritative filled_qty with the requested qty."""
+        end_ts = datetime(2026, 7, 26, 12, 3, tzinfo=timezone.utc)
+        ctx = _make_ctx()
+        ctx.aggregator.add_bar.return_value = True
+        ctx.aggregator.history_df = _make_history_df(MIN_HISTORY_BARS, end_ts)
+        orch = self._persisting_orch(ctx, _make_features_df(end_ts))
+
+        fill = _make_event("fill", "BUY", filled_qty=93.5, filled_avg_price=100.25)
+
+        async def fill_lands_during_submission(fn, *args, **kwargs):
+            result = fn(*args, **kwargs)
+            if fn == orch._submit_entry_order:
+                # The fill is handled on the loop before _handle_signal resumes.
+                await orch._on_trade_update(fill)
+            return result
+
+        with patch("asyncio.to_thread", fill_lands_during_submission):
+            await orch._on_bar(self._bar(end_ts))
+
+        self.assertEqual(ctx.state, SymbolState.IN_TRADE)
+        self.assertEqual(
+            ctx.entry_qty, 93.5, "requested qty clobbered the authoritative fill"
+        )
+        self.assertEqual(self._saved()["BTC/USD"]["qty"], 93.5)
+
+    async def test_partial_then_terminal_fill_records_final_qty(self):
+        """Symptom 3: the BUY branch required PENDING, so a partial_fill
+        flipped state to IN_TRADE and the terminal fill was then skipped
+        entirely — the final cumulative qty and average price were lost."""
+        ctx = _make_ctx(state=SymbolState.PENDING)
+        ctx.sl_price = 99.0
+        ctx.tp_price = 105.0
+        orch = self._persisting_orch(ctx)
+
+        await orch._on_trade_update(
+            _make_event("partial_fill", "BUY", filled_qty=40.0, filled_avg_price=100.0)
+        )
+        self.assertEqual(ctx.state, SymbolState.IN_TRADE)
+        self.assertEqual(ctx.entry_qty, 40.0)
+        self.assertEqual(self._saved()["BTC/USD"]["qty"], 40.0)
+
+        # Alpaca reports filled_qty / filled_avg_price CUMULATIVELY, so the
+        # terminal event carries the final totals, not just the increment.
+        await orch._on_trade_update(
+            _make_event("fill", "BUY", filled_qty=100.0, filled_avg_price=101.5)
+        )
+        self.assertEqual(ctx.state, SymbolState.IN_TRADE)
+        self.assertEqual(ctx.entry_qty, 100.0, "terminal fill was skipped")
+        self.assertEqual(ctx.entry_price, 101.5)
+        self.assertEqual(self._saved()["BTC/USD"]["qty"], 100.0)
+
+    async def test_cancel_removes_entry_from_state_file(self):
+        """Requirement 2: the entry must leave the file the moment the symbol
+        leaves IN_TRADE, or _load_state would re-inject SL/TP on restart for a
+        position that no longer exists."""
+        ctx = _make_ctx(state=SymbolState.IN_TRADE)
+        ctx.sl_price = 99.0
+        ctx.tp_price = 105.0
+        ctx.entry_qty = 10.0
+        orch = self._persisting_orch(ctx)
+
+        orch._save_state()
+        self.assertIn("BTC/USD", self._saved())
+
+        await orch._on_trade_update(_make_event("canceled", "BUY"))
+
+        self.assertEqual(ctx.state, SymbolState.FLAT)
+        self.assertNotIn(
+            "BTC/USD", self._saved(), "canceled trade left stale entry in state file"
+        )
 
 
 if __name__ == "__main__":

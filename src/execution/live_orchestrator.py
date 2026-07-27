@@ -128,6 +128,20 @@ Glossary:
 
     ── persistence and display ──
     STATE_FILE -- "active_trades.json", so a restart can recover open trades.
+        _load_state() re-injects SL/TP from it for any symbol Alpaca still
+        shows open, which for crypto is the ONLY way the watchdog learns the
+        exit levels again -- a position missing from this file restarts
+        unprotected.
+    persistence ownership rule -- whoever writes authoritative state persists
+        it. _save_state() serializes only IN_TRADE symbols, so a caller that
+        runs while the symbol is PENDING cannot record it. The writes that
+        matter therefore persist from _on_trade_update: the BUY fill branch
+        (which owns entry_price/entry_qty) and the cancel/expire/reject branch
+        (which removes the entry as it leaves IN_TRADE). Terminal SELL fills
+        persist inside _enter_cooling.
+    persist_needed -- local flag in _on_trade_update, set inside ctx.lock when
+        authoritative state changed so the file write happens AFTER the lock
+        is released, keeping blocking I/O out of the critical section.
     DASHBOARD_REFRESH_INTERVAL -- 1.0s refresh of the terminal dashboard.
     MAX_ACTIVITY_LOG -- 5, the number of recent events shown.
     DEFAULT_SYMBOLS -- the fallback symbol list when none is supplied.
@@ -621,10 +635,16 @@ class LiveOrchestrator:
         """
         Serialize every IN_TRADE symbol's SL, TP, and qty to STATE_FILE.
 
-        Called after a successful market buy and after every trade close so
-        the file always reflects the current live positions.  Failures are
-        logged as warnings — a missing persist is recoverable; a crash in
-        this path must not hide the underlying trade activity.
+        Called from the paths that write authoritative position state, so the
+        file always reflects the current live positions: the BUY fill branch
+        of _on_trade_update, its cancel/expire/reject branch, and
+        _enter_cooling on a terminal SELL.  Failures are logged as warnings —
+        a missing persist is recoverable; a crash in this path must not hide
+        the underlying trade activity.
+
+        NOTE: only IN_TRADE symbols are serialized, so calling this while a
+        symbol is still PENDING is a no-op for that symbol.  Callers must
+        persist *after* the transition to IN_TRADE, not before it.
         """
         try:
             payload: Dict[str, dict] = {}
@@ -1480,14 +1500,21 @@ class LiveOrchestrator:
         if result.success:
             # Apply the thread's results to SymbolContext here, on the event
             # loop: the floored SL (the watchdog must monitor the same level
-            # the position was sized against) and the pre-fill qty seed for
-            # _save_state (authoritative qty arrives with the fill event).
+            # the position was sized against) and the pre-fill qty seed.
             async with ctx.lock:
                 if result.adjusted_sl is not None:
                     ctx.sl_price = result.adjusted_sl
-                ctx.entry_qty = result.submitted_qty
-            # Persist immediately so a restart mid-trade can recover
-            self._save_state()
+                # Seed the qty ONLY while still PENDING. ctx.lock is released
+                # across the await above, so the fill event may already have
+                # been processed and written the authoritative filled_qty —
+                # which differs from the requested qty on a partial fill or
+                # fractional rounding. Never clobber it with the request.
+                if ctx.state == SymbolState.PENDING:
+                    ctx.entry_qty = result.submitted_qty
+            # No _save_state() here by design: on the normal path the symbol
+            # is still PENDING, and _save_state persists only IN_TRADE
+            # symbols, so the call could never record this trade. Persistence
+            # belongs to the fill handler, which owns entry_price/entry_qty.
         else:
             # REST call failed — roll back to FLAT so the next bar can retry
             async with ctx.lock:
@@ -1739,30 +1766,54 @@ class LiveOrchestrator:
                 ctx.state.name,
             )
 
+            # Set inside a lock when authoritative state changed; the actual
+            # write happens after the lock is released (see end of handler).
+            persist_needed = False
+
             # ----------------------------------------------------------------
             # Fill -> IN_TRADE (BUY entry) or COOLING (terminal SELL)
             # ----------------------------------------------------------------
             if event_type in ("fill", "partial_fill"):
                 order_side: str = str(getattr(order, "side", "")).upper()
                 async with ctx.lock:
-                    if order_side == "BUY" and ctx.state == SymbolState.PENDING:
-                        ctx.state = SymbolState.IN_TRADE
+                    if order_side == "BUY" and ctx.state in (
+                        SymbolState.PENDING,
+                        SymbolState.IN_TRADE,
+                    ):
+                        # IN_TRADE is accepted so a terminal fill following a
+                        # partial_fill still lands. Alpaca's filled_qty /
+                        # filled_avg_price are CUMULATIVE on the order object,
+                        # so the later event carries the final totals and the
+                        # refresh below is always the more correct value.
+                        was_pending = ctx.state == SymbolState.PENDING
+                        if was_pending:
+                            ctx.state = SymbolState.IN_TRADE
                         ctx.entry_price = float(
                             getattr(order, "filled_avg_price", 0.0) or 0.0
                         )
                         ctx.entry_qty = float(getattr(order, "filled_qty", 0.0) or 0.0)
-                        logger.info(
-                            "[%s] State -> IN_TRADE | filled=%.4f | qty=%.4f",
-                            symbol,
-                            ctx.entry_price,
-                            ctx.entry_qty,
-                        )
-                        self._log_activity(
-                            symbol,
-                            f"Filled @ ${ctx.entry_price:.2f} | "
-                            f"Qty: {ctx.entry_qty:.4f}",
-                            "success",
-                        )
+                        persist_needed = True
+                        if was_pending:
+                            logger.info(
+                                "[%s] State -> IN_TRADE | filled=%.4f | qty=%.4f",
+                                symbol,
+                                ctx.entry_price,
+                                ctx.entry_qty,
+                            )
+                            self._log_activity(
+                                symbol,
+                                f"Filled @ ${ctx.entry_price:.2f} | "
+                                f"Qty: {ctx.entry_qty:.4f}",
+                                "success",
+                            )
+                        else:
+                            logger.info(
+                                "[%s] BUY %s while IN_TRADE | filled=%.4f | qty=%.4f",
+                                symbol,
+                                event_type,
+                                ctx.entry_price,
+                                ctx.entry_qty,
+                            )
                     elif (
                         order_side == "SELL"
                         and event_type == "fill"
@@ -1797,12 +1848,21 @@ class LiveOrchestrator:
                         # Clear so a same-bar retry signal isn't silently
                         # dropped by the dedup gate in _handle_signal.
                         ctx.last_client_order_id = None
+                        persist_needed = True
                         logger.info(
                             "[%s] State -> FLAT | reason=%s",
                             symbol,
                             event_type,
                         )
                         self._log_activity(symbol, f"Order {event_type}", "warning")
+
+            # Lock released — persist the authoritative state written above.
+            # Whoever writes authoritative state persists it: a BUY fill so a
+            # restart can re-inject SL/TP, and a cancel/expire/reject so the
+            # entry leaves the file the moment it leaves IN_TRADE.
+            # (Terminal SELL fills persist inside _enter_cooling.)
+            if persist_needed:
+                self._save_state()
 
         except Exception as exc:
             logger.error("Error in _on_trade_update: %s", exc, exc_info=True)
