@@ -3,6 +3,29 @@ from unittest.mock import MagicMock, patch
 import sys
 from pathlib import Path
 
+"""
+Tests for the provider's raw tick callback -- the hook the scalper's software
+stop-loss depends on.
+
+This callback runs inline on the blocking stream thread for EVERY quote, so the
+contract is unusually strict: it must be fast, it must fire before the bar path,
+and it must never be able to take the feed down.
+
+Glossary:
+    test_tick_callback_receives_correct_args -- the (symbol, bid, ask) contract.
+    test_tick_callback_fires_before_bar_flush -- ORDER MATTERS: the stop check
+        must see the quote before any bar-close work runs, or an exit is delayed
+        by up to a whole bar.
+    test_no_tick_callback_bar_path_unchanged -- the hook is optional; without
+        one, bar handling must behave exactly as before it existed.
+    test_missing_bids_asks_no_tick_callback -- a quote with no prices is skipped
+        rather than passed on as zeros.
+    test_tick_callback_exception_logged_continues -- THE IMPORTANT ONE: a raising
+        callback is logged and the stream keeps running. An exception escaping
+        here would kill the price feed, which with software-enforced stops means
+        an unwatched open position.
+"""
+
 # Add src to path
 project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root / "src"))

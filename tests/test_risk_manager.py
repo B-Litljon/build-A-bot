@@ -2,6 +2,36 @@ import unittest
 import sys
 from pathlib import Path
 
+"""
+Tests for RiskManager -- the bracket floors and the three chop gates.
+
+The most safety-critical test file in the suite: these pin the rules that decide
+whether a trade is allowed at all. A regression here does not raise an error, it
+silently starts taking trades the system was built to refuse.
+
+Glossary:
+    TestRiskManagerForex -- the static floors, one per instrument family.
+        Verifies the minimum stop distance is measured in the right unit:
+        percent for equities, pips for currency pairs, and percent again for
+        metals (a 0.0001 pip on gold near 2700 would never fire).
+    test_metal_detection_does_not_catch_fiat -- guards the string matching that
+        separates XAU/XAG from ordinary six-letter currency pairs.
+    TestCoupledKeff -- the volatility-coupled cost multiplier. Pins that it does
+        nothing below median volatility, that "tighten" and "loosen" move in
+        opposite directions above it, and that the result is clipped at 1.0 so
+        a passing trade's cost can never exceed its own stop distance.
+    TestDynamicHybridFloor -- the live gate combination.
+    test_cost_gate_proxy_fallback_when_spread_stale -- when the live spread is
+        too old to trust, the volatility-scaled estimate must be used instead.
+    test_cold_start_bypasses_regime_gate -- with too little history the regime
+        gate must stand down rather than veto everything on a half-filled
+        buffer; a just-restarted bot must not be frozen.
+    test_extreme_rollover_spread_vetoes_safely -- the rollover blowout case
+        that Gate C exists for.
+    test_no_regime_series_uses_static_floor -- without volatility context the
+        manager falls back to the legacy floor rather than failing.
+"""
+
 # Add src to path
 project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root / "src"))

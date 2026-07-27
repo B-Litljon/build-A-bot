@@ -5,6 +5,19 @@ the promoted model in models/forex/. These tests pin that contract:
   - default output dir is models/<asset_class> (the production location),
   - RETRAIN_MODEL_DIR redirects it while leaving asset_class unchanged,
   - an actual save lands ONLY in the override dir.
+
+Why this matters more than it looks: RETRAIN_MODEL_DIR is the isolation
+mechanism for experiments. If it leaked, a side experiment would overwrite the
+promoted model that a live bot hot-reloads -- silently swapping the running
+strategy's brain for an unvalidated candidate.
+
+Glossary:
+    asset_class stays unchanged -- the override redirects ONLY the save
+        destination. Every feature, gate and hyperparameter path stays
+        identical, so the side model is a fair comparison rather than a
+        different experiment.
+    "lands ONLY in the override dir" -- the assertion that matters: the
+        production directory must be untouched afterwards.
 """
 import json
 import os

@@ -4,6 +4,32 @@ These tests exercise the state transitions in `_on_trade_update` without
 spinning up Alpaca clients, models, or websocket streams. SymbolContext and
 LiveOrchestrator are constructed via ``__new__`` to bypass their heavy
 ``__init__`` chains; only the attributes the handler reads are populated.
+
+Two suites live here: the original state-machine tests, and the thread-ownership
+regression tests added 2026-07-26 with the concurrency fix.
+
+Glossary:
+    __new__ construction -- SymbolContext and LiveOrchestrator are built without
+        running __init__, so no Alpaca client, model or websocket is needed.
+        Only the attributes under test are populated.
+    TestThreadOwnership -- pins the ownership contract: the event loop is the
+        SOLE writer of SymbolContext state.
+    __setattr__ instrumentation -- the technique. SymbolContext.__setattr__ is
+        patched to record (attribute, thread id) for every write, then the test
+        drives a real sealed-bar -> inference -> signal -> order cycle and
+        asserts every recorded write happened on the loop thread. This catches
+        a whole CLASS of bug rather than one instance.
+    vacuity guard -- the test also asserts all eight expected fields were
+        actually written. Without it, a test that accidentally exercised
+        nothing would still pass.
+    negative proof -- the instrumentation was validated by temporarily
+        injecting a thread-side write and confirming both tests FAILED, then
+        removing it. An assertion never observed failing is not evidence.
+    _make_history_df / _make_features_df / _make_inference_orch -- builders for
+        synthetic bars, a one-row feature frame, and an orchestrator with
+        mocked models and broker.
+    natr_14 = 0.05 -- chosen so the volatility kill switch passes AND the
+        minimum-stop floor fires, exercising both paths in one cycle.
 """
 
 import asyncio

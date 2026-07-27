@@ -3,6 +3,23 @@ from unittest.mock import MagicMock, patch
 import sys
 from pathlib import Path
 
+"""
+Cross-broker execution safety checks.
+
+Three unrelated hazards, grouped because each one is a case where a wrong
+answer costs money rather than raising an error.
+
+Glossary:
+    test_alpaca_rebalance_gate -- the investor's deadband: a holding already
+        close enough to its target must NOT be traded, so the monthly rebalance
+        does not pay costs to correct trivial drift.
+    test_oanda_close_position_fill_parsing -- reads the actual filled size out
+        of the broker's close response. Assuming the requested size was filled
+        is how local state silently diverges from reality.
+    test_oanda_partial_fill_behavior -- a partial fill must leave the remainder
+        recorded as still held, not be rounded to flat.
+"""
+
 # Add src to path
 project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root / "src"))

@@ -6,6 +6,19 @@ Covers the five verification points from the implementation plan:
   1. Generator baseline parity with the training veto's expanding/rolling median.
   2. alpha_table=None → generate() is a bit-identical no-op.
   3. Veto mask prices instruments asymmetrically from the table.
+
+Glossary:
+    parity (point 1) -- the feature and the training-side veto must compute
+        baseline volatility the SAME way. If they diverge, the model sees a
+        different cost than the gate enforces.
+    bit-identical no-op (point 2) -- the safety guarantee: with no cost table,
+        output must be unchanged from before this feature existed, so models
+        predating the experiment are unaffected.
+    asymmetric pricing (point 3) -- a cheap instrument and an expensive one must
+        be judged by their own measured costs, not one shared assumption. This
+        is the entire point of the experiment.
+    cost_ratio -- see GLOSSARY.md; higher means the toll is large relative to
+        the move being targeted.
   4. clean_data interplay: the cost column drops no extra rows.
   5. Train/live golden parity: pooled multi-symbol path == single-symbol path.
 """

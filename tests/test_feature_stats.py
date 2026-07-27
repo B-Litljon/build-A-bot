@@ -1,4 +1,21 @@
-"""Tests for the feature-stats sidecar + PSI (src/ml/feature_stats.py)."""
+"""
+Tests for the feature-stats sidecar + PSI (src/ml/feature_stats.py).
+
+Covers both the artifact's shape and the PSI maths -- including the property
+that motivated the whole design: identical distributions must score near zero,
+and the null calibration must sit well above zero on ordinary autocorrelated
+data. Without that second fact the textbook thresholds would false-alarm
+constantly.
+
+Glossary:
+    pooled vs per_symbol -- both populations are written; drift diagnosis needs
+        per-symbol because instruments sit at different baseline levels.
+    continuous vs categorical binning -- features with few distinct values
+        (session flags, hour_of_day) get one bin per value instead of deciles.
+    null_psi -- the calibration quantiles; see GLOSSARY.md (PSI).
+    round-trip -- stats are saved and reloaded to confirm the JSON artifact
+        survives serialisation unchanged.
+"""
 
 from __future__ import annotations
 

@@ -3,6 +3,17 @@
 Covers the retrain-log parser and the two-step confirm-token flow for the
 start/stop control tools — all without spawning or killing a real process
 (the side-effecting helpers are monkeypatched).
+
+Glossary:
+    two-step confirm token -- the safety mechanism under test: the first call
+        returns a preview plus a random token and does NOTHING; acting requires
+        a second call carrying that token with identical arguments. These tests
+        pin that a wrong, missing, or reused token cannot act -- i.e. an
+        assistant cannot start or stop the live bot by accident.
+    monkeypatched helpers -- the process-touching functions are replaced, so
+        the tests never spawn or kill anything real. Running these against a
+        live soak must remain harmless.
+    retrain-log parser -- extracts progress and verdict from a retrain log.
 """
 import sys
 import time

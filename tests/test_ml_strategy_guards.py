@@ -1,6 +1,22 @@
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
+"""
+Tests for MLStrategy's stale-bar guard.
+
+Feature cleaning drops rows with missing values. If the row dropped happens to
+be the NEWEST bar, the frame's last row is an older bar -- and scoring that
+against the current price means trading on stale information while believing it
+is current. The guard compares the two timestamps and returns None instead.
+
+Glossary:
+    TestStaleFeatureGuard -- the two halves of that contract.
+    test_signal_skipped_when_latest_bar_dropped -- mismatched timestamps must
+        produce no signal, even if the model would have approved.
+    test_matching_timestamps_proceed_to_prediction -- and the guard must not
+        block the normal case.
+"""
+
 import sys
 from pathlib import Path
 

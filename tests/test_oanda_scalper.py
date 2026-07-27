@@ -5,6 +5,38 @@ from unittest.mock import MagicMock, patch, ANY
 import sys
 from pathlib import Path
 
+"""
+Tests for OandaScalperOrchestrator -- the live forex bot's control flow.
+
+The largest test file here, and it concentrates on the failure paths rather than
+the happy path, because with software-enforced stops the dangerous states are
+"we think we're flat but aren't" and "we tried to close and it didn't work".
+
+Glossary:
+    FakeSignal -- a minimal stand-in for strategies.base.Signal, so tests can
+        drive the orchestrator without loading real models.
+    test_rapid_breach_ticks_close_once -- quotes arrive far faster than a close
+        completes; a burst of breaching ticks must produce ONE close, not one
+        per tick.
+    test_close_not_called_synchronously_in_tick -- the tick callback runs on the
+        provider's stream thread and must return in microseconds, so the close
+        must be dispatched to the event loop rather than executed inline.
+    test_watchdog_close_failure_retries_then_parks -- when closing keeps
+        failing, the position is "parked" rather than forgotten. Forgetting it
+        would mean an open position nothing is watching.
+    test_no_entry_on_close_failed_position -- a symbol in that parked state must
+        not be re-entered.
+    test_boot_reconcile_* -- on startup the broker is asked what is actually
+        open: an orphan left by a crashed process is flattened, a flat account
+        is a no-op, and a failed sync ABORTS rather than proceeding blind.
+    test_reversal_records_authoritative_units -- after flipping direction the
+        BROKER's reported size is recorded, not the size that was requested.
+    test_failed_flip_restores_old_position_state -- a failed reversal must roll
+        local state back, so it still reflects what is really held.
+    test_tick_watchdog_ignores_reversing_position -- mid-flip the stop/target
+        are meaningless and must not fire.
+"""
+
 # Suppress unawaited-coroutine RuntimeWarning when mocking asyncio.run_coroutine_threadsafe
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 

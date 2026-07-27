@@ -1,3 +1,21 @@
+"""
+Checks that FactoryOrchestrator's warm-up history is injected into the
+aggregators before the live feed starts.
+
+⚠️ NOT COLLECTED BY PYTEST (verified 2026-07-27, glossary pass). pyproject.toml
+sets testpaths = ["tests"], but collection also requires the default
+``test_*.py`` filename pattern, and this file is ``verify_warmup.py``. Its test
+therefore never runs in the suite -- the run reports 114 collected, and this one
+is not among them. Rename to ``test_warmup.py`` to include it. Flagged, not
+changed (renaming is a code change, and the suite count would move).
+
+Glossary:
+    TestWarmupSequence -- the single test case.
+    test_warmup_injection -- asserts fetched history reaches the aggregators
+        before subscribing, so the first live bar is scored against warm
+        indicators rather than an empty buffer.
+"""
+
 import asyncio
 import unittest
 from unittest.mock import MagicMock, patch, AsyncMock

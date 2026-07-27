@@ -1,4 +1,20 @@
-"""Unit tests for CompositeFundamentalProvider — no network required."""
+"""
+Unit tests for CompositeFundamentalProvider — no network required.
+
+Pins the chaining contract: sources are tried in order, the first non-empty
+answer wins, and a source that raises is treated as a miss rather than an error.
+That last rule is what stops one broken vendor from taking down a monthly
+rebalance.
+
+Glossary:
+    first-non-empty -- resolved per METHOD CALL, not per provider, so one
+        symbol's company info and its financials may legitimately come from
+        different sources.
+    empty list -- a legal configuration meaning "no fundamentals"; every method
+        answers empty rather than failing.
+    no network -- every provider is a stub, so these tests are deterministic
+        and fast.
+"""
 
 import sys
 import unittest
