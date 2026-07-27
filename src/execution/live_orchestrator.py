@@ -48,6 +48,91 @@ Dashboard Features:
 ATR Kill Switch Threshold: 0.5204 (from drift_report.json, High-regime trigger)
 Cooling-off period: 5 minutes after any bracket closes
 Schema failure policy: catch → Discord alert → drop bar → symbol stays FLAT
+
+STATUS: this is the ALPACA (equities + crypto) orchestrator. It is NOT the
+currently-live bot -- the live one is oanda_scalper_orchestrator.py. Kept
+working and tested; `src/execution/__init__.py` deliberately does not export it.
+
+THREADING CONTRACT (the thing most likely to bite you here): the asyncio event
+loop is the SOLE owner of every mutable field on SymbolContext. Worker
+functions offloaded with asyncio.to_thread receive immutable snapshots as
+arguments and RETURN frozen result objects; the loop applies them. Thread
+functions must never hold a reference to a SymbolContext. This is enforced by a
+regression test that instruments SymbolContext.__setattr__ and asserts every
+write happens on the loop thread.
+
+See GLOSSARY.md (angel/devil, bracket, NATR, sealed bar, watchdog, HTF).
+
+Glossary:
+    ── decision thresholds ──
+    ANGEL_THRESHOLD -- 0.40, stage one's bar for proposing a trade.
+    DEVIL_THRESHOLD -- 0.50, stage two's bar for approving it.
+    ATR_KILL_SWITCH_THRESHOLD -- 0.5204 (in NATR percent units). Above this,
+        volatility is judged too violent to trade and the bar is skipped
+        regardless of what the models think. A blunt safety net, not a model
+        output.
+
+    ── bracket sizing ──
+    SL_ATR_MULTIPLIER / TP_ATR_MULTIPLIER -- 0.5 and 3.0, stop and target as
+        multiples of recent volatility. Must match the retrainer's values.
+    MIN_SL_PCT -- 0.0015 (0.15%). A floor on stop distance; without it a
+        near-zero volatility reading produces an absurdly tight stop and a
+        collapsing position-size denominator.
+    ACCOUNT_RISK_PER_TRADE -- 0.02, risk 2% of equity per trade.
+
+    ── lifecycle ──
+    SymbolState -- FLAT (idle, can take a signal) -> PENDING (order sent,
+        awaiting fill) -> IN_TRADE (filled, brackets live) -> PENDING_EXIT
+        (exit sent) -> COOLING (timer running) -> FLAT.
+    COOLING_SECONDS -- 300. After any position closes the symbol sits out five
+        minutes, so one choppy stretch cannot trigger repeated re-entries.
+    SymbolContext -- all per-symbol runtime state. Loop-owned; see the
+        threading contract above.
+    ctx.lock -- per-symbol asyncio.Lock guarding state transitions, so two bars
+        cannot both claim a FLAT slot.
+
+    ── inference plumbing ──
+    InferenceOutcome -- frozen result returned by the inference thread:
+        signal, new_htf_cache, last_atr, last_conviction. The loop applies it.
+        Every return path, including rejections and the exception handler,
+        propagates new_htf_cache -- otherwise an early return would silently
+        discard the recomputed cache.
+    EntryOrderResult -- frozen result from the order thread: success,
+        adjusted_sl (after the MIN_SL_PCT floor), submitted_qty.
+    HTFCache -- frozen snapshot of the slower-timeframe features, so they are
+        recomputed only when a slow bar seals rather than on every fast bar.
+    HTF_CACHE_PERIOD_MINUTES -- 5. Must match the feature pipeline's HTF
+        timeframe or live features diverge from training ones.
+    cold path / warm path -- cold recomputes the HTF features from scratch when
+        a 5-minute boundary is crossed; warm injects the cached scalars. The
+        cache is read ONCE into a local snapshot before offloading, so the warm
+        path cannot mix values from two different periods.
+
+    ── history and warm-up ──
+    MIN_HISTORY_BARS -- 260, minimum bars before trading (sized for a 50-period
+        average on 5-minute bars).
+    HISTORY_SIZE -- 400 bars retained per aggregator.
+
+    ── execution ──
+    Smart Clock Gate -- equities are blocked outside regular trading hours;
+        crypto always passes.
+    CLOCK_CACHE_TTL -- 30.0 seconds of caching on the market-open check, so a
+        REST call is not made per bar.
+    Crypto vs equity orders -- equities get a real broker-side bracket
+        (target + stop attached); crypto gets a plain market buy plus the
+        software watchdog, because the venue does not support brackets.
+    Crypto Watchdog Loop -- 1-second poll comparing last_price against sl_price
+        and tp_price, issuing a manual exit on breach. This is why last_price
+        must always be the freshest tick and is never overwritten with an older
+        sealed-bar close.
+
+    ── persistence and display ──
+    STATE_FILE -- "active_trades.json", so a restart can recover open trades.
+    DASHBOARD_REFRESH_INTERVAL -- 1.0s refresh of the terminal dashboard.
+    MAX_ACTIVITY_LOG -- 5, the number of recent events shown.
+    DEFAULT_SYMBOLS -- the fallback symbol list when none is supplied.
+    Schema failure policy -- catch, alert to Discord, drop the bar, leave the
+        symbol FLAT. A malformed bar must never open a position.
 """
 
 from __future__ import annotations

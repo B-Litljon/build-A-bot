@@ -1,3 +1,54 @@
+"""
+The Factory orchestrator -- the smallest complete trading loop in the repo.
+
+Wires a data feed, a strategy, and the risk manager together on one asyncio
+loop, and enforces stops and targets in software. Alpaca-backed (crypto and
+equities). At 191 lines it is by far the clearest illustration of the shape all
+the orchestrators share; read this one first, then the OANDA one.
+
+The loop: bar arrives -> aggregate -> if a bar sealed, snapshot history and run
+the model on a worker thread -> if a Signal comes back and we are flat, size it
+and send the order -> a separate 1-second watchdog closes the position when
+price crosses a level.
+
+See GLOSSARY.md (sealed bar, bracket, watchdog, warm-up).
+
+Glossary:
+    FactoryOrchestrator -- the loop itself. Owns no trading logic: the strategy
+        decides, the risk manager sizes, this only sequences and executes.
+    aggregators -- one LiveBarAggregator per symbol, 1-minute bars, 400 bars of
+        history retained.
+    active_positions -- symbol -> {sl, tp, qty, order_id}. Presence in this dict
+        IS the "am I in a trade" flag; there is no separate state machine here,
+        unlike the other two orchestrators.
+    _locks -- one asyncio.Lock per symbol, so two bars for the same symbol
+        cannot both open a position.
+    Double-check under lock -- position sizing awaits broker calls, during
+        which another coroutine could have entered. _execute_buy therefore
+        re-checks active_positions AFTER acquiring the lock. Without that, a
+        burst of signals could open several positions in one symbol.
+    _shutdown_event -- set by SIGINT/SIGTERM, which is what makes Ctrl-C a
+        clean stop rather than an abort mid-order.
+
+    warm-up (lookback_minutes=300) -- 300 minutes of history are fetched and
+        replayed into the aggregators BEFORE the live feed starts. Without it
+        the first live bars would be scored against half-computed indicators.
+    _on_tick -- despite the name this receives BARS, not raw quotes. Returns
+        immediately unless add_bar() reports a sealed bar.
+    asyncio.to_thread(strategy.generate_signals) -- model inference is
+        CPU-bound and would stall the event loop, so it runs on a worker
+        thread. The thread receives a CLONE of the history, never live state.
+
+    _watchdog_loop -- SOFTWARE stop-loss and take-profit: polls once a second
+        and market-closes when the last known price crosses either level. The
+        broker is never given a native bracket order.
+    ⚠️ Watchdog resolution -- it reads the last SEALED BAR's close, so an exit
+        can lag by up to a bar and fills can differ from the level. The OANDA
+        orchestrator improves on this by checking live quotes instead.
+    _execute_sell -- market close, then removes the symbol from
+        active_positions.
+"""
+
 import asyncio
 import logging
 import signal

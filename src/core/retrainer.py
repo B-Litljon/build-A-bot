@@ -53,9 +53,14 @@ Glossary:
         two runs on the same data give the same model.
 
     SL_ATR_MULTIPLIER / TP_ATR_MULTIPLIER -- bracket width in units of the
-        instrument's own recent volatility: stop at 0.5x, target at 3.0x, i.e.
-        a 6:1 payoff. Must stay identical to the live orchestrators or the
-        model is trained on trades the bot would never take.
+        instrument's own recent volatility: stop at 0.5x, target at 3.0x (a
+        6:1 payoff). ⚠️ These are the EQUITIES/default values and are only
+        function defaults here -- get_asset_config() takes the real numbers
+        from RiskProfile.for_asset_class(), and the FOREX profile overrides
+        them to 1.0x / 2.0x (a 2:1 payoff). Check the profile, not these
+        constants, when reasoning about a forex run. Either way the value must
+        match the live orchestrator's or the model is trained on trades the bot
+        would never take.
     MAX_HOLD_BARS -- 45. A trade that reaches neither level within 45 bars is
         labelled a loss (timeout), because capital was tied up for nothing.
     SURVIVAL_BARS -- 5. The horizon for the Devil's survival label, below.

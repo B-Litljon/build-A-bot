@@ -12,6 +12,34 @@ Required environment variables:
 
 Scope of this module: state + close. Entry methods, fill-stream
 consumers, and watchdog wiring live in separate modules.
+
+Why NET position and not individual trades: US regulation (NFA) requires FIFO
+closing and forbids holding opposing positions in the same pair. Tracking one
+signed number per instrument makes those rules impossible to violate by
+construction, rather than something the code has to remember to check.
+
+Glossary:
+    OandaOrderManager -- owns the truth about what is currently held.
+    net position -- one signed unit count per instrument: positive is long,
+        negative is short, zero is flat. There is no concept of separate lots.
+    get_net_position / get_average_entry_price -- cached reads of that state;
+        the average entry price is the broker's number, not a locally computed
+        one.
+    sync_position -- refreshes local state from the broker. The broker is
+        always authoritative; local state is a cache.
+    close_position -- flattens an instrument. Raises OrderCloseError on broker
+        failure and LEAVES LOCAL STATE UNTOUCHED, so a failed close never makes
+        the bot believe it is flat when it is not. That asymmetry is
+        deliberate: believing you are flat while holding a position is far more
+        dangerous than the reverse.
+    submit_target_position -- expresses an order as "I want to end at N units"
+        rather than "buy N units". Idempotent in effect, which is what makes a
+        retry after an ambiguous network failure safe.
+    _to_oanda_symbol -- normalises 'EUR/USD' / 'EURUSD' / 'EUR_USD' to the
+        underscore form.
+    _state_lock -- guards the position cache; this class is touched from both
+        the event loop and worker threads.
+    OrderCloseError -- raised when the broker rejects a close.
 """
 
 import logging
