@@ -19,7 +19,7 @@ Architecture: asyncio.to_thread concurrency + Rich Dashboard
        │                                     crypto always passes
        ▼
   asyncio.to_thread(_run_inference)        ← CPU-bound RF offloaded to thread pool
-       │ Signal | None
+       │ InferenceOutcome (loop applies it)
        ▼
   [Volatility Kill Switch]                 ← natr_14 vs ATR_KILL_SWITCH_THRESHOLD
        │ passes
@@ -228,17 +228,21 @@ MAX_ACTIVITY_LOG: int = 5
 HTF_CACHE_PERIOD_MINUTES: int = 5  # Must match _HTF_TIMEFRAME in feature_pipeline.py
 
 
-@dataclass
+@dataclass(frozen=True)
 class HTFCache:
     """
     Stores the last computed HTF feature scalars for a single symbol.
 
     Lifecycle:
         - Created by _prime_htf_cache() immediately after warm-up completes.
-        - Refreshed by _run_inference() when bar_timestamp >= next_available_at
-          (cold path — full recompute via compute_indicators).
+        - Recomputed by _run_inference() when bar_timestamp >= next_available_at
+          (cold path — full recompute via compute_indicators); the new instance
+          is returned in InferenceOutcome and installed by the event loop.
         - On the warm path, its scalar values are injected as Polars literals,
           bypassing the group_by_dynamic + TA-Lib resample entirely.
+
+    Frozen: instances cross the loop/thread-pool boundary as snapshots and
+    must never be mutated — replace the whole object instead.
 
     All datetime fields are UTC-aware. No naive datetimes permitted.
     """
@@ -296,6 +300,38 @@ class HTFCache:
         )
 
 
+@dataclass(frozen=True)
+class InferenceOutcome:
+    """
+    Result of one thread-side inference pass.
+
+    _run_inference is a pure function: it receives immutable snapshots
+    (cloned history_df, frozen HTFCache) and returns this record; the event
+    loop (_on_bar) applies every field to SymbolContext.  A None field means
+    "no update".  new_htf_cache is populated whenever the cold path
+    recomputed HTF features — on signal, reject, veto, and error paths alike.
+    """
+
+    signal: Optional[Signal] = None
+    new_htf_cache: Optional[HTFCache] = None
+    last_atr: Optional[float] = None
+    last_conviction: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class EntryOrderResult:
+    """
+    Result of one thread-side entry submission.
+
+    _submit_entry_order never touches SymbolContext; the event loop
+    (_handle_signal) applies adjusted_sl and submitted_qty after the await.
+    """
+
+    success: bool
+    adjusted_sl: Optional[float] = None  # SL after the MIN_SL_PCT floor fired
+    submitted_qty: Optional[float] = None  # qty sent to the broker
+
+
 class SymbolState(Enum):
     """Lifecycle states for a single symbol's trading slot."""
 
@@ -315,10 +351,13 @@ class SymbolContext:
     """
     Holds all mutable state for a single tracked symbol.
 
-    Thread-safety note: `state` is read/written only from the asyncio event
-    loop (the lock is an asyncio.Lock).  Inference runs in a thread pool but
-    only *reads* the immutable `aggregator.history_df` snapshot; it never
-    mutates SymbolContext directly.
+    Ownership contract: every field is owned and mutated ONLY by the asyncio
+    event loop.  Worker threads (_run_inference, _submit_entry_order) receive
+    immutable snapshots as arguments (the cloned `history_df`, the frozen
+    `HTFCache`) and hand results back as frozen records (InferenceOutcome,
+    EntryOrderResult) which the event loop applies after the await; thread
+    functions must never hold a reference to SymbolContext.  `state`
+    transitions additionally happen under the per-symbol asyncio.Lock.
     """
 
     def __init__(self, symbol: str, is_crypto: bool) -> None:
@@ -1013,31 +1052,58 @@ class LiveOrchestrator:
             )
             return
 
+        # Snapshot the (frozen) HTF cache so the worker thread never reads a
+        # mid-swap SymbolContext — see the SymbolContext ownership contract.
+        htf_snapshot: Optional[HTFCache] = ctx.htf_cache
+
         # Offload CPU-bound inference — does NOT block the event loop
-        signal_result: Optional[Signal] = await asyncio.to_thread(
-            self._run_inference, symbol, history_snapshot
+        outcome: InferenceOutcome = await asyncio.to_thread(
+            self._run_inference, symbol, history_snapshot, htf_snapshot
         )
 
-        if signal_result is None:
+        # Apply the thread's results to SymbolContext here, on the event loop
+        if outcome.new_htf_cache is not None:
+            ctx.htf_cache = outcome.new_htf_cache
+        if outcome.last_atr is not None:
+            ctx.last_atr = outcome.last_atr
+        if outcome.last_conviction is not None:
+            ctx.last_conviction = outcome.last_conviction
+
+        if outcome.signal is None:
             return
 
         # All execution checks happen back in the event loop (state machine)
-        await self._handle_signal(ctx, signal_result)
+        await self._handle_signal(ctx, outcome.signal)
 
     # -----------------------------------------------------------------------
     # Inference (runs in thread pool — must be pure / no asyncio calls)
     # -----------------------------------------------------------------------
 
-    def _run_inference(self, symbol: str, history_df: pl.DataFrame) -> Optional[Signal]:
+    def _run_inference(
+        self,
+        symbol: str,
+        history_df: pl.DataFrame,
+        htf_cache: Optional[HTFCache],
+    ) -> InferenceOutcome:
         """
         Execute Angel -> Devil two-stage inference on the latest bar.
 
         Called via asyncio.to_thread; must NOT call any asyncio primitives.
+        Pure function per the SymbolContext ownership contract: reads only
+        the snapshots passed in (cloned history_df, frozen htf_cache) and
+        never touches SymbolContext — the event loop applies the outcome.
 
-        Returns a Signal on joint Angel+Devil approval, or None.
+        The outcome carries a Signal on joint Angel+Devil approval, plus a
+        new_htf_cache whenever the cold path recomputed HTF features — on
+        every return path, including rejects and errors, so the warm-path
+        optimization survives early returns.
         Any exception is caught, logged, and reported to Discord (via a
         thread-safe requests.post call inside NotificationManager).
         """
+        # Must survive every early return below, including the exception
+        # handler — initialise before the try.
+        new_htf_cache: Optional[HTFCache] = None
+
         try:
             # ----------------------------------------------------------------
             # Schema validation — catch mismatches before they corrupt numpy
@@ -1058,20 +1124,18 @@ class LiveOrchestrator:
             if hasattr(bar_timestamp, "tzinfo") and bar_timestamp.tzinfo is None:
                 bar_timestamp = bar_timestamp.replace(tzinfo=timezone.utc)
 
-            ctx = self._contexts[symbol]
-
             # Cold path: cache absent, stale, or seal boundary crossed.
             # Handles: cold start, overnight gaps, any gap > 5m, session open.
             if (
-                ctx.htf_cache is None
-                or bar_timestamp >= ctx.htf_cache.next_available_at
+                htf_cache is None
+                or bar_timestamp >= htf_cache.next_available_at
             ):
                 logger.debug(
                     "[%s] HTF cold path | bar_ts=%s | next_available_at=%s",
                     symbol,
                     bar_timestamp.isoformat(),
-                    ctx.htf_cache.next_available_at.isoformat()
-                    if ctx.htf_cache
+                    htf_cache.next_available_at.isoformat()
+                    if htf_cache
                     else "None",
                 )
                 # Full recompute — TA-Lib resample on all 400 1m bars
@@ -1091,7 +1155,7 @@ class LiveOrchestrator:
                     )
                 )
                 if len(valid_htf) > 0:
-                    ctx.htf_cache = HTFCache.from_features_df(valid_htf, bar_timestamp)
+                    new_htf_cache = HTFCache.from_features_df(valid_htf, bar_timestamp)
 
             else:
                 # Warm path: compute 1m base features only, inject HTF scalars.
@@ -1100,18 +1164,18 @@ class LiveOrchestrator:
                     "[%s] HTF warm path | bar_ts=%s | cache sealed_at=%s",
                     symbol,
                     bar_timestamp.isoformat(),
-                    ctx.htf_cache.sealed_at.isoformat(),
+                    htf_cache.sealed_at.isoformat(),
                 )
                 # Since V3BaseFeatures is the first generator in the pipeline, we use it directly for warm path.
                 features_df = self._feature_engineer.feature_generators[0].generate(history_df)
                 features_df = features_df.with_columns(
                     [
-                        pl.lit(ctx.htf_cache.htf_rsi_14).alias("htf_rsi_14"),
-                        pl.lit(ctx.htf_cache.htf_trend_agreement)
+                        pl.lit(htf_cache.htf_rsi_14).alias("htf_rsi_14"),
+                        pl.lit(htf_cache.htf_trend_agreement)
                         .cast(pl.Int8)
                         .alias("htf_trend_agreement"),
-                        pl.lit(ctx.htf_cache.htf_vol_rel).alias("htf_vol_rel"),
-                        pl.lit(ctx.htf_cache.htf_bb_pct_b).alias("htf_bb_pct_b"),
+                        pl.lit(htf_cache.htf_vol_rel).alias("htf_vol_rel"),
+                        pl.lit(htf_cache.htf_bb_pct_b).alias("htf_bb_pct_b"),
                     ]
                 )
 
@@ -1146,7 +1210,7 @@ class LiveOrchestrator:
 
             if len(features_df) == 0:
                 logger.debug("[%s] All rows null after feature drop — skip.", symbol)
-                return None
+                return InferenceOutcome(new_htf_cache=new_htf_cache)
 
             latest_row = features_df.tail(1)
 
@@ -1162,7 +1226,7 @@ class LiveOrchestrator:
                     natr_value,
                     ATR_KILL_SWITCH_THRESHOLD,
                 )
-                return None
+                return InferenceOutcome(new_htf_cache=new_htf_cache)
 
             # ----------------------------------------------------------------
             # Current price + ATR for bracket sizing
@@ -1172,11 +1236,6 @@ class LiveOrchestrator:
             # TA-Lib NATR is a percentage; convert to absolute ATR
             # natr_14 = (ATR / close) * 100  ->  ATR = (natr_14 / 100) * close
             atr_abs: float = (natr_value / 100.0) * current_price
-
-            # Update dashboard tracking
-            ctx = self._contexts[symbol]
-            ctx.last_price = current_price
-            ctx.last_atr = natr_value
 
             # ----------------------------------------------------------------
             # Stage 1 — The Angel (direction, high recall)
@@ -1194,7 +1253,9 @@ class LiveOrchestrator:
                     angel_prob,
                     ANGEL_THRESHOLD,
                 )
-                return None
+                return InferenceOutcome(
+                    new_htf_cache=new_htf_cache, last_atr=natr_value
+                )
 
             # ----------------------------------------------------------------
             # Stage 2 — The Devil (conviction, high precision)
@@ -1215,15 +1276,14 @@ class LiveOrchestrator:
                     devil_prob,
                     self._devil_threshold,
                 )
-                return None
+                return InferenceOutcome(
+                    new_htf_cache=new_htf_cache, last_atr=natr_value
+                )
 
             # ----------------------------------------------------------------
             # Both agreed — build Signal with ATR bracket data in metadata
             # ----------------------------------------------------------------
             bar_timestamp: datetime = latest_row["timestamp"][0]
-
-            # Update dashboard conviction
-            ctx.last_conviction = devil_prob
 
             logger.info(
                 "[%s] SIGNAL | price=%.2f | angel=%.4f | devil=%.4f | "
@@ -1236,20 +1296,29 @@ class LiveOrchestrator:
                 atr_abs,
             )
 
-            return Signal(
-                symbol=symbol,
-                type=SignalType.BUY,
-                price=current_price,
-                confidence=devil_prob,
-                timestamp=bar_timestamp,
-                metadata={
-                    "angel_prob": angel_prob,
-                    "devil_prob": devil_prob,
-                    "natr_14": natr_value,
-                    "atr_abs": atr_abs,
-                    "sl_price": round(current_price - SL_ATR_MULTIPLIER * atr_abs, 4),
-                    "tp_price": round(current_price + TP_ATR_MULTIPLIER * atr_abs, 4),
-                },
+            return InferenceOutcome(
+                signal=Signal(
+                    symbol=symbol,
+                    type=SignalType.BUY,
+                    price=current_price,
+                    confidence=devil_prob,
+                    timestamp=bar_timestamp,
+                    metadata={
+                        "angel_prob": angel_prob,
+                        "devil_prob": devil_prob,
+                        "natr_14": natr_value,
+                        "atr_abs": atr_abs,
+                        "sl_price": round(
+                            current_price - SL_ATR_MULTIPLIER * atr_abs, 4
+                        ),
+                        "tp_price": round(
+                            current_price + TP_ATR_MULTIPLIER * atr_abs, 4
+                        ),
+                    },
+                ),
+                new_htf_cache=new_htf_cache,
+                last_atr=natr_value,
+                last_conviction=devil_prob,
             )
 
         except Exception as exc:
@@ -1260,7 +1329,7 @@ class LiveOrchestrator:
                 f"[LiveOrchestrator][{symbol}] Inference error — bar dropped.\n"
                 f"```{str(exc)[:800]}```"
             )
-            return None
+            return InferenceOutcome(new_htf_cache=new_htf_cache)
 
     # -----------------------------------------------------------------------
     # Signal handler (back in the event loop after inference returns)
@@ -1317,13 +1386,24 @@ class LiveOrchestrator:
             "info",
         )
 
-        success = await asyncio.to_thread(
+        result: EntryOrderResult = await asyncio.to_thread(
             self._submit_entry_order,
             sig,
             client_order_id,
         )
 
-        if not success:
+        if result.success:
+            # Apply the thread's results to SymbolContext here, on the event
+            # loop: the floored SL (the watchdog must monitor the same level
+            # the position was sized against) and the pre-fill qty seed for
+            # _save_state (authoritative qty arrives with the fill event).
+            async with ctx.lock:
+                if result.adjusted_sl is not None:
+                    ctx.sl_price = result.adjusted_sl
+                ctx.entry_qty = result.submitted_qty
+            # Persist immediately so a restart mid-trade can recover
+            self._save_state()
+        else:
             # REST call failed — roll back to FLAT so the next bar can retry
             async with ctx.lock:
                 ctx.state = SymbolState.FLAT
@@ -1337,7 +1417,9 @@ class LiveOrchestrator:
     # Order submission (runs in thread pool)
     # -----------------------------------------------------------------------
 
-    def _submit_entry_order(self, sig: Signal, client_order_id: str) -> bool:
+    def _submit_entry_order(
+        self, sig: Signal, client_order_id: str
+    ) -> EntryOrderResult:
         """
         Submit a plain fractional market buy for any asset class (equity or crypto).
 
@@ -1349,13 +1431,17 @@ class LiveOrchestrator:
         fractional equities and all crypto pairs.
 
         Called via asyncio.to_thread; must NOT call any asyncio primitives.
+        Never touches SymbolContext (ownership contract) — the floored SL and
+        submitted qty travel back in the EntryOrderResult for the event loop
+        (_handle_signal) to apply.
 
-        Returns True on success, False on any exception (including the
-        slippage-inversion guard).
+        Returns an EntryOrderResult; success=False on any exception
+        (including the slippage-inversion guard).
         """
         symbol = sig.symbol
         sl_price: float = sig.metadata["sl_price"]
         tp_price: float = sig.metadata["tp_price"]
+        adjusted_sl: Optional[float] = None
 
         try:
             # ----------------------------------------------------------------
@@ -1371,7 +1457,7 @@ class LiveOrchestrator:
                     tp_price,
                     sig.price,
                 )
-                return False
+                return EntryOrderResult(success=False)
 
             if sl_price >= sig.price:
                 logger.warning(
@@ -1380,7 +1466,7 @@ class LiveOrchestrator:
                     sl_price,
                     sig.price,
                 )
-                return False
+                return EntryOrderResult(success=False)
 
             # ----------------------------------------------------------------
             # Position sizing: 2% of account equity at risk + Notional Guards
@@ -1397,9 +1483,10 @@ class LiveOrchestrator:
             # Prevents denominator collapse when 0.5×ATR is smaller than the
             # bid/ask spread on low-volatility crypto regimes.
             # Floor = max(ATR-derived distance, 0.15% of entry price).
-            # sl_price is recomputed from the floored distance and written
-            # back to ctx.sl_price so the watchdog monitors the same level
-            # the position was sized against.
+            # sl_price is recomputed from the floored distance and returned
+            # as EntryOrderResult.adjusted_sl; the event loop writes it to
+            # ctx.sl_price so the watchdog monitors the same level the
+            # position was sized against.
             # ----------------------------------------------------------------
             raw_sl_distance: float = sig.price - sl_price
             min_sl_distance: float = sig.price * MIN_SL_PCT
@@ -1416,9 +1503,8 @@ class LiveOrchestrator:
                     sig.price - raw_sl_distance,
                     sl_price,
                 )
-                # Sync watchdog — it must monitor the same SL we sized against
-                ctx_ref = self._contexts[symbol]
-                ctx_ref.sl_price = sl_price
+                # The event loop syncs this to ctx.sl_price for the watchdog
+                adjusted_sl = sl_price
 
             risk_per_share: float = actual_sl_distance
 
@@ -1428,7 +1514,7 @@ class LiveOrchestrator:
                     symbol,
                     risk_per_share,
                 )
-                return False
+                return EntryOrderResult(success=False)
 
             qty: float = risk_dollars / risk_per_share
             intended_notional: float = qty * sig.price
@@ -1456,7 +1542,7 @@ class LiveOrchestrator:
                     symbol,
                     intended_notional,
                 )
-                return False
+                return EntryOrderResult(success=False)
 
             # Round to 4 decimals; enforce fractional floor of 0.0001
             qty = max(round(qty, 4), 0.0001)
@@ -1515,15 +1601,12 @@ class LiveOrchestrator:
             # Notify Discord
             self._notifier.send_trade_alert(sig, action="ENTRY")
 
-            # Persist state immediately so a restart mid-trade can recover
             # NOTE: entry_qty is set properly by _on_trade_update on fill;
-            # we pre-seed it here from the submitted qty so _save_state has
-            # a value even if the fill event hasn't arrived yet.
-            ctx = self._contexts[symbol]
-            ctx.entry_qty = qty
-            self._save_state()
-
-            return True
+            # submitted_qty pre-seeds it (via _handle_signal) so _save_state
+            # has a value even if the fill event hasn't arrived yet.
+            return EntryOrderResult(
+                success=True, adjusted_sl=adjusted_sl, submitted_qty=qty
+            )
 
         except Exception as exc:
             logger.error(
@@ -1535,7 +1618,7 @@ class LiveOrchestrator:
             self._notifier.send_system_message(
                 f"[LiveOrchestrator][{symbol}] Entry order FAILED: {exc}"
             )
-            return False
+            return EntryOrderResult(success=False)
 
     # -----------------------------------------------------------------------
     # Trade update handler (Alpaca order lifecycle WebSocket)
