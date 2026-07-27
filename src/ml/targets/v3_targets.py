@@ -1,3 +1,26 @@
+"""
+A simple fixed-percentage training label.
+
+STATUS: used only by ``feature_pipeline.main()``. The LIVE training path
+(``src/core/retrainer.py``) builds its own labels from volatility-scaled
+brackets and does not use this. Kept because the older pipeline entry point
+still references it.
+
+Glossary:
+    V3DirectionalTarget -- labels each bar 1 if price rises by at least
+        min_gain within the next `lookahead` bars, else 0.
+    _LOOKAHEAD_BARS -- 15 bars, the default window to look ahead.
+    _MIN_GAIN_PCT -- 0.003, i.e. a 0.3% rise counts as a win.
+    target -- the output column. Null (not 0) for the final rows where the
+        future is unknown, so incomplete rows get dropped rather than being
+        mislabelled as losses.
+
+Note the difference from the production labels: this only asks whether price
+EVER reached a level, ignoring whether a stop would have been hit first. The
+retrainer's labels replay stops and targets bar by bar, which is why they are
+harsher and more realistic.
+"""
+
 import polars as pl
 from ml.core.interfaces import BaseTargetGenerator
 

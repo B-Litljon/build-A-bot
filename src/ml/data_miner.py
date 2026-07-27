@@ -21,6 +21,25 @@ The resulting Parquet files use the canonical schema:
     low       : Float64
     close     : Float64
     volume    : Float64
+
+Bulk history fetcher: pulls years of bars a month at a time, politely, and
+caches them to disk so experiments re-read local Parquet instead of hammering
+the vendor. Unlike the older harvester it goes through the provider factory,
+so it works with any configured data source.
+
+Glossary:
+    DataMiner -- the fetch-and-persist driver.
+    _BAR_SCHEMA -- the canonical six-column bar shape, matching the providers.
+    _DEFAULT_OUTPUT_DIR -- data/raw/, one file per symbol as
+        <SYMBOL>_1min.parquet.
+    Monthly chunking -- history is requested a month at a time because vendors
+        cap the rows per response; chunks are concatenated afterwards.
+    _MAX_RETRIES -- 3 attempts per chunk before giving up on it.
+    _RETRY_BACKOFF_BASE -- 5 seconds, doubling each attempt (5, 10, 20).
+    _INTER_CHUNK_DELAY -- 1.0 second pause between calls, to stay inside rate
+        limits over a long multi-year pull.
+    DATA_SOURCE -- inherited from the environment, so the same command mines
+        from whichever vendor is configured.
 """
 
 from __future__ import annotations

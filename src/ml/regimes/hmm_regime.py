@@ -11,6 +11,38 @@ Walk-forward leakage is the caller's responsibility:
   - Score both train and val frames with the resulting dict via predict_regime_probs().
   - For the final production model, fit on all retraining data and persist
     via save_hmm_models(); MLStrategy loads it for live inference.
+
+EXPERIMENTAL and OFF by default -- only active when RETRAIN_USE_HMM=1. The
+idea: markets move between hidden modes (quiet drift, trending, violent), which
+nobody labels directly. The model infers those modes statistically and hands
+the classifier its confidence in each one as three extra inputs.
+
+Glossary:
+    N_STATES -- 3 regimes. Not named or interpreted anywhere; they are whatever
+        the fit finds, so "state 0" has no fixed meaning across symbols or runs.
+    HMM_INPUT_COLS -- what the regime model observes: log_return and natr_14,
+        i.e. direction-of-move and size-of-move. Deliberately NOT price level,
+        so the regimes are comparable across instruments and eras.
+    HMM_OUTPUT_COLS -- the three added columns hmm_state_0_prob ... _2_prob.
+        These are what get appended to the classifier's feature list.
+    MIN_FIT_ROWS -- 200. Fewer rows than this and the symbol is skipped
+        entirely rather than fitted on noise.
+    _clean_for_hmm -- replaces non-finite values with that column's mean; the
+        HMM fitter rejects NaN and infinity outright.
+    fit_regime_models -- one model per symbol. Returns None for any symbol that
+        was skipped or whose fit failed, so callers must handle None.
+    predict_regime_probs -- adds the three columns. Symbols with no model get a
+        uniform 1/3 across all states -- a deliberately uninformative value the
+        classifier can ignore, rather than a gap that would drop the row.
+    Uniform padding -- if a fit collapses to fewer states than requested, the
+        missing columns are padded uniform so the feature vector always has the
+        expected width.
+    save_hmm_models / load_hmm_models -- joblib round-trip for the per-symbol
+        dict, written atomically next to the Angel and Devil models so the
+        three artifacts always travel together.
+    Leakage rule -- fit on TRAINING rows only, then score both training and
+        validation with that fitted model. Fitting on all the data first would
+        let the validation fold's own future inform its regime labels.
 """
 
 from __future__ import annotations

@@ -24,6 +24,48 @@ PSI convention (standard 10-bin):
 Stats are stored pooled AND per-symbol: the model trains pooled, but drift
 diagnosis is per-instrument (instruments have different baseline levels for
 several features, so live-vs-pooled alone would false-positive).
+
+This is the "is the model broken or is the market just quiet?" tool. It answers
+it WITHOUT retraining anything, by comparing what the model sees live against
+what it saw in training.
+
+Glossary:
+    PSI (Population Stability Index) -- one number for how far a live feature's
+        distribution has moved from its training distribution. 0 = identical;
+        bigger = more foreign.
+    NULL CALIBRATION -- the load-bearing idea here, and the reason the textbook
+        PSI cutoffs (0.10 / 0.25) are NOT used directly. Those cutoffs assume
+        independent samples. Market bars are strongly autocorrelated, so any
+        short window sits in a narrow slice of the full range and scores high
+        PSI even when nothing is wrong. This module therefore measures what PSI
+        ORDINARY training windows produce, and only calls drift when live PSI
+        beats that null's upper tail.
+    null_psi -- the resulting reference: p50/p90/p95/p99 of PSI across randomly
+        sampled training windows, stored per symbol per feature.
+    null_window -- 100 bars, the window length the null is built from. Live
+        comparisons must use the same length or the reference is meaningless.
+    null_samples -- 200 random windows sampled to build the null.
+    seed -- 7, fixed so the artifact is reproducible.
+    _column_stats -- per-feature summary: count, mean, std, min, max, plus the
+        binning needed for PSI.
+    kind: "continuous" vs "categorical" -- continuous features are binned at
+        training deciles; features with few distinct values (session flags,
+        hour_of_day) get one bin per value instead.
+    _CATEGORICAL_MAX_UNIQUE -- 24, the cutoff for that decision (covers
+        hour_of_day's 24 values and the 0/1 flags).
+    decile_edges -- the nine interior bin boundaries from training.
+    expected -- the REALIZED training mass per bin, not a flat 0.10. Heavy ties
+        can collapse bins, so the actual proportions are stored.
+    _PSI_EPS -- 1e-4 smoothing so an empty live bin yields a large number
+        instead of infinity.
+    STATS_FILENAME -- "feature_stats.json", written into the model directory so
+        the stats travel with the model they describe.
+    schema_version -- 2. Bump when the artifact's shape changes; older sidecars
+        lack the null calibration.
+    pooled vs per_symbol -- pooled matches how the model trains; per-symbol is
+        what drift diagnosis must use, because instruments sit at genuinely
+        different baseline levels and comparing one against the pooled average
+        would flag drift that is not there.
 """
 
 from __future__ import annotations
