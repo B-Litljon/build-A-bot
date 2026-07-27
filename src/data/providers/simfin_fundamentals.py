@@ -19,6 +19,26 @@ changes.
 
 Requires ``SIMFIN_API_KEY`` in the process environment (loaded via
 ``python-dotenv`` at the orchestrator).
+
+Glossary:
+    SimFinFundamentalProvider -- the default fundamentals source for the
+        monthly equities investor. Unlike a per-symbol API, it downloads whole
+        datasets once and then answers every symbol from memory.
+    _PROJECT_ROOT -- repo root, resolved by walking three levels up from this
+        file. Note this breaks if the file is moved between directories.
+    _DEFAULT_CACHE_DIR -- data/raw/simfin_cache/, where the bulk CSVs land.
+    _REFRESH_DAYS_DEFAULT -- 30. Cached CSVs older than this are re-downloaded;
+        fundamentals only change quarterly, so a monthly refresh is ample.
+    _VARIANTS -- ("general", "banks", "insurance"). Banks and insurers report
+        fundamentally different line items, so SimFin splits them into separate
+        datasets; a bank like JPM only exists in the "banks" partition.
+    _INCOME_LOADERS / _BALANCE_LOADERS -- one SimFin loader function per
+        (statement, variant) pair.
+    _find_in_variants -- resolves a ticker to whichever partition contains it,
+        so callers never need to know a company's sector.
+    Column renames -- income-statement columns are renamed to the
+        Yahoo-shaped names ("Total Revenue", "Operating Income") the investor's
+        feature pipeline already expects, so sources stay swappable.
 """
 
 from __future__ import annotations

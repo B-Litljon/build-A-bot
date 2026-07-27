@@ -7,6 +7,18 @@ field-level results across sources (e.g. income statement from SimFin,
 balance sheet from Yahoo when one source is missing fields), but that
 requires field-level awareness that would leak provider internals into
 this layer.
+
+Glossary:
+    CompositeFundamentalProvider -- itself a FundamentalProvider, so callers
+        cannot tell whether they hold one source or several. This is what
+        FUNDAMENTAL_SOURCES actually builds.
+    _providers -- the ordered source list; earlier entries win. An empty list
+        is legal and answers empty to everything, which is the supported "no
+        fundamentals" mode.
+    First-non-empty semantics -- resolved independently per method call, so
+        one symbol's company info and its financials may come from different
+        sources. Exceptions from a source are logged and treated as a miss, so
+        one broken vendor cannot take down the run.
 """
 
 from __future__ import annotations

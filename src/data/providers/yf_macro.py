@@ -9,6 +9,17 @@ this adapter with a FRED-backed implementation (fredapi) — see the note
 in src/data/macro.py.
 
 No API key is required.
+
+Glossary:
+    YFinanceMacroProvider -- maps friendly indicator names onto Yahoo tickers
+        and returns the resulting daily series.
+    _INDICATOR_MAP -- the name-to-ticker table: VIX, 10Y_YIELD, 2Y_YIELD,
+        SP500, NASDAQ, DJI, GOLD, OIL, DXY. Extend it to add an indicator.
+    ^TNX (10Y_YIELD) -- CAUTION: Yahoo reports this as the yield times ten, so
+        a 4.2% yield arrives as 42.0. Nothing in this module rescales it.
+    ^IRX (2Y_YIELD) -- MISNAMED: this is the 13-week Treasury bill rate, not
+        the 2-year. It is the closest free Yahoo proxy; use FRED's DGS2 if the
+        real 2-year matters.
 """
 
 from __future__ import annotations

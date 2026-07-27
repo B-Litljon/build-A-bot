@@ -9,6 +9,53 @@ workflow.
 Required environment variables:
     OANDA_API_KEY       - Bearer token from hub.oanda.com
     OANDA_ACCOUNT_ID    - Account ID (numeric string)
+
+This is the data feed for the live forex scalper. OANDA streams individual
+price quotes rather than finished bars, so this module builds the bars itself
+from ticks. See GLOSSARY.md (bid/ask, mid price, sealed bar, heartbeat).
+
+Glossary:
+    _GRANULARITY -- maps a bar size in minutes to OANDA's own code
+        (1 -> "M1", 15 -> "M15", 60 -> "H1"). Anything not in this table is
+        rejected rather than silently rounded.
+    _MAX_CANDLES -- 5000, OANDA's per-request cap. Longer ranges are fetched
+        by paging forward from the last timestamp received.
+    _to_oanda_symbol -- normalises "EUR/USD", "EURUSD" and "EUR_USD" to the
+        underscore form OANDA expects.
+    _parse_iso -- OANDA timestamps carry nanoseconds, which Python's ISO
+        parser rejects; this truncates to whole seconds first.
+    environment -- "practice" (paper money) or "live" (real). Defaults to
+        practice.
+    _stream_gran -- minutes per bar built from the tick stream.
+    _stream_timeout -- read-inactivity timeout in seconds (default 20,
+        OANDA_STREAM_TIMEOUT_SECONDS). OANDA sends a heartbeat every ~5s, so
+        silence this long means the connection is dead. This exists because a
+        half-open socket would otherwise hang the reader forever while stops
+        and targets are enforced in software -- the timeout turns the hang
+        into an exception the reconnect logic already handles.
+    _tick_bars -- per-instrument bar under construction: its time bucket,
+        start time, running OHLC and tick count.
+    _handle_tick -- folds one quote into the current bar. Uses the mid price,
+        the average of best bid and best ask.
+    volume -- NOT traded size. OANDA reports tick count, so this counts quotes
+        and starts at 1 for the opening tick (starting at 0 made live activity
+        look lower than the training data and skewed a feature).
+    _flush_bar -- emits a finished bar to the orchestrator's callback, hopping
+        threads safely into the event loop when one is running.
+    _tick_callback -- optional raw-quote hook called on every tick with
+        (symbol, bid, ask). Must return in under 50 microseconds and do no
+        blocking I/O; it runs inline on the stream thread. The scalper uses it
+        to track live spreads.
+    _last_stream_msg / seconds_since_last_message -- when any message last
+        arrived, heartbeats included. The orchestrator's watchdog reads this to
+        decide the feed has gone quiet. None means the stream is not running.
+    force_disconnect -- best-effort kill of a stalled stream so it reconnects.
+        May do nothing if the thread is blocked mid-read, which is what the
+        read timeout is for.
+    stop_stream / reset_stop -- shutdown flag and its reset. Stopping flushes
+        every part-built bar rather than discarding it.
+    get_historical_bars -- pages complete mid-price candles over a date range.
+        In-progress candles are skipped, so warm-up never sees a partial bar.
 """
 
 import asyncio

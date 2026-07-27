@@ -1,3 +1,28 @@
+"""
+Concrete MarketDataProvider backed by Alpaca (US equities + crypto).
+
+Wraps Alpaca's REST and WebSocket SDKs behind the generic
+:class:`MarketDataProvider` interface. Selected with DATA_SOURCE=alpaca (the
+default). Equities and crypto need different Alpaca clients and different
+stream classes, so this adapter holds both and routes per symbol.
+
+Glossary:
+    AlpacaProvider -- the adapter itself.
+    api_key / secret_key -- Alpaca credentials, passed in by the factory.
+    paper -- True routes trading calls to the paper-money account.
+    stock_client / crypto_client -- separate historical REST clients; Alpaca
+        splits the two asset types across different endpoints.
+    trading_client -- the account/asset endpoint, used for symbol discovery
+        rather than for placing orders.
+    Symbol convention -- crypto pairs carry a slash ("BTC/USD") while equities
+        do not ("AAPL"); the slash is how this adapter decides which client to
+        use, and Alpaca is inconsistent about it in responses (see the
+        matching fix-up in src/data/feed.py).
+    DataFeed.IEX -- the free tier's data feed, which sees only part of total
+        market volume. Any volume-derived feature computed from it is an
+        approximation.
+"""
+
 import asyncio
 import logging
 from datetime import datetime

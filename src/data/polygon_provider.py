@@ -5,6 +5,15 @@ Wraps the ``polygon-api-client`` REST + WebSocket clients behind the
 generic :class:`MarketDataProvider` interface.
 
 Requires the ``POLYGON_API_KEY`` environment variable.
+
+Selectable via DATA_SOURCE=polygon but not currently used by either live bot;
+kept as a working alternative feed.
+
+Glossary:
+    PolygonDataProvider -- the adapter. Implements the same four methods as
+        every other provider (discovery, historical bars, subscribe, stream).
+    api_key -- from the constructor or POLYGON_API_KEY. Polygon's plan tier
+        determines which symbols and how much history are actually available.
 """
 
 import asyncio

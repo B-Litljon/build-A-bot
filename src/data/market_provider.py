@@ -16,6 +16,27 @@ Adapters for new vendors should subclass MarketDataProvider and
 implement all four abstract methods.
 
 This file must not import any vendor SDKs.
+
+Glossary:
+    MarketDataProvider -- the contract every vendor adapter implements.
+        Discovery, historical bars and live streaming live in one class
+        because a vendor's credentials, client lifecycle and rate limits are
+        shared across all three.
+    _BAR_SCHEMA -- the canonical six-column bar shape every provider must
+        return: timestamp (microsecond UTC), open/high/low/close/volume as
+        Float64. Everything downstream assumes exactly this.
+    _empty_bars() -- a correctly-typed empty DataFrame. Providers return this
+        on failure rather than raising, so one bad symbol cannot abort a fetch.
+    get_active_symbols -- up to *limit* currently-tradable tickers, ranked by
+        activity where the vendor supports it.
+    get_historical_bars -- OHLCV for one symbol over a datetime range. Must
+        never raise; returns empty on failure or no data.
+    subscribe -- register a callback for live bars. Non-blocking; it only sets
+        up the vendor's stream client.
+    run_stream -- the blocking loop that actually delivers bars. Always called
+        after subscribe().
+    timeframe_minutes -- bar size in minutes. Daily and weekly bars are
+        deliberately out of scope for this contract.
 """
 
 import abc
