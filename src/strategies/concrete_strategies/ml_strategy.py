@@ -15,6 +15,75 @@ Usage:
         devil_threshold=0.50,
         warmup_period=60
     )
+
+This is the decision-maker: bars in, Signal-or-None out. It owns no broker
+connection and places no orders -- an orchestrator calls it and acts on the
+result. Everything about it is arranged so that live inference matches training
+exactly; the feature pipeline is IMPORTED from src/ml rather than reimplemented,
+and its generator order is identical to the retrainer's.
+
+Glossary:
+    asset_class -- "equities" or "forex". Picks the default model directory
+        (models/<asset_class>/) when explicit paths are not given.
+    angel_path / devil_path -- the two model pickles. Resolved relative to the
+        project root if not found as given.
+    angel_threshold -- 0.40; how confident stage one must be to propose.
+    devil_threshold -- the approval bar for stage two. Set from the
+        constructor, then OVERWRITTEN by _load_threshold() from the model's
+        threshold.json, because the retrainer tunes this value per model.
+    warmup_period -- 260 bars minimum before trading. Sized for a 50-period
+        average on 5-minute bars (50 x 5 = 250 plus headroom); acting sooner
+        means acting on half-computed indicators.
+    timeframe / htf_timeframe -- fast bar size in minutes, and the slower
+        context timeframe ("5m").
+    regime_window -- 260; must match RiskProfile.regime_window or the cost
+        feature and the live cost gate would disagree about baseline volatility.
+
+    self.pipeline -- the imported FeaturePipeline, built as
+        [V3BaseFeatures, V3HTFFeatures, V3SessionFeatures, V3CostFeatures].
+        This order is IDENTICAL to retrainer.py's; keeping them in lockstep is
+        what prevents training/inference skew.
+    _cost_gen -- the V3CostFeatures instance kept as a handle so hot-reload can
+        swap its alpha table in place without rebuilding the pipeline.
+    feature_names -- read from the trained model's own feature_names_in_, NOT
+        hardcoded. That way a retrain which changes the feature set propagates
+        without a code edit. Raises at construction if the model exposes no
+        names, since there would be no safe way to order the columns.
+
+    Fail-loud guards -- if the model was trained with cost_ratio but
+        spread_alphas.json is missing, or with regime features but the HMM
+        artifact is missing, the constructor raises. Deliberate: a boot-time
+        error is far better than silently scoring against a wrong-width
+        feature vector on the first live bar.
+    _validate_metadata -- checks metadata.json next to the model to confirm the
+        model's asset class matches. Warns (not raises) if absent.
+    _load_threshold -- reads threshold.json from the model dir; falls back to
+        the constructor value.
+    _load_spread_table -- reads spread_alphas.json from the model dir, so a
+        model always uses the cost assumptions it was trained against.
+
+    Hot reload -- _check_model_updates() runs at the start of every bar and
+        compares file modification times; when the retrainer atomically swaps in
+        new pickles the strategy picks them up without a restart.
+    _reload_lock -- guards that swap so a reload cannot interleave with
+        inference.
+    angel_mtime / devil_mtime / _spread_table_mtime -- the last-seen
+        modification times driving that comparison.
+    n_jobs = 1 -- forced on both models: single-row inference is so small that
+        multi-process parallelism costs more in overhead than it saves.
+
+    generate_signals -- the entry point. Returns a Signal only when BOTH stages
+        approve, otherwise None.
+    Stale-bar guard -- feature cleaning drops rows with missing values. If the
+        NEWEST bar was the one dropped, the tail of the frame is an older bar,
+        and scoring it against the current price would trade on the wrong bar.
+        The strategy returns None instead.
+    _heartbeat_window / _heartbeat_counter -- per-symbol ring buffer of recent
+        Angel probabilities, summarised to the log every
+        _heartbeat_every_n_bars (default 15, MLSTRATEGY_HEARTBEAT_EVERY_N).
+        Exists so an operator can see the model is alive and evaluating during
+        long stretches with no trades -- rejections themselves log at debug
+        level and are normally invisible.
 """
 
 import json
