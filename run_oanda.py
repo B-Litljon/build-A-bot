@@ -11,6 +11,28 @@ Usage:
     python3 run_oanda.py                      # default EUR/USD
     python3 run_oanda.py --symbols GBP/USD    # override basket
     OANDA_UNITS=500 python3 run_oanda.py      # override position size
+
+⚠️ THIS IS THE LAUNCHER FOR THE CURRENTLY-RUNNING BOT. The live M15 soak is
+`run_oanda.py --daemon --env practice --granularity 15`, kept alive by
+soak_watchdog.sh (cron, every 5 minutes). To stop it, `touch soak.off` BEFORE
+killing the process, or the watchdog resurrects it within 5 minutes.
+
+Glossary:
+    _SRC_DIR -- src/, prepended to sys.path so bare module names resolve.
+    FALLBACK_SYMBOLS -- ["EUR/USD"], used only when nothing else specifies a
+        basket. The real basket normally comes from the model's metadata.
+    _MODEL_DIR -- which model directory to load; this is what selects between
+        models/forex and a side candidate like models/forex_m15.
+    _METADATA_PATH -- metadata.json in that directory. Read so the bot trades
+        the instruments and timeframe the model was actually TRAINED on rather
+        than whatever the command line happens to say.
+    _GRANULARITY_PROFILES -- maps bar size to (higher-timeframe, warm-up bars),
+        matching scripts/probe_model.py. Picking the wrong pair here would feed
+        the model differently-computed features than it trained on.
+    --granularity -- bar size in minutes (15 for the current soak).
+    --env -- "practice" (paper money) or "live" (real). Defaults to practice.
+    --daemon -- headless mode; log to file, no interactive display.
+    OANDA_UNITS -- position size override.
 """
 
 import argparse

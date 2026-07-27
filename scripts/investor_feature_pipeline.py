@@ -28,6 +28,31 @@ Usage:
 
 Input:
     data/raw/v4_investor_data.parquet
+
+Step 2 of the V4 Investor. Turns the merged daily table into model inputs plus
+the ranking target.
+
+Glossary:
+    MOM_WINDOWS -- the trailing-return lookbacks: 63, 126 and 252 trading days
+        (roughly 3, 6 and 12 months). "Momentum" here just means how much the
+        stock has already gone up over each span.
+    MACRO_WINDOW -- 20 days, the smoothing window applied to VIX and yields so
+        the model sees a trend rather than one noisy day.
+    FORWARD_DAYS -- 60. The target looks 60 trading days ahead.
+    target_top_quintile -- 1 if the stock lands in the best-performing FIFTH of
+        the universe over those 60 days, else 0. Note this is a RELATIVE
+        (cross-sectional) question -- "did it beat its peers", not "did it go
+        up" -- which is what makes the model a ranker rather than a predictor.
+    _NUMERATOR_COLS / _REVENUE_COL -- income-statement lines turned into margin
+        ratios, so a large company and a small one are comparable.
+    --inference flag -- switches the output file and RETAINS the most recent
+        rows that training deliberately discards. Training must drop them
+        (their 60-day future has not happened yet, so they have no label);
+        inference needs exactly those rows, because today is the day being
+        predicted.
+    _OUTPUT_PATH_TRAINING / _OUTPUT_PATH_INFERENCE --
+        data/processed/v4_training_features.parquet and
+        v4_inference_features.parquet respectively.
 """
 
 from __future__ import annotations

@@ -20,6 +20,29 @@ Usage (env vars mirror the original retrain invocation):
 
 If the model was trained WITH a spread table, also set RETRAIN_SPREAD_TABLE
 so the veto population (and cost_ratio feature) match.
+
+A backfill tool: gives an older model the training-distribution snapshot that
+scripts/probe_model.py needs, so models trained before 2026-07-07 can still be
+probed for drift.
+
+⚠️ Everything here depends on FAITHFULLY RECONSTRUCTING the original training
+frame. It reuses the retrainer's own fetch, pipeline, veto and cleaning
+functions for exactly that reason -- any divergence produces a reference the
+live data is then unfairly compared against, which would manufacture drift that
+was never there.
+
+Glossary:
+    model dir argument -- e.g. models/forex_m15; where the sidecar is written.
+    end-date argument -- ⚠️ THE ONE THAT MATTERS. The stats must describe what
+        the model ACTUALLY trained on, so this must be the model's training
+        date (readable from its metadata.json), not today. Get it wrong and the
+        reference describes a window the model never saw.
+    RETRAIN_SPREAD_TABLE -- must be set if the model was trained with cost
+        awareness, or the reconstructed veto population and feature set will
+        differ from the original.
+    compute_feature_stats / save_feature_stats -- shared with the retrainer, so
+        backfilled sidecars are identical in shape to freshly written ones.
+    feature_stats.json -- the output, written into the model dir.
 """
 
 from __future__ import annotations

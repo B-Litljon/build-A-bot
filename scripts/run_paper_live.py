@@ -9,6 +9,17 @@ Requires:
 
 Shutdown:
     Ctrl-C or SIGTERM — orchestrator drains gracefully before exit.
+
+Paper-money launcher for the Factory path. Near-duplicate of run_factory.py at
+the repo root; this one lives in scripts/ and is explicitly paper-only.
+
+Glossary:
+    paper credentials -- .env must hold PAPER Alpaca keys. Nothing in this file
+        enforces that, so the safety is procedural, not technical.
+    graceful drain -- on SIGINT/SIGTERM the orchestrator finishes what it is
+        doing and shuts down cleanly rather than aborting mid-order.
+    assembly -- like run_factory.py, wires feed + strategy + risk manager +
+        orchestrator and awaits the run loop.
 """
 
 import asyncio

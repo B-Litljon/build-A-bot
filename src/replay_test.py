@@ -12,6 +12,32 @@ Features:
     - High-speed replay loop with cross-sectional bar streaming
     - In-memory signal accumulation (no row-by-row disk writes)
     - Batch CSV export of signal ledger
+
+Phase 2 of run_pipeline.sh. Replays saved bars past the models as if they were
+arriving live, recording every signal, so the decisions can then be graded.
+Cross-sectional means it advances all symbols one timestamp at a time rather
+than finishing one symbol before starting the next -- which is what a live feed
+actually does.
+
+⚠️ The docstring line above says "CSV export", but LEDGER_PATH is a PARQUET
+file. Stale wording; the code writes parquet.
+
+Glossary:
+    MockAlpacaProvider -- stands in for the live feed, yielding saved bars in
+        the shape the real provider would deliver them.
+    DATA_PATH -- data/oos_bars.parquet, the bars to replay.
+    LEDGER_PATH -- data/signal_ledger.parquet, the recorded signals. Consumed
+        by evaluate_performance.py and reinforcement_voter.py.
+    ANGEL_MODEL_PATH / DEVIL_MODEL_PATH -- the legacy root-level model paths
+        (models/angel_latest.pkl), not the current per-asset-class layout.
+    ANGEL_THRESHOLD / DEVIL_THRESHOLD -- 0.40 / 0.50, matching live.
+    WARMUP_PERIOD -- 260 bars before signals are emitted, sized for the
+        50-period average on 5-minute bars.
+    FEATURE_NAMES -- this script's own feature list; verify it still matches
+        the pipeline before trusting results.
+    In-memory accumulation -- signals are collected and written once at the
+        end rather than appended per row, which is the difference between a
+        replay that takes seconds and one that takes hours.
 """
 
 from __future__ import annotations

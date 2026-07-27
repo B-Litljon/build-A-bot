@@ -25,6 +25,32 @@ Usage:
     PYTHONPATH=src:. python scripts/bake_spread_alphas.py \
         logs/soak_2026-07-02_0215.log config/spread_alphas_m15.json \
         --denomination-minutes 15 [--min-n 120]
+
+Turns observation into configuration: reads what the live bot MEASURED about
+trading costs and writes a table the trainer and the cost gate can both use,
+replacing the single placeholder assumption (0.15) with per-instrument reality.
+
+Glossary:
+    alpha_emp -- the measured number: median spread divided by median typical
+        move. Dimensionless, so 0.07 means the toll is 7% of a typical move
+        (cheap) and 0.93 means 93% (effectively untradeable).
+    SPREAD_CALIB -- the log line the orchestrator emits periodically; this
+        script parses those lines out of a soak log.
+    _CALIB_RE -- the regex that extracts them.
+    Last line wins -- the LAST SPREAD_CALIB line per instrument is used, since
+        the sample count only grows, so the final line is the best-supported.
+    --min-n -- discard instruments with fewer than this many samples; a handful
+        of quotes is not a cost estimate.
+    DEFAULT_ALPHA -- 0.15, the fallback written into the table for instruments
+        that were never measured. Matches RiskProfile.spread_atr_alpha.
+    --denomination-minutes -- ⚠️ LOAD-BEARING. Typical move depends on bar size,
+        so an alpha measured on 15-minute bars is NOT valid for 1-minute bars.
+        It is recorded in the output and the retrainer warns loudly on
+        mismatch.
+    output JSON -- {"alphas": {symbol: alpha}, "default_alpha": ...,
+        "denomination_minutes": ...}. Point RETRAIN_SPREAD_TABLE at it to train
+        with cost awareness; the retrainer copies it next to the model on
+        promotion so model and cost assumptions always travel together.
 """
 
 from __future__ import annotations

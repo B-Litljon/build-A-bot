@@ -21,6 +21,25 @@ Data layers:
     3. Fundamentals — SimFinFundamentalProvider  (src/data/providers/)
                       Institutional SEC fundamentals via SimFin bulk-download.
                       Requires SIMFIN_API_KEY in .env.
+
+Step 1 of the V4 Investor (the monthly stock ranker -- a completely separate
+product from the forex scalper). Merges three data layers that update at wildly
+different rates into one daily table.
+
+Glossary:
+    MACRO_INDICATORS -- ["VIX", "10Y_YIELD"]: a fear gauge and an interest-rate
+        level, the two economy-wide signals the ranker sees.
+    _START_DATE / _END_DATE -- a rolling 5-year window ending today.
+    _OUTPUT_PATH -- data/raw/v4_investor_data.parquet.
+    _FUNDAMENTAL_LAG_DAYS -- 45, AND THIS IS THE MOST IMPORTANT NUMBER HERE.
+        Company results are not public the instant the quarter ends; filing
+        takes weeks. Every fundamental value is therefore shifted forward 45
+        days before being joined, so a given day only ever sees numbers that
+        were genuinely published by then. Without this the model would rank
+        stocks using earnings nobody had yet seen, and would look brilliant in
+        testing and useless live.
+    point-in-time safe -- the property that shift buys: every row contains only
+        information available on its own date.
 """
 
 from __future__ import annotations

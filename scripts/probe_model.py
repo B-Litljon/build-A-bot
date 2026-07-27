@@ -25,6 +25,37 @@ Usage:
         [--bars 100] [--symbols XAU_USD,GBP_NZD] [--env practice]
 
 Read-only: fetches history via the OANDA REST API, loads pkls, prints.
+
+The tool for "the bot hasn't traded in days -- is it broken?". It answers
+without retraining or touching any weights, and distinguishes the two possible
+causes: the model's inputs have drifted somewhere it was never trained (DRIFT),
+or the inputs look normal and the setups genuinely are not there (HONEST).
+
+⚠️ Do NOT read raw PSI against the textbook 0.10/0.25 cutoffs here. Those assume
+independent samples; market bars are autocorrelated, so ordinary quiet data
+scores high. The verdict compares live PSI against the null calibration stored
+in feature_stats.json -- what PSI ORDINARY training windows produce. See
+src/ml/feature_stats.py.
+
+Glossary:
+    PSI -- Population Stability Index; how far a feature's live distribution has
+        moved from its training distribution. See GLOSSARY.md.
+    TreeSHAP -- exact per-feature attribution: for recent bars, how much each
+        input pushed the model's opinion up or down. Turns "the model is quiet"
+        into "the model is quiet BECAUSE momentum features are suppressing it".
+    log-odds -- the units SHAP contributions come in; negative values push the
+        probability down.
+    DRIFT vs HONEST -- the two verdicts. DRIFT means retraining may help;
+        HONEST means the model is working correctly in an edge-less stretch and
+        retraining would be chasing noise.
+    _GRANULARITY_PROFILES -- maps bar size to (higher-timeframe, warm-up bars):
+        1m -> ("5m", 260), 5m -> ("30m", 300), 15m -> ("1h", 260). The probe
+        must rebuild features exactly as the model's own timeframe did.
+    --bars -- how many recent bars to probe (default 100, matching the null
+        calibration's window length -- changing it invalidates the comparison).
+    --symbols / --env -- restrict instruments; practice or live account.
+    model dir argument -- e.g. models/forex_m15. Everything is read from there:
+        the pickles, feature_stats.json, threshold.json, metadata.json.
 """
 
 from __future__ import annotations

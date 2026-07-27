@@ -34,6 +34,34 @@ Invocation:
 
 Cron (monthly, first day of month, 16:30 ET — after close):
     30 16 1 * *  cd /path/to/project && pipenv run python scripts/portfolio_orchestrator.py
+
+Step 4 (final) of the V4 Investor, and the only part that places real orders.
+Runs once a month from cron: refresh data, rebuild features, rank, then move
+the account to the target basket. Unlike the scalper this holds positions for
+weeks and never watches a tick.
+
+Glossary:
+    TOP_K -- 8. Hold the model's eight best-ranked names.
+    TARGET_WEIGHT -- 1/8 = 12.5% each, equal-weighted. Equal weighting is a
+        deliberate refusal to bet more on the top pick, since the ranker's
+        confidence ordering has not proven reliable enough to size on.
+    SECTOR_CAP -- 2, at most two holdings from any one sector, so the basket
+        cannot quietly become an all-in bet on a single industry when the model
+        likes one sector's whole cohort.
+    EQUITY_BUFFER -- 0.99, deploy 99% of equity and leave 1% headroom so
+        rounding and price drift between sizing and filling cannot overdraw the
+        account.
+    REBALANCE_DEADBAND -- 0.005. If a holding is already within 0.5% of equity
+        of its target, leave it alone. Prevents paying commission and spread
+        every month to correct trivial drift.
+    _MINER_SCRIPT / _FEATURE_SCRIPT -- steps 1 and 2, run as SUBPROCESSES
+        rather than imported, so a crash in data refresh cannot leave this
+        process in a half-updated state mid-rebalance.
+    _MODEL_PATH -- models/v4_investor_lgbm.txt.
+    --inference -- how the feature step is invoked here, keeping today's row
+        (which training would discard for having no known future).
+    usable_equity -- account equity after EQUITY_BUFFER; the base every target
+        weight is applied to.
 """
 
 from __future__ import annotations
