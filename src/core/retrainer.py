@@ -22,6 +22,121 @@ Environment Variables:
     ALPACA_API_KEY: Alpaca API key
     ALPACA_SECRET_KEY: Alpaca API secret
     DISCORD_WEBHOOK_URL: Discord webhook for retraining reports (optional)
+
+This is the training half of the system. Nothing here runs during live trading;
+it fetches history, builds labels, trains the two models, tests them on data
+they never saw, and only overwrites the live model files if that test passes.
+Domain terms (angel/devil, ATR/NATR, bracket, chop veto, walk-forward, OOS,
+Brier score, profit factor) are defined in GLOSSARY.md.
+
+Artifacts written on promotion, into ``model_dir`` (default models/<asset_class>/):
+    angel_latest.pkl, devil_latest.pkl, metadata.json, threshold.json,
+    feature_stats.json, and spread_alphas.json when the cost experiment is on.
+All are written to a temp name then os.replace()d, so the live bot's
+hot-reloader can never read a half-written file.
+
+Glossary:
+    DAYS_BACK -- how many days of history to train on (default 60, override
+        RETRAIN_DAYS_BACK).
+    _DEFAULT_TICKERS_BY_CLASS -- the default instrument basket per asset class.
+        The forex basket is volatility-first (two metals plus JPY/commonwealth
+        crosses) because the calm G7 majors failed the gate outright. Override
+        with RETRAIN_SYMBOLS.
+    get_asset_config -- turns DATA_SOURCE ("oanda" -> forex, else equities)
+        into one dict of every knob the run needs: basket, bracket multipliers,
+        hold limit, bar size, and where to save.
+    model_dir -- save destination. Defaults to the production models/<class>/;
+        set RETRAIN_MODEL_DIR to train a side candidate without overwriting the
+        promoted model, while keeping every other setting identical.
+    get_hyperparameters -- returns (angel_params, devil_params) for LightGBM.
+        Both are deterministic by construction (fixed seed, force_row_wise) so
+        two runs on the same data give the same model.
+
+    SL_ATR_MULTIPLIER / TP_ATR_MULTIPLIER -- bracket width in units of the
+        instrument's own recent volatility: stop at 0.5x, target at 3.0x, i.e.
+        a 6:1 payoff. Must stay identical to the live orchestrators or the
+        model is trained on trades the bot would never take.
+    MAX_HOLD_BARS -- 45. A trade that reaches neither level within 45 bars is
+        labelled a loss (timeout), because capital was tied up for nothing.
+    SURVIVAL_BARS -- 5. The horizon for the Devil's survival label, below.
+    ANGEL_THRESHOLD -- 0.40. Minimum Angel probability for a bar to count as a
+        proposed trade.
+    DEVIL_THRESHOLD -- 0.50, fallback only. The real threshold is chosen per
+        run by _find_optimal_threshold() and saved to threshold.json.
+
+    BRIER_THRESHOLD -- 0.30 gate ceiling on probability calibration. Raised
+        from 0.25 deliberately: the survival label's ~45% base rate puts a
+        do-nothing classifier near 0.25, so the old value rejected honest
+        models.
+    EV_THRESHOLD -- 0.0005, minimum average return per trade to promote.
+    PROFIT_FACTOR_THRESHOLD -- 1.2, minimum gross-win / gross-loss ratio.
+    MIN_OOS_TRADES_FOR_PF -- 100, the legacy single-fold sample-size floor,
+        superseded by the pooled floor below but still referenced.
+    BASELINE_POOLED_OOS_TRADES -- 300. Trades are pooled across all folds and
+        the requirement is scaled down by the chop veto's drop rate
+        (effective_floor = 300 x (1 - chop_veto_rate)), so a filter that
+        correctly discards a third of the bars is not punished for the trades
+        it removed. This floor exists because a handful of lucky wins at 6:1
+        payoff can fake a passing profit factor.
+    USE_HMM_FEATURES -- off by default (RETRAIN_USE_HMM=1 to enable). Adds
+        3 hidden-regime probability features, fit per fold to avoid leakage.
+    _SPREAD_TABLE_PATH / SPREAD_TABLE -- optional per-instrument trading-cost
+        table (RETRAIN_SPREAD_TABLE). When set, the cost gate uses each
+        instrument's measured cost instead of one flat assumption, a
+        ``cost_ratio`` feature is added so the model can see cost directly, and
+        the table is copied next to the model on promotion. Unset, runs are
+        bit-identical to before that experiment.
+
+    BASE_FEATURE_COLS -- the 22 always-on model inputs, in four groups:
+        10 single-bar indicators, 4 higher-timeframe (htf_*) views of the
+        slower chart, 4 candle-shape microstructure measures, and 4 one-hot
+        trading-session flags.
+    FEATURE_COLS -- BASE_FEATURE_COLS plus cost_ratio and/or the HMM columns
+        when those experiments are enabled. This exact list and order must
+        match what the live strategy feeds the model.
+
+    FoldMetrics -- one walk-forward fold's scorecard: sizes, Brier, expected
+        value, win rate, and both trade counts.
+    angel_proposed_trades vs devil_approved_trades -- how many bars stage one
+        liked versus how many survived stage two. The ratio is the Devil's
+        selectivity.
+    ValidationReport -- the aggregate verdict across folds, plus gate_passed
+        and the human-readable rejection_reasons list that gets posted to
+        Discord.
+    chop_veto_rate -- fraction of training rows the chop veto discarded.
+    effective_trade_floor -- the drop-rate-scaled trade count actually required.
+
+    fetch_training_data -- pulls raw bars per symbol from the configured
+        provider and stacks them into one frame.
+    _compute_devil_targets_atr -- the MACRO label: replay each bar forward up
+        to max_hold and record whether target or stop came first. Stop is
+        checked first each bar, so a bar touching both is scored a loss.
+    _compute_devil_survival_target -- the label actually trained on: did price
+        avoid the stop for the next 5 bars. Introduced because the Devil's
+        inputs describe a 1-5 minute horizon, so asking it about a 45-bar
+        outcome was an unlearnable mismatch.
+    _compute_chop_veto_mask -- vectorised copy of the live pre-trade veto, so
+        the model only ever learns from bars the live bot would actually
+        trade. Gate A rejects bars where the stop is too tight relative to
+        trading cost; Gate B rejects bars whose volatility sits too low in its
+        own recent range (dead, choppy conditions).
+    engineer_features_and_labels -- runs the feature pipeline, builds both
+        labels, applies the veto, and returns the clean training frame.
+    generate_time_decay_weights -- weights recent rows more heavily
+        (decay_factor 0.95) so the model leans toward current market behaviour.
+    refit_models -- trains the Angel then the Devil on one window.
+    _find_optimal_threshold -- sweeps candidate Devil cut-offs and picks the
+        one maximising expected value, subject to a minimum trade count.
+    validate_candidate -- the gate itself: 3 expanding walk-forward folds,
+        each trained on the past and scored on the future it never saw. The
+        full-data production model is trained only after the gate passes.
+    promote_or_reject -- the single decision point. On pass it writes the model
+        files; on fail it returns False and the previous production weights are
+        left untouched.
+    save_models / save_threshold / save_spread_table -- the atomic writers for
+        the artifacts listed above.
+    Exit codes -- 0 promoted, 1 execution error, 2 trained but rejected. Note
+        that 2 is not a failure of this script; it means the gate did its job.
 """
 
 from __future__ import annotations

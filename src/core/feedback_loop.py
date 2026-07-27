@@ -13,6 +13,39 @@ Inputs:
 Output:
     - Terminal metrics summary
     - Discord alert (if drift detected)
+
+This is the watchdog half of the LEGACY offline loop: resolver.py grades the
+signals, this module decides whether the grades are bad enough to justify
+retraining. Its exit code is what run_pipeline.sh reads to decide whether to
+invoke the retrainer. See GLOSSARY.md ("drift", "Brier score", "OOS").
+
+Glossary:
+    RESOLVED_PATH -- data/resolved_ledger.csv, written by resolver.py. The only
+        input; this module writes no files.
+    TAKE_PROFIT / STOP_LOSS -- +0.5% / -0.2%, the same legacy fixed brackets
+        resolver.py used. Only used to turn win/loss counts into an average
+        return per trade, so they must match resolver.py or the EV is wrong.
+    CRITICAL_BRIER -- 0.25. Above this the probabilities are considered badly
+        calibrated and drift is declared. (The retrainer's own gate uses a
+        looser 0.30 for a different target; the two numbers are not the same
+        test.)
+    MINIMUM_EV -- 0.0005, i.e. the model must make at least 0.05% per trade on
+        average. Below that -- or negative -- counts as drift.
+    PerformanceMetrics -- the computed scorecard: win rate, expected value,
+        Brier score, log loss, and the raw trade/win/loss counts.
+    win_rate -- wins / (wins + losses). Descriptive only; no gate reads it.
+    expected_value -- average return per trade, as a fraction (0.001 = 0.1%).
+    brier_score -- mean squared error between the Devil's predicted
+        probabilities and what actually happened. 0.0 is perfect; lower is
+        better. This is the calibration test.
+    log_loss -- cross-entropy of the same probabilities. Reported for context;
+        it is not gated on. Probabilities are clipped away from 0 and 1 first
+        so a single confident miss cannot make it infinite.
+    DriftEvaluator.data -- the loaded resolved ledger.
+    check_drift -- returns (is_drifted, reason); a model fails if EITHER the
+        Brier or the EV condition trips, and the reasons are concatenated.
+    run() exit codes -- 0 healthy, 1 execution error, 2 critical drift. 2 is
+        the value run_pipeline.sh keys on to trigger a retrain.
 """
 
 from __future__ import annotations
