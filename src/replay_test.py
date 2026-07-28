@@ -30,7 +30,8 @@ Glossary:
         by evaluate_performance.py and reinforcement_voter.py.
     ANGEL_MODEL_PATH / DEVIL_MODEL_PATH -- the legacy root-level model paths
         (models/angel_latest.pkl), not the current per-asset-class layout.
-    ANGEL_THRESHOLD / DEVIL_THRESHOLD -- 0.40 / 0.50, matching live.
+    ANGEL_THRESHOLD / DEVIL_THRESHOLD -- matching live; the Angel bar is
+        imported from core.thresholds (0.40 unless env-overridden).
     WARMUP_PERIOD -- 260 bars before signals are emitted, sized for the
         50-period average on 5-minute bars.
     FEATURE_NAMES -- this script's own feature list; verify it still matches
@@ -61,6 +62,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from src.ml.feature_pipeline import FeaturePipeline
 from src.ml.features.v3_features import V3BaseFeatures, V3HTFFeatures
 from src.ml.trainers.v3_rf_trainer import V3RandomForestTrainer
+from src.core.thresholds import ANGEL_THRESHOLD
 from src.strategies.concrete_strategies.ml_strategy import MLStrategy
 
 logging.basicConfig(
@@ -76,7 +78,7 @@ ANGEL_MODEL_PATH = Path("models/angel_latest.pkl")
 DEVIL_MODEL_PATH = Path("models/devil_latest.pkl")
 
 # Thresholds (must match training configuration)
-ANGEL_THRESHOLD = 0.40
+# Angel bar imported from core.thresholds (shared repo-wide, env-overridable)
 DEVIL_THRESHOLD = 0.50
 WARMUP_PERIOD = 260  # V3.3: expanded for 5m HTF SMA-50 warm-up (250 bars minimum)
 

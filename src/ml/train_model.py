@@ -22,7 +22,8 @@ Glossary:
         liked: of these candidates, which are actually worth taking. It vetoes.
         Two stages exist because one model tuned for both jobs does neither
         well. See GLOSSARY.md.
-    ANGEL_THRESHOLD -- 0.40, the confidence above which the Angel proposes.
+    ANGEL_THRESHOLD -- the confidence above which the Angel proposes; imported
+        from core.thresholds (0.40 unless env-overridden).
     DEVIL_THRESHOLD -- 0.50, the confidence above which the Devil approves.
         (Production learns this value per retrain instead of fixing it.)
     EXCLUDE_COLS -- columns that must never be fed to the model: timestamp,
@@ -54,6 +55,7 @@ import pandas as pd
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import classification_report, precision_score, roc_auc_score, recall_score
 
+from core.thresholds import ANGEL_THRESHOLD
 from ml.core.interfaces import BaseTrainer
 from ml.trainers.v3_rf_trainer import V3RandomForestTrainer
 
@@ -66,8 +68,8 @@ logger = logging.getLogger(__name__)
 _PROCESSED_DIR = Path("data/processed")
 _MODEL_DIR = Path("src/ml/models")
 
-# Meta-Labeling Configuration
-ANGEL_THRESHOLD = 0.40
+# Meta-Labeling Configuration — the Angel bar comes from core.thresholds
+# (shared repo-wide; the ANGEL_THRESHOLD env var overrides it).
 DEVIL_THRESHOLD = 0.50
 
 # Columns to exclude from features (prevent data leakage)

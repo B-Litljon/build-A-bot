@@ -96,6 +96,24 @@ the `metadata` dict rather than as named fields.
 - **Imported by:** `src/execution/live_orchestrator.py`,
   `src/core/notification_manager.py`. **Data artifacts:** none.
 
+### `thresholds.py`
+`ANGEL_THRESHOLD` — the single source of truth for the Angel proposal bar
+(0.40 unless the `ANGEL_THRESHOLD` env var overrides at process start).
+Exists because the value was previously hardcoded independently in eight
+files, while the Devil's training population and the bracket fit are both
+conditioned on it — the stages must move together or they silently drift.
+The retrainer pins the value into `threshold.json` at save time, and
+`MLStrategy` prefers that pinned value over this constant, so the env
+override is a train/analysis-time knob, not a live-tuning knob.
+
+- **Imports from repo:** none.
+- **Imported by:** `core/retrainer.py`, `execution/live_orchestrator.py`,
+  `strategies/concrete_strategies/ml_strategy.py`, `ml/train_model.py`,
+  `day_trading/train_model.py`, `analysis/optimize_brackets.py`,
+  `analysis/failure_modes.py`, `replay_test.py`. **Data artifacts:** none
+  directly (retrainer writes the value into `threshold.json` /
+  `metadata.json`).
+
 ### `order_management.py` — ⚠️ dead
 `OrderParams`, a percentage-multiplier risk config its own docstring describes
 as backtest-only and explicitly warns against wiring into live execution. It

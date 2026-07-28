@@ -1,6 +1,6 @@
 # `tests/`
 
-**114 tests, all passing.** Run with:
+**128 tests, all passing.** Run with:
 
 ```bash
 PYTHONPATH=src:. python -m pytest -q
@@ -13,7 +13,7 @@ webhook on import).
 
 > ⚠️ **`verify_warmup.py` is never run.** It contains a real test case, but
 > collection also requires the default `test_*.py` filename pattern and this
-> file doesn't match. The suite reports 114 collected and this one isn't among
+> file doesn't match. The suite reports 128 collected and this one isn't among
 > them. Renaming it to `test_warmup.py` would include it. Flagged, not changed.
 
 **No network, no broker, no real models.** Every test stubs its dependencies —
@@ -42,12 +42,12 @@ See the root [GLOSSARY.md](../GLOSSARY.md) for domain terms.
 | `test_stream_liveness.py` | 9 | What happens when the price feed goes silent |
 | `test_cost_feature.py` | 9 | The per-instrument cost feature and veto alphas |
 | `test_trading_mcp.py` | 9 | The MCP two-step confirm-token safety flow |
-| `execution/test_live_orchestrator.py` | 8 | State machine + **thread-ownership regression** |
+| `execution/test_live_orchestrator.py` | 12 | State machine + **thread-ownership regression** + persistence ownership |
 | `test_oanda_entry.py` | 5 | Net-position arithmetic |
 | `test_oanda_tick_hook.py` | 5 | The raw tick callback contract |
 | `test_execution_safety.py` | 3 | Rebalance deadband, fill parsing, partial fills |
 | `test_retrainer_output_dir.py` | 3 | `RETRAIN_MODEL_DIR` isolation |
-| `test_ml_strategy_guards.py` | 2 | The stale-bar guard |
+| `test_ml_strategy_guards.py` | 5 | The stale-bar guard + threshold.json pinning |
 | `verify_warmup.py` | (1, **not collected**) | Warm-up injection |
 
 ### Tests worth understanding before changing anything

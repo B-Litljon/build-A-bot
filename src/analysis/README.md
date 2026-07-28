@@ -30,10 +30,15 @@ an entry that was wrong immediately rather than one that drifted.
   under `src/ml/models/`), `data/oos_bars.parquet`, `data/raw/`.
 - **Writes:** console only.
 
-### `optimize_brackets.py`
+### `optimize_brackets.py` — ⚠️ import-dead
 Holds the model's signals fixed and sweeps 100 bracket geometries
 (4 stop widths × 5 target widths × 5 hold limits) to ask what *would* have made
 the most of them.
+
+> ⚠️ **Does not currently import**: it references `get_alpaca_client`, removed
+> from `core/retrainer.py` on 2026-05-22 (59a1125). Any bracket numbers it
+> ever produced predate the M15 era — the live M15 brackets actually come from
+> `RiskProfile.for_asset_class("forex")`, not from this script.
 
 > ⚠️ The obvious trap: sweeping 100 combinations against one fixed history and
 > keeping the winner is curve-fitting. Treat the result as a hypothesis to test

@@ -65,7 +65,8 @@ See GLOSSARY.md (angel/devil, bracket, NATR, sealed bar, watchdog, HTF).
 
 Glossary:
     ── decision thresholds ──
-    ANGEL_THRESHOLD -- 0.40, stage one's bar for proposing a trade.
+    ANGEL_THRESHOLD -- stage one's bar for proposing a trade; imported from
+        core.thresholds (0.40 unless the ANGEL_THRESHOLD env var overrides).
     DEVIL_THRESHOLD -- 0.50, stage two's bar for approving it.
     ATR_KILL_SWITCH_THRESHOLD -- 0.5204 (in NATR percent units). Above this,
         volatility is judged too violent to trade and the bar is skipped
@@ -219,6 +220,7 @@ from alpaca.trading.stream import TradingStream
 # so bare module names resolve correctly inside the src/ tree.
 from core.notification_manager import NotificationManager
 from core.signal import Signal, SignalType
+from core.thresholds import ANGEL_THRESHOLD
 from ml.feature_pipeline import FeaturePipeline
 from ml.features.v3_features import V3BaseFeatures, V3HTFFeatures
 from strategies.concrete_strategies.ml_strategy import MLStrategy
@@ -233,9 +235,8 @@ from utils.bar_aggregator import LiveBarAggregator
 # src/analysis/reinforcement_voter.py on fresh OOS data.
 ATR_KILL_SWITCH_THRESHOLD: float = 0.5204  # natr_14 percentage units
 
-# Angel/Devil classification thresholds — restored to standard after the
-# crypto-only stress-test sprint.
-ANGEL_THRESHOLD: float = 0.40
+# Angel/Devil classification thresholds. The Angel bar is imported from
+# core.thresholds — one shared, env-overridable constant repo-wide.
 # Legacy fallback only — production threshold is loaded dynamically from
 # models/threshold.json by _load_devil_threshold() at orchestrator startup.
 DEVIL_THRESHOLD: float = 0.50

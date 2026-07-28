@@ -20,7 +20,8 @@ Glossary:
     SL_MULTIPLIERS / TP_MULTIPLIERS / MAX_HOLD_OPTIONS -- the grid:
         4 stop widths x 5 target widths x 5 hold limits = 100 combinations,
         each simulated against every signal.
-    ANGEL_THRESHOLD / DEVIL_THRESHOLD -- 0.40 / 0.50, held FIXED. Only bracket
+    ANGEL_THRESHOLD / DEVIL_THRESHOLD -- 0.40 / 0.50 (Angel imported from
+        core.thresholds, env-overridable), held FIXED per run. Only bracket
         geometry is swept; the model's opinions are the input, not the variable.
     MODEL_PATHS -- candidate model locations, tried in order.
     TICKERS -- the legacy 5-symbol equities basket.
@@ -45,6 +46,7 @@ import polars as pl
 from src.ml.feature_pipeline import FeaturePipeline
 from src.ml.features.v3_features import V3BaseFeatures, V3HTFFeatures
 from src.core.retrainer import fetch_training_data, get_alpaca_client
+from src.core.thresholds import ANGEL_THRESHOLD
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,8 +59,10 @@ SL_MULTIPLIERS = [0.5, 1.0, 1.5, 2.0]
 TP_MULTIPLIERS = [1.0, 1.5, 2.0, 2.5, 3.0]
 MAX_HOLD_OPTIONS = [10, 15, 20, 30, 45]
 
-# Model thresholds (must match LiveOrchestrator / MLStrategy)
-ANGEL_THRESHOLD = 0.40
+# Model thresholds. The Angel bar is imported from core.thresholds (shared
+# repo-wide, env-overridable): brackets are fitted on the population above
+# this bar, so optimizing at one value and trading at another fits the
+# wrong cohort.
 DEVIL_THRESHOLD = 0.50
 
 # Model paths — primary (retrainer output), then fallback (train_model output)

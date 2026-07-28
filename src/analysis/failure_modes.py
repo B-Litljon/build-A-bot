@@ -23,7 +23,8 @@ Glossary:
     FAST_SL_CUTOFF -- 3. A stop hit within the first 3 bars counts as a "fast"
         loss, the signature of an entry that was wrong immediately rather than
         one that drifted against the position.
-    ANGEL_THRESHOLD / DEVIL_THRESHOLD -- 0.40 / 0.50, the same gates as live.
+    ANGEL_THRESHOLD / DEVIL_THRESHOLD -- the same gates as live; the Angel bar
+        is imported from core.thresholds (0.40 unless env-overridden).
     ANGEL_PATH / DEVIL_PATH -- primary model locations (legacy root paths).
     ALT_ANGEL_PATH / ALT_DEVIL_PATH -- fallbacks under src/ml/models/ for the
         even older joblib artifacts.
@@ -44,6 +45,7 @@ import joblib
 import numpy as np
 import polars as pl
 
+from src.core.thresholds import ANGEL_THRESHOLD
 from src.ml.feature_pipeline import FeaturePipeline
 from src.ml.features.v3_features import V3BaseFeatures, V3HTFFeatures
 
@@ -60,8 +62,9 @@ TP_ATR_MULTIPLIER = 3.0
 MAX_HOLD_BARS = 45
 FAST_SL_CUTOFF = 3  # bars 1-3 = "fast" SL hit
 
-# Model thresholds (must match LiveOrchestrator / MLStrategy)
-ANGEL_THRESHOLD = 0.40
+# Model thresholds. The Angel bar is imported from core.thresholds (shared
+# repo-wide, env-overridable) so an analysis sweep and a retrain cannot
+# disagree about the proposal population.
 DEVIL_THRESHOLD = 0.50
 
 # Model paths — primary (retrainer output), then fallback (train_model output)

@@ -32,6 +32,7 @@ project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root / "src"))
 
 from core.retrainer import get_asset_config, save_models, save_threshold
+from core.thresholds import ANGEL_THRESHOLD
 
 
 class TestRetrainerOutputDir(unittest.TestCase):
@@ -72,6 +73,14 @@ class TestRetrainerOutputDir(unittest.TestCase):
             meta = json.loads((override / "metadata.json").read_text())
             self.assertEqual(meta["asset_class"], "forex")
             self.assertEqual(meta["trained_on_symbols"], ["XAU_USD", "XAG_USD"])
+
+            # threshold.json pins BOTH bars: the tuned Devil value passed in,
+            # and the Angel bar the pair was trained at (added 2026-07 so a
+            # deployed model can't run at a different population than it was
+            # fitted for).
+            thr = json.loads((override / "threshold.json").read_text())
+            self.assertEqual(thr["devil_threshold"], 0.27)
+            self.assertEqual(thr["angel_threshold"], round(ANGEL_THRESHOLD, 4))
 
 
 if __name__ == "__main__":

@@ -64,7 +64,8 @@ Glossary:
     MAX_HOLD_BARS -- 45. A trade that reaches neither level within 45 bars is
         labelled a loss (timeout), because capital was tied up for nothing.
     SURVIVAL_BARS -- 5. The horizon for the Devil's survival label, below.
-    ANGEL_THRESHOLD -- 0.40. Minimum Angel probability for a bar to count as a
+    ANGEL_THRESHOLD -- imported from core.thresholds (0.40 unless the env var
+        overrides at process start). Minimum Angel probability for a bar to count as a
         proposed trade.
     DEVIL_THRESHOLD -- 0.50, fallback only. The real threshold is chosen per
         run by _find_optimal_threshold() and saved to threshold.json.
@@ -329,7 +330,12 @@ SURVIVAL_BARS = 5  # Phase 5.5: Devil survival window (bars)
 # INFERENCE THRESHOLDS (must match MLStrategy)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-ANGEL_THRESHOLD = 0.40
+# The Angel bar is imported, not defined here: core.thresholds is the single
+# source of truth (ANGEL_THRESHOLD env var overrides at process start). The
+# Devil trains only on Angel-approved rows (Phase 5.5) and the bracket
+# optimizer fits on the same population — one value, or the stages drift.
+from src.core.thresholds import ANGEL_THRESHOLD  # noqa: E402
+
 # Legacy: used as a fallback. In validate_candidate(), the Devil threshold
 # is dynamically selected per-fold via _find_optimal_threshold().
 DEVIL_THRESHOLD = 0.50
@@ -2047,6 +2053,7 @@ def save_models(
         "trained_at": datetime.now(timezone.utc).isoformat(),
         "trained_on_symbols": asset_config.get("tickers", []),
         "data_source": os.getenv("DATA_SOURCE", "alpaca").strip().lower(),
+        "angel_threshold": ANGEL_THRESHOLD,
     }
     with open(metadata_temp, "w") as f:
         json.dump(metadata, f, indent=2)
@@ -2077,6 +2084,11 @@ def save_threshold(threshold: float, asset_config: dict) -> None:
 
     data = {
         "devil_threshold": round(threshold, 4),
+        # Pin the Angel bar the pair was trained at: the Devil's training
+        # population and the bracket fit are conditioned on it, so the live
+        # strategy must run the model at this value (MLStrategy overrides
+        # its default with this key when present).
+        "angel_threshold": round(ANGEL_THRESHOLD, 4),
         "updated_at": datetime.now().isoformat(),
     }
 

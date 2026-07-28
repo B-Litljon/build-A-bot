@@ -27,9 +27,12 @@ Glossary:
         (models/<asset_class>/) when explicit paths are not given.
     angel_path / devil_path -- the two model pickles. Resolved relative to the
         project root if not found as given.
-    angel_threshold -- 0.40; how confident stage one must be to propose.
+    angel_threshold -- how confident stage one must be to propose. Default
+        from core.thresholds (0.40, env-overridable), then OVERRIDDEN by the
+        angel_threshold pinned in the model's threshold.json when present —
+        a pair must run at the bar its Devil and brackets were fitted for.
     devil_threshold -- the approval bar for stage two. Set from the
-        constructor, then OVERWRITTEN by _load_threshold() from the model's
+        constructor, then OVERWRITTEN by _load_thresholds() from the model's
         threshold.json, because the retrainer tunes this value per model.
     warmup_period -- 260 bars minimum before trading. Sized for a 50-period
         average on 5-minute bars (50 x 5 = 250 plus headroom); acting sooner
@@ -57,8 +60,9 @@ Glossary:
         feature vector on the first live bar.
     _validate_metadata -- checks metadata.json next to the model to confirm the
         model's asset class matches. Warns (not raises) if absent.
-    _load_threshold -- reads threshold.json from the model dir; falls back to
-        the constructor value.
+    _load_thresholds -- reads threshold.json from the model dir (the tuned
+        Devil bar and, since 2026-07, the pinned Angel bar); falls back to
+        the constructor values for missing keys.
     _load_spread_table -- reads spread_alphas.json from the model dir, so a
         model always uses the cost assumptions it was trained against.
 
@@ -102,6 +106,7 @@ warnings.filterwarnings("ignore", message=".*join_asof.*")
 
 from strategies.base import BaseStrategy, Signal
 from core.notification_manager import NotificationManager
+from core.thresholds import ANGEL_THRESHOLD as DEFAULT_ANGEL_THRESHOLD
 
 # CRITICAL: Import FeaturePipeline to prevent training/inference skew
 from ml.feature_pipeline import FeaturePipeline
@@ -147,7 +152,7 @@ class MLStrategy(BaseStrategy):
         asset_class: str = "equities",
         angel_path: str | Path = None,
         devil_path: str | Path = None,
-        angel_threshold: float = 0.40,
+        angel_threshold: float = DEFAULT_ANGEL_THRESHOLD,
         devil_threshold: float = 0.50,
         warmup_period: int = 260,  # default for 1m base / 5m HTF
         timeframe: int = 1,
@@ -297,10 +302,13 @@ class MLStrategy(BaseStrategy):
         # Validate metadata sidecar
         self._validate_metadata()
 
-        # Override devil_threshold with the value persisted by the retrainer
-        # (models/threshold.json).  Must be called AFTER self.devil_threshold is
-        # set above so _load_threshold() can use it as a fallback.
-        self.devil_threshold = self._load_threshold()
+        # Override both thresholds with the values persisted by the retrainer
+        # (threshold.json in the model dir). Must be called AFTER the
+        # instance values are set above so _load_thresholds() can use them as
+        # fallbacks. The Angel value pins the population the pair was
+        # trained/bracketed at; artifacts predating 2026-07 pin only the
+        # Devil and fall back to the constructor default for the Angel.
+        self.angel_threshold, self.devil_threshold = self._load_thresholds()
 
         # Heartbeat state: every N bars per symbol, log a summary of the
         # angel_prob distribution. Lets the operator see the model is
@@ -347,46 +355,57 @@ class MLStrategy(BaseStrategy):
                 raise
             logger.warning("_validate_metadata: failed to read %s (%s)", metadata_path, exc)
 
-    def _load_threshold(self) -> float:
+    def _load_thresholds(self) -> "tuple[float, float]":
         """
-        Load the Devil model's optimal threshold from the model directory's
-        threshold.json (next to the pkl artifacts, so side models carry their own).
+        Load pinned decision thresholds from the model directory's
+        threshold.json (next to the pkl artifacts, so side models carry
+        their own).
 
-        Written by retrainer.save_threshold() after a successful validation gate.
-        Falls back to self.devil_threshold (the value passed to __init__) if the
-        file is absent or corrupt.
+        Written by retrainer.save_threshold() after a successful validation
+        gate. ``devil_threshold`` has been persisted since the beginning;
+        ``angel_threshold`` since 2026-07 — it pins the population the pair
+        was trained and bracketed at, so a deployed model cannot be run at a
+        different Angel bar than it was fitted for. Either key falls back to
+        the current instance value (the constructor default) when absent, so
+        older artifacts keep working.
 
         Returns:
-            float: The production threshold for Devil approval decisions.
+            (angel_threshold, devil_threshold) for production decisions.
         """
         threshold_path = self.angel_path.parent / "threshold.json"
         if not threshold_path.exists():
             logger.warning(
-                "_load_threshold: %s not found — "
-                "using constructor default devil_threshold=%.2f",
+                "_load_thresholds: %s not found — using defaults "
+                "angel=%.2f devil=%.2f",
                 threshold_path,
+                self.angel_threshold,
                 self.devil_threshold,
             )
-            return self.devil_threshold
+            return self.angel_threshold, self.devil_threshold
         try:
             with open(threshold_path, "r") as fh:
                 data = json.load(fh)
-            threshold = float(data["devil_threshold"])
+            devil = float(data["devil_threshold"])
+            angel = float(data.get("angel_threshold", self.angel_threshold))
             logger.info(
-                "_load_threshold: loaded production threshold=%.4f from %s",
-                threshold,
+                "_load_thresholds: loaded production thresholds "
+                "angel=%.4f%s devil=%.4f from %s",
+                angel,
+                "" if "angel_threshold" in data else " (default; not pinned)",
+                devil,
                 threshold_path,
             )
-            return threshold
+            return angel, devil
         except Exception as exc:
             logger.warning(
-                "_load_threshold: failed to read %s (%s) — "
-                "using constructor default devil_threshold=%.2f",
+                "_load_thresholds: failed to read %s (%s) — using defaults "
+                "angel=%.2f devil=%.2f",
                 threshold_path,
                 exc,
+                self.angel_threshold,
                 self.devil_threshold,
             )
-            return self.devil_threshold
+            return self.angel_threshold, self.devil_threshold
 
     def _load_spread_table(self) -> tuple:
         """
@@ -517,14 +536,23 @@ class MLStrategy(BaseStrategy):
                     logger.critical(msg)
                     self.notification_manager.send_system_message(msg)
 
-                # Also reload the threshold — a retrain always produces a new
-                # threshold.json alongside the new model weights.
-                old_threshold = self.devil_threshold
-                self.devil_threshold = self._load_threshold()
-                if self.devil_threshold != old_threshold:
+                # Also reload the thresholds — a retrain always produces a
+                # new threshold.json alongside the new model weights.
+                old_angel = self.angel_threshold
+                old_devil = self.devil_threshold
+                self.angel_threshold, self.devil_threshold = (
+                    self._load_thresholds()
+                )
+                if self.angel_threshold != old_angel:
+                    logger.info(
+                        "[HOT-RELOAD] Angel threshold updated: %.4f -> %.4f",
+                        old_angel,
+                        self.angel_threshold,
+                    )
+                if self.devil_threshold != old_devil:
                     logger.info(
                         "[HOT-RELOAD] Devil threshold updated: %.4f -> %.4f",
-                        old_threshold,
+                        old_devil,
                         self.devil_threshold,
                     )
 

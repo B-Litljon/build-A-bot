@@ -35,3 +35,6 @@ backtest_output.log
 .DS_Store
 
 soak.off
+
+# Offline analysis artifacts (rescued/derived data; regenerable)
+analysis_cache/

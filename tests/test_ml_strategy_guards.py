@@ -1,3 +1,5 @@
+import json
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
@@ -15,6 +17,11 @@ Glossary:
         produce no signal, even if the model would have approved.
     test_matching_timestamps_proceed_to_prediction -- and the guard must not
         block the normal case.
+    TestThresholdLoading -- threshold.json pins BOTH stage bars since 2026-07:
+        a pinned angel_threshold overrides the constructor default (a pair
+        must run at the bar its Devil/brackets were fitted for), a legacy
+        file without the key keeps the default, and a missing file keeps
+        both defaults. Uses MLStrategy.__new__ to skip model loading.
 """
 
 import sys
@@ -85,6 +92,47 @@ class TestStaleFeatureGuard(unittest.TestCase):
         # blocker: with aligned real features this exercises the full path
         # without raising. (Signal may legitimately be None on rejection.)
         self.assertTrue(result is None or result.direction == "long")
+
+
+class TestThresholdLoading(unittest.TestCase):
+    """threshold.json pins BOTH stage bars (angel_threshold added 2026-07)."""
+
+    @staticmethod
+    def _bare_strategy(model_dir: Path) -> MLStrategy:
+        # __new__ bypasses the heavy model-loading __init__ —
+        # _load_thresholds only touches angel_path and the two instance
+        # defaults, so this stays a unit test.
+        s = MLStrategy.__new__(MLStrategy)
+        s.angel_threshold = 0.40
+        s.devil_threshold = 0.50
+        s.angel_path = model_dir / "angel_latest.pkl"
+        return s
+
+    def test_pinned_angel_overrides_default(self):
+        """A pinned angel_threshold wins over the constructor default."""
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td)
+            (p / "threshold.json").write_text(
+                json.dumps({"devil_threshold": 0.48, "angel_threshold": 0.325})
+            )
+            s = self._bare_strategy(p)
+            self.assertEqual(s._load_thresholds(), (0.325, 0.48))
+
+    def test_legacy_artifact_without_angel_keeps_default(self):
+        """Pre-2026-07 threshold.json (devil only) keeps the Angel default."""
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td)
+            (p / "threshold.json").write_text(
+                json.dumps({"devil_threshold": 0.48})
+            )
+            s = self._bare_strategy(p)
+            self.assertEqual(s._load_thresholds(), (0.40, 0.48))
+
+    def test_missing_file_keeps_both_defaults(self):
+        """No threshold.json at all -> both constructor values survive."""
+        with tempfile.TemporaryDirectory() as td:
+            s = self._bare_strategy(Path(td))
+            self.assertEqual(s._load_thresholds(), (0.40, 0.50))
 
 
 if __name__ == "__main__":

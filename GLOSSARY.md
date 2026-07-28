@@ -111,7 +111,11 @@ the first model's signals rather than the market directly.
 
 **threshold** — the confidence level above which a stage acts. The Devil's is
 not fixed; the retrainer tunes it per model and saves it to `threshold.json`,
-which the live strategy loads at startup and on hot reload.
+which the live strategy loads at startup and on hot reload. The Angel's is a
+single repo-wide constant (`src/core/thresholds.py`; `ANGEL_THRESHOLD` env
+var overrides at train/analysis time) that the retrainer also pins into
+`threshold.json`, so a deployed pair always runs at the bar its Devil and
+brackets were fitted for.
 
 **angel_prob / devil_prob** — each stage's output probability, carried in a
 signal's metadata and shown in Discord alerts.
@@ -394,7 +398,7 @@ travelling together so a model always matches its assumptions:
 | File | What it is |
 |---|---|
 | `angel_latest.pkl` / `devil_latest.pkl` | The two trained models. |
-| `threshold.json` | The Devil threshold tuned for *this* model. |
+| `threshold.json` | The Devil threshold tuned for *this* model, plus (since 2026-07) the pinned Angel bar the pair was trained at. |
 | `metadata.json` | Asset class, timeframe, symbols, training date. Read at boot to confirm the bot trades what the model was trained on. |
 | `feature_stats.json` | Training feature distributions + null calibration, for drift probing. |
 | `spread_alphas.json` | The cost table this model was trained against. |
