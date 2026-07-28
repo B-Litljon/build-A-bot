@@ -1,0 +1,106 @@
+  XAU_USD: 6451 bars scored, 566 simulated
+  XAG_USD: 6451 bars scored, 609 simulated
+  GBP_JPY: 6777 bars scored, 551 simulated
+  AUD_JPY: 6777 bars scored, 390 simulated
+  EUR_JPY: 6776 bars scored, 557 simulated
+  NZD_JPY: 6777 bars scored, 349 simulated
+  GBP_AUD: 6777 bars scored, 433 simulated
+  GBP_NZD: 6777 bars scored, 376 simulated
+
+Sanity vs sweep session (8,087 overlapping bars): max |d angel_prob| = 0.00e+00, max |d devil_prob| = 0.00e+00
+
+OOS window: 2026-07-03 -> now  (3.60 calendar wk) | tradeable-6 candidate bars: OOS 9,917 / IS 30,744
+Devil threshold: 0.48 | timeout rate among sims: 0.0%
+
+══ OUT-OF-SAMPLE (tradeable 6) ══
+
+-- Angel only (no Devil, no gates)
+ thresh |      n     WR     avg%     tot%      PF   n/wk
+  0.250 |    672  36.9%     +nan     +nan    0.56  186.5
+  0.275 |    262  40.1%     +nan     +nan    0.62   72.7
+  0.300 |    121  45.5%  -0.0070    -0.85    0.80   33.6
+  0.325 |     68  45.6%  -0.0070    -0.48    0.80   18.9
+  0.350 |     42  40.5%  -0.0137    -0.57    0.65   11.7
+  0.375 |     27  51.9%  -0.0028    -0.07    0.92    7.5
+  0.400 |     20  65.0%  +0.0112    +0.22    1.41    5.6
+  0.450 |     11  63.6%  +0.0085    +0.09    1.28    3.1
+
+-- Angel + Devil
+ thresh |      n     WR     avg%     tot%      PF   n/wk
+  0.250 |    563  36.9%     +nan     +nan    0.57  156.3
+  0.275 |    214  37.9%     +nan     +nan    0.57   59.4
+  0.300 |    106  43.4%  -0.0091    -0.97    0.75   29.4
+  0.325 |     59  42.4%  -0.0118    -0.69    0.68   16.4
+  0.350 |     38  36.8%  -0.0190    -0.72    0.54   10.5
+  0.375 |     24  50.0%  -0.0069    -0.17    0.80    6.7
+  0.400 |     18  61.1%  +0.0040    +0.07    1.13    5.0
+  0.450 |     11  63.6%  +0.0085    +0.09    1.28    3.1
+
+-- Angel + Devil + Gates A/B/C (live-faithful)
+ thresh |      n     WR     avg%     tot%      PF   n/wk
+  0.250 |    371  35.8%     +nan     +nan    0.61  103.0
+  0.275 |    128  33.6%  -0.0206    -2.64    0.52   35.5
+  0.300 |     59  39.0%  -0.0085    -0.50    0.76   16.4
+  0.325 |     29  31.0%  -0.0194    -0.56    0.51    8.0
+  0.350 |     18  22.2%  -0.0315    -0.57    0.29    5.0
+  0.375 |      9  33.3%  -0.0231    -0.21    0.40    2.5
+  0.400 |      4  75.0%  +0.0231    +0.09    2.96    1.1
+  0.450 |      0      -       -        -       -      -
+
+══ MARGINAL BAND, OOS, gates applied (the trades a lower threshold ADDS) ══
+            band |       n     WR     avg%     tot%      PF   n/wk
+ >=0.400 (today) |      4  75.0%  +0.0231    +0.09    2.96    1.1
+     0.350-0.400 |     14   7.1%  -0.0470    -0.66    0.12    3.9
+     0.325-0.350 |     11  45.5%  +0.0003    +0.00    1.01    3.1
+     0.300-0.325 |     30  46.7%  +0.0020    +0.06    1.06    8.3
+     0.250-0.300 |    312  35.3%     +nan     +nan    0.59   86.6
+
+(same bands, Devil ignored)
+ >=0.400 (today) |      5  80.0%  +0.0360    +0.18    4.82    1.4
+     0.350-0.400 |     14   7.1%  -0.0470    -0.66    0.12    3.9
+     0.325-0.350 |     14  42.9%  -0.0026    -0.04    0.92    3.9
+     0.300-0.325 |     35  48.6%  +0.0013    +0.04    1.04    9.7
+     0.250-0.300 |    353  34.3%     +nan     +nan    0.56   98.0
+
+══ DEVIL VERDICT (angel_prob >= 0.40 rows = its training population) ══
+
+IN-SAMPLE: n=133 | pass n=115 (86%) avg +0.1083% WR 87.0% | veto n=18 avg -0.0470% WR 33.3% | spearman(devil_prob, pnl) = +0.614
+
+OUT-OF-SAMPLE: n=20 | pass n=18 (90%) avg +0.0040% WR 61.1% | veto n=2 avg +0.0763% WR 100.0% | spearman(devil_prob, pnl) = -0.242
+
+[extrapolation 0.325-0.40, OOS, reference only] pass n=41 avg -0.0187% | veto n=7 avg +0.0092%
+
+══ PER-INSTRUMENT, OOS, gates applied, Devil ignored ══
+
+threshold 0.325
+   symbol |       n     WR     avg%     tot%      PF   n/wk
+  AUD_JPY |      3  66.7%  +0.0313    +0.09    2.43    0.8
+  EUR_JPY |     13  38.5%  -0.0060    -0.08    0.80    3.6
+  GBP_AUD |      4   0.0%  -0.0748    -0.30    0.00    1.1
+  GBP_JPY |     13  30.8%  -0.0179    -0.23    0.55    3.6
+  GBP_NZD |      0      -       -        -       -      -
+  NZD_JPY |      0      -       -        -       -      -
+
+threshold 0.35
+   symbol |       n     WR     avg%     tot%      PF   n/wk
+  AUD_JPY |      2  50.0%  +0.0109    +0.02    1.33    0.6
+  EUR_JPY |      9  33.3%  -0.0104    -0.09    0.67    2.5
+  GBP_AUD |      3   0.0%  -0.0774    -0.23    0.00    0.8
+  GBP_JPY |      5  20.0%  -0.0350    -0.18    0.21    1.4
+  GBP_NZD |      0      -       -        -       -      -
+  NZD_JPY |      0      -       -        -       -      -
+
+threshold 0.4
+   symbol |       n     WR     avg%     tot%      PF   n/wk
+  AUD_JPY |      1 100.0%  +0.0876    +0.09     inf    0.3
+  EUR_JPY |      3  66.7%  +0.0152    +0.05    1.97    0.8
+  GBP_AUD |      0      -       -        -       -      -
+  GBP_JPY |      1 100.0%  +0.0466    +0.05     inf    0.3
+  GBP_NZD |      0      -       -        -       -      -
+  NZD_JPY |      0      -       -        -       -      -
+
+angel_prob IS (candidates only, >= 0.25): n=30744 p50=0.156 p90=0.237 max=0.833
+
+angel_prob OOS (candidates only, >= 0.25): n=9917 p50=0.159 p90=0.239 max=0.673
+
+study_scored.parquet written.
