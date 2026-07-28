@@ -45,6 +45,21 @@ Glossary:
         first live bars are not double-counted or scored twice. The "seam" is
         that junction between replayed and live data.
     _prime_history -- fetches the warm-up bars at boot.
+    _last_scored_ts -- per symbol, the newest bar timestamp that actually went
+        through signal evaluation (streamed or catch-up). Deliberately NOT
+        reset on reconnect: it is the dedup that stops repeated re-primes
+        inside one bar period from scoring the same bar twice (= duplicate
+        orders).
+    _catch_up_missed_bars -- after every prime, scores the newest primed bar
+        if it sealed while the stream was down and is still fresh. Before this
+        existed, bars sealing during an outage were fetched into the buffer
+        but never evaluated (~6 of 15 would-be signals died in these gaps
+        during the 2026-07 soak).
+    _seam_catchup_max_age -- SEAM_CATCHUP_MAX_AGE_SECONDS; how stale a missed
+        bar may be and still be scored. -1 (default) = one bar period,
+        0 disables catch-up.
+    _evaluate_and_trade -- the decision tail (inference → guards → bracket →
+        order) shared by the stream path and the catch-up path.
     _reconcile_on_boot -- asks the broker what is actually open before trading.
         A restart must adopt reality rather than assume it is flat -- otherwise
         a position left by a crashed process would run with nothing watching
@@ -194,6 +209,22 @@ class OandaScalperOrchestrator:
         self._seam_crossed: Dict[str, bool] = {
             _to_oanda_symbol(s): False for s in symbols
         }
+
+        # Newest bar timestamp that went through signal evaluation, per
+        # symbol. NOT reset on reconnect — this is the dedup that keeps
+        # repeated re-primes inside one bar period from scoring (and
+        # potentially trading) the same bar twice.
+        self._last_scored_ts: Dict[str, Optional[datetime]] = {
+            _to_oanda_symbol(s): None for s in symbols
+        }
+
+        # Seam catch-up staleness bound, in seconds. Bars that sealed while
+        # the stream was down are only scored if at most this old. -1 means
+        # "one granularity period" (resolved at catch-up time, when the
+        # provider's granularity is known); 0 disables catch-up entirely.
+        self._seam_catchup_max_age = float(
+            os.getenv("SEAM_CATCHUP_MAX_AGE_SECONDS", "-1")
+        )
 
         # Position state: symbol -> {entry, sl, tp, units, state}
         self._positions: Dict[str, dict] = {}
@@ -588,6 +619,21 @@ class OandaScalperOrchestrator:
             )
             return
 
+        # Record this bar as scored BEFORE evaluating — even a None signal
+        # counts as "seen", so the seam catch-up can never rescore it.
+        self._last_scored_ts[symbol] = bar["timestamp"]
+
+        await self._evaluate_and_trade(symbol)
+
+    async def _evaluate_and_trade(self, symbol: str) -> None:
+        """
+        Decision tail shared by the stream path and the seam catch-up.
+
+        Reads the CURRENT bar buffer for ``symbol`` and runs: strategy
+        inference → position-state guards → bracket gates → order submit →
+        position record. Acts on the newest buffer row; callers own freshness
+        and dedup (``_last_scored_ts``).
+        """
         # ── generate signal ──
         df = pl.DataFrame(self._bar_buffers[symbol])
         try:
@@ -894,6 +940,79 @@ class OandaScalperOrchestrator:
                 self._last_hist_ts[norm_sym],
             )
 
+    async def _catch_up_missed_bars(self) -> None:
+        """
+        Score the newest primed bar per symbol if it was never evaluated.
+
+        Bars that seal while the stream is down (disconnect, restart, broker
+        maintenance) are fetched by ``_prime_history`` into the buffer, but
+        the stream never replays them — before this existed their signals
+        were silently lost (~6 of 15 would-be signals died in these gaps
+        during the 2026-07 soak). Runs after every prime, BEFORE the stream
+        (re)starts, so it cannot race ``_on_bar``.
+
+        Only the newest sealed bar is considered: older missed bars are
+        decisions whose moment has passed. ``_last_scored_ts`` dedups across
+        repeated reconnects inside one bar period; the age bound skips
+        weekend/maintenance gaps. At boot this may re-enter a position that
+        ``_reconcile_on_boot`` just flattened — deliberate: the signal is
+        still live, and a restart should re-adopt it with fresh brackets.
+        """
+        max_age = self._seam_catchup_max_age
+        gran_min = getattr(self._provider, "_stream_gran", 1)
+        if max_age < 0:
+            max_age = float(gran_min) * 60.0
+        if max_age == 0:
+            return
+        now = datetime.now(timezone.utc)
+        for norm_sym, buf in self._bar_buffers.items():
+            try:
+                if not buf or len(buf) < self._warmup:
+                    continue
+                bar = buf[-1]
+                ts = bar.get("timestamp")
+                if not isinstance(ts, datetime) or ts.tzinfo is None:
+                    logger.warning(
+                        "[%s] Seam catch-up skipped: newest primed bar has "
+                        "no usable timestamp (%r)",
+                        norm_sym,
+                        ts,
+                    )
+                    continue
+                sealed_at = ts + timedelta(minutes=gran_min)
+                age = (now - sealed_at).total_seconds()
+                if age < 0:
+                    continue  # not sealed yet (defensive; prime filters these)
+                if age > max_age:
+                    logger.info(
+                        "[%s] Seam catch-up: newest bar %s sealed %.0fs ago "
+                        "(> %.0fs) — too stale to act on, skipping",
+                        norm_sym,
+                        ts,
+                        age,
+                        max_age,
+                    )
+                    continue
+                last = self._last_scored_ts.get(norm_sym)
+                if last is not None and ts <= last:
+                    continue  # already scored (repeat reconnect in one bar)
+                logger.info(
+                    "SEAM_CATCHUP [%s] bar %s sealed %.0fs ago while the "
+                    "stream was down — scoring it now",
+                    norm_sym,
+                    ts,
+                    age,
+                )
+                # Mark BEFORE evaluating: a failed evaluation must not retry
+                # on the next reconnect — duplicate-order risk outranks one
+                # lost signal.
+                self._last_scored_ts[norm_sym] = ts
+                await self._evaluate_and_trade(norm_sym)
+            except Exception as e:
+                logger.error(
+                    "[%s] Seam catch-up failed: %s", norm_sym, e, exc_info=True
+                )
+
     async def _stream_with_retry(self) -> None:
         """Run the pricing stream with reconnect-on-disconnect."""
         while not self._shutdown_event.is_set():
@@ -920,6 +1039,9 @@ class OandaScalperOrchestrator:
                 self._seam_crossed[sym] = False
 
             await self._prime_history()
+
+            # Score anything that sealed while we were dark (fresh bars only)
+            await self._catch_up_missed_bars()
 
             # Defensive: clear provider stop event in case it was set
             self._provider.reset_stop()
@@ -998,6 +1120,11 @@ class OandaScalperOrchestrator:
         )
 
         await self._prime_history()
+
+        # A signal bar that sealed just before this process started (crash
+        # relaunch, watchdog restart) is in the primed history but would
+        # otherwise never be scored — catch it while it is still fresh.
+        await self._catch_up_missed_bars()
 
         # Run the pricing stream with reconnect-on-disconnect wrapper
         self._stream_task = asyncio.create_task(self._stream_with_retry())

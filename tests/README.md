@@ -37,7 +37,7 @@ See the root [GLOSSARY.md](../GLOSSARY.md) for domain terms.
 |---|---:|---|
 | `test_composite_fundamentals.py` | 18 | Provider chaining: first non-empty wins; a raising source is a miss, not an error |
 | `test_risk_manager.py` | 16 | The bracket floors and all three chop gates |
-| `test_oanda_scalper.py` | 15 | The live bot's control flow — mostly failure paths |
+| `test_oanda_scalper.py` | 22 | The live bot's control flow — mostly failure paths |
 | `test_feature_stats.py` | 12 | The stats artifact and the PSI maths |
 | `test_stream_liveness.py` | 9 | What happens when the price feed goes silent |
 | `test_cost_feature.py` | 9 | The per-instrument cost feature and veto alphas |
@@ -67,6 +67,11 @@ stream thread and must dispatch, not block),
 *parked*, not forgotten — forgetting it means an open position nothing is
 watching), and the `test_boot_reconcile_*` group (on startup, ask the broker
 what's really open; a failed sync **aborts** rather than proceeding blind).
+The `test_seam_catchup_*` group pins the reconnect-gap fix: a bar that sealed
+while the stream was down is scored exactly once if fresh — stale bars and
+already-scored bars are skipped, and an evaluation error must not escape (it
+would kill the reconnect loop). This is the fix for the 2026-07 soak losing
+~half its signals in re-prime gaps.
 
 **`test_oanda_tick_hook.py`** — `test_tick_callback_exception_logged_continues`
 is the important one: an exception escaping the callback would kill the price

@@ -68,7 +68,7 @@ Note the forex profile overrides the bracket multipliers to **1.0× / 2.0×**
 - **Data artifacts:** none directly; reads per-instrument costs passed in from
   the model dir's `spread_alphas.json`.
 
-### `oanda_scalper_orchestrator.py` (994 lines) — ⚠️ the live bot
+### `oanda_scalper_orchestrator.py` (1218 lines) — ⚠️ the live bot
 `OandaScalperOrchestrator`. Two clocks run at once, and most of the design
 follows from that:
 
@@ -80,8 +80,13 @@ follows from that:
 
 Things worth knowing:
 
-- **History seam** (`_last_hist_ts`, `_seam_crossed`) — warm-up history and the
-  live stream overlap in time; these prevent double-counting at the junction.
+- **History seam** (`_last_hist_ts`, `_seam_crossed`, `_last_scored_ts`) —
+  warm-up history and the live stream overlap in time; these prevent
+  double-counting at the junction. After every (re)prime,
+  `_catch_up_missed_bars` scores the newest sealed bar if it landed while the
+  stream was down and is still fresh (`SEAM_CATCHUP_MAX_AGE_SECONDS`; default
+  one bar period). Before this existed, signals sealing during an outage were
+  silently lost — ~6 of 15 would-be signals in the 2026-07 soak.
 - **`_reconcile_on_boot`** — asks the broker what's actually open before
   trading. A restart must adopt reality, not assume it's flat, or a position
   left by a crashed process runs with nothing watching its stop.
