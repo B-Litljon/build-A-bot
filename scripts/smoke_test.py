@@ -5,6 +5,19 @@ Verifies:
   1. FactoryOrchestrator instantiates cleanly against Alpaca Paper keys.
   2. A3 chop filter: calculate_bracket() returns None when 0.5x ATR < 0.15% floor.
   3. $50 min notional: calculate_quantity() returns 0.0 for zombie trades.
+
+A hand-run sanity check on the Factory path, not part of the pytest suite. Its
+"DO NOT COMMIT" header is stale -- the file IS committed, and the equivalent
+assertions now live in tests/test_risk_manager.py.
+
+Glossary:
+    Test 1 -- construction against real paper credentials, i.e. does the whole
+        object graph wire up and authenticate.
+    Test 2 -- the chop filter's refusal path: a stop narrower than the floor
+        must return None (no trade), not a tiny bracket.
+    Test 3 -- the $50 minimum: sizing must return 0.0 rather than a dust
+        position not worth its own commission.
+    zombie trade -- a position too small to be worth holding.
 """
 
 import os

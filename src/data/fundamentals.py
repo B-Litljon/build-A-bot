@@ -6,6 +6,24 @@ be imported from this module.  This file must not import any vendor SDKs.
 
 Concrete implementations:
   - YFinanceFundamentalProvider  (src/data/providers/yf_fundamentals.py)
+  - SimFinFundamentalProvider    (src/data/providers/simfin_fundamentals.py)
+  - CompositeFundamentalProvider (src/data/providers/composite_fundamentals.py)
+
+Company financials, used by the monthly equities investor to rank stocks.
+The forex scalper never touches this.
+
+Glossary:
+    FundamentalProvider -- the contract for any source of company financials.
+        Every method returns empty rather than raising, so a missing company
+        degrades one row instead of failing a whole ranking run.
+    get_company_info -- static descriptive data: sector, industry, name,
+        country, market cap, currency, exchange. Sector is the one the
+        investor's diversification cap depends on.
+    get_valuation_metrics -- point-in-time ratios: trailing and forward P/E,
+        price-to-book, EV/EBITDA, PEG, price-to-sales, return on equity, gross
+        margins. Values are floats or None.
+    get_quarterly_financials -- quarterly income-statement lines as a
+        DataFrame indexed by period_end, most recent quarter first.
 """
 
 from __future__ import annotations

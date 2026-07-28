@@ -1,3 +1,110 @@
+"""
+The Shield -- bracket sizing, position sizing, and the "chop filter" that
+refuses trades not worth taking.
+
+Two jobs, both applied AFTER a strategy has already decided it wants to trade:
+
+1. Turn a raw volatility number into a stop and target distance.
+2. Veto the trade entirely if conditions make it unwinnable -- if the cost of
+   trading eats the expected move, if the market is too quiet to move at all,
+   or if it is a time of day when spreads blow out.
+
+The veto is the important part. A model can be perfectly correct about
+direction and still lose money on an instrument whose trading cost exceeds the
+move being predicted, which is exactly what this filter exists to prevent.
+
+SYMMETRY CONTRACT: ``coupled_keff`` and the gate logic here are mirrored by
+``retrainer._compute_chop_veto_mask`` so the model only ever trains on bars the
+live bot would actually trade. Change a gate here and the training side must
+change with it, or the model learns from setups it will never be given.
+
+See GLOSSARY.md (chop veto, NATR, bracket, spread, pip).
+
+Glossary:
+    RiskProfile -- all the tunable numbers, per asset class. Built by
+        for_asset_class(), which also reads the environment overrides.
+    sl_atr_multiplier / tp_atr_multiplier -- bracket width in units of recent
+        volatility. Defaults 0.5 / 3.0 (a 6:1 payoff) for equities; the FOREX
+        profile overrides these to 1.0 / 2.0 (2:1). Always check which profile
+        is live before assuming a ratio.
+    risk_per_trade -- 0.02, i.e. risk 2% of account equity per trade. This,
+        not a fixed size, is what determines position size.
+    max_notional_cap -- 100000, a hard ceiling on position value regardless of
+        what the risk maths asks for.
+    round_precision -- decimal places for bracket prices; 4 for equities, 5 for
+        forex (which quotes finer).
+    min_sl_pct -- 0.0015 (0.15%), the equities stop floor.
+    min_sl_pips -- 2.0, the forex stop floor in pips.
+    min_sl_pct_metals -- 0.0001, a PERCENT floor for gold/silver, because a
+        forex "pip" of 0.0001 is meaningless on an instrument priced near 2700
+        and would never trigger.
+    _METAL_BASES -- {XAU, XAG, XPT, XPD}; how a metal is recognised.
+    _get_forex_pip_size -- 0.01 for anything quoted in JPY, 0.0001 otherwise.
+
+    ── The three gates ──
+    last_veto_gate -- which gate rejected the most recent call, or GATE_NONE.
+        The orchestrator reads this to log WHICH constraint is binding.
+    GATE_SPREAD / GATE_REGIME / GATE_TIME / GATE_STATIC / GATE_NONE -- the
+        identifiers for that telemetry.
+    Gate A (cost, GATE_SPREAD) -- rejects when the stop distance is smaller
+        than the cost of trading: sl_dist < k_eff * spread. Trading through a
+        toll bigger than the move you are targeting loses on average even when
+        the direction is right.
+    Gate B (regime, GATE_REGIME) -- rejects when current volatility sits in the
+        bottom regime_pctile (20%) of its own recent window. A market too quiet
+        to move cannot reach the target before the hold limit expires.
+    Gate C (time, GATE_TIME) -- rejects everything inside a daily blackout
+        window, default 16:55-17:30 New York (_DEFAULT_BLACKOUT_ET). This is
+        the daily rollover, when spreads briefly blow out roughly tenfold.
+        Checked FIRST and independent of volatility, because the spread is
+        toxic then regardless of conditions. Anchored to New York local time,
+        not UTC, so it tracks daylight saving instead of drifting an hour
+        twice a year.
+
+    spread_k_base -- 1.5; the base safety multiple on cost in Gate A.
+    spread_k_coupling -- 0.0 by default, i.e. DECOUPLED and flat. Non-zero
+        makes the multiplier scale with volatility.
+    spread_k_coupling_mode -- "tighten" (more cost discipline as volatility
+        rises) or "loosen" (less). Two competing theses, left switchable so a
+        soak can decide between them.
+    coupled_keff -- computes the effective multiplier. Scales only ABOVE the
+        median volatility, and is clipped at >= 1.0 so a passing trade's cost
+        can never exceed its own stop distance. Shared verbatim with the
+        training side; that sharing is the symmetry contract.
+    regime_pctile -- 20.0; Gate B's cut-off percentile.
+    regime_window -- 260 BARS (not calendar time) of volatility history.
+    regime_min_samples -- 60. Below this the window is "cold": Gate B is
+        bypassed entirely and Gate A runs decoupled, so a just-started bot does
+        not veto everything on a half-filled buffer.
+    spread_atr_alpha -- 0.15, the assumed cost as a fraction of baseline
+        volatility, used when no fresh live spread is available.
+    _alpha_overrides -- per-instrument measured costs from the model's
+        spread_alphas.json. Used ONLY in the stale-spread fallback; a fresh
+        live spread always wins.
+    spread_fresh -- whether the passed spread is recent enough to trust. When
+        false the volatility-scaled proxy is used instead.
+
+    ── Kill switches (all environment variables) ──
+    RISK_CHOP_FILTER_ENABLED -- master off switch for ALL gating.
+    RISK_SPREAD_GATE_ENABLED / RISK_REGIME_GATE_ENABLED /
+        RISK_TIME_GATE_ENABLED -- per-gate switches. Every flag treats
+        0/false/no/off as disabled and anything else (including unset) as
+        enabled, so gates are ON by default.
+
+    ── Sizing ──
+    calculate_bracket -- returns (sl_distance, tp_distance) as DISTANCES, or
+        None when a gate vetoes. Two paths: the dynamic hybrid gates when a
+        regime_series is supplied (live forex), otherwise the legacy static
+        floor (equities / cold start).
+    calculate_quantity -- position size from risk_per_trade, then capped by
+        max_notional_cap and by available buying power (95% of it). Returns
+        the smallest of the three.
+    is_crypto -- routes sizing to the cash balance instead of buying power,
+        because Alpaca reports crypto funds in the cash field.
+    $50 minimum notional -- anything smaller returns 0.0 and the trade is
+        skipped, to avoid pointless dust positions.
+"""
+
 import logging
 import os
 from dataclasses import dataclass
@@ -179,8 +286,17 @@ class RiskManager:
     """
     The Shield: Enforces institutional-grade safety nets and dynamic sizing.
     """
-    def __init__(self, profile: RiskProfile = RiskProfile()):
+    def __init__(
+        self,
+        profile: RiskProfile = RiskProfile(),
+        alpha_overrides: Optional[dict] = None,
+    ):
         self.profile = profile
+        # Per-instrument spread alphas ({symbol: alpha_emp}, from the model
+        # dir's spread_alphas.json). Used ONLY in Gate A's stale-spread proxy
+        # branch — a fresh live tick spread always wins. Symbols not listed
+        # fall back to the flat profile.spread_atr_alpha.
+        self._alpha_overrides: dict = alpha_overrides or {}
         # Which gate vetoed the most recent calculate_bracket() call (read by
         # the orchestrator for split telemetry). GATE_NONE when it passed.
         self.last_veto_gate: str = GATE_NONE
@@ -318,8 +434,16 @@ class RiskManager:
             else:
                 # Volatility-scaled proxy (matches the training-side proxy):
                 # baseline ATR (median of window) converted from NATR% to price.
+                # Per-instrument measured alpha when the model dir shipped a
+                # spread table; flat profile value otherwise.
+                alpha = self._alpha_overrides.get(symbol, p.spread_atr_alpha)
                 baseline_atr_abs = float(np.median(arr)) * entry_price / 100.0
-                spread_proxy, src = p.spread_atr_alpha * baseline_atr_abs, "proxy"
+                spread_proxy = alpha * baseline_atr_abs
+                src = (
+                    f"proxy/alpha={alpha:.3f}"
+                    if symbol in self._alpha_overrides
+                    else "proxy"
+                )
             floor = k_eff * spread_proxy
             if sl_dist < floor:
                 logger.info(

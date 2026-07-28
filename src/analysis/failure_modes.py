@@ -7,6 +7,30 @@ and classifies each trade outcome to guide the next optimization step.
 
 Usage (from project root):
     python -m src.analysis.failure_modes
+
+Offline diagnostic, not part of live trading. It answers "HOW are the losers
+losing?" -- stopped out instantly, bled out slowly, or timed out flat -- which
+points at different fixes (too-tight stop, no edge, too-short hold).
+
+⚠️ Reads the LEGACY root-level model paths (models/angel_latest.pkl), not the
+current per-asset-class layout (models/forex/, models/forex_m15/). Those old
+files still exist on disk, so it runs, but it is diagnosing the old equities
+models unless the paths are changed.
+
+Glossary:
+    SL_ATR_MULTIPLIER / TP_ATR_MULTIPLIER / MAX_HOLD_BARS -- 0.5 / 3.0 / 45,
+        the simulated bracket. Kept in step with the retrainer's defaults.
+    FAST_SL_CUTOFF -- 3. A stop hit within the first 3 bars counts as a "fast"
+        loss, the signature of an entry that was wrong immediately rather than
+        one that drifted against the position.
+    ANGEL_THRESHOLD / DEVIL_THRESHOLD -- the same gates as live; the Angel bar
+        is imported from core.thresholds (0.40 unless env-overridden).
+    ANGEL_PATH / DEVIL_PATH -- primary model locations (legacy root paths).
+    ALT_ANGEL_PATH / ALT_DEVIL_PATH -- fallbacks under src/ml/models/ for the
+        even older joblib artifacts.
+    OOS_BARS_PATH -- data/oos_bars.parquet, the bars to diagnose against.
+    RAW_DATA_DIR -- data/raw/, the fallback source.
+    TICKERS -- the legacy 5-symbol equities basket.
 """
 
 from __future__ import annotations
@@ -21,6 +45,7 @@ import joblib
 import numpy as np
 import polars as pl
 
+from src.core.thresholds import ANGEL_THRESHOLD
 from src.ml.feature_pipeline import FeaturePipeline
 from src.ml.features.v3_features import V3BaseFeatures, V3HTFFeatures
 
@@ -37,8 +62,9 @@ TP_ATR_MULTIPLIER = 3.0
 MAX_HOLD_BARS = 45
 FAST_SL_CUTOFF = 3  # bars 1-3 = "fast" SL hit
 
-# Model thresholds (must match LiveOrchestrator / MLStrategy)
-ANGEL_THRESHOLD = 0.40
+# Model thresholds. The Angel bar is imported from core.thresholds (shared
+# repo-wide, env-overridable) so an analysis sweep and a retrain cannot
+# disagree about the proposal population.
 DEVIL_THRESHOLD = 0.50
 
 # Model paths — primary (retrainer output), then fallback (train_model output)

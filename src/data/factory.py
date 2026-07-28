@@ -12,6 +12,32 @@ Fundamental provider — reads ``FUNDAMENTAL_SOURCES`` env (comma-separated):
     - ``yfinance``/``yahoo`` — Yahoo Finance fundamentals
     - ``none``             — no fundamentals (empty responses)
     Multiple sources are chained: first non-empty result wins.
+
+This is the single switch that decides which market the bot is trading. The
+live forex scalper runs with DATA_SOURCE=oanda; the equities work uses alpaca.
+Vendor SDKs are imported lazily inside each branch so that, for example,
+running OANDA never requires the Polygon package to be installed.
+
+Glossary:
+    get_market_provider -- reads DATA_SOURCE and returns a ready-to-use
+        provider. Raises ValueError on an unrecognised value rather than
+        silently defaulting, so a typo cannot quietly trade the wrong market.
+    DATA_SOURCE -- "alpaca" (default), "polygon", "yahoo", or "oanda".
+    PAPER_MODE -- Alpaca only; "True" (the default) routes to the paper
+        account. Note the default is paper, so real money requires an explicit
+        opt-out.
+    OANDA_ENV -- "practice" (default) or "live", the OANDA equivalent.
+    OANDA_STREAM_GRANULARITY_MIN -- bar size the live tick stream aggregates
+        into, in minutes (default 1).
+    YAHOO_POLL_INTERVAL -- seconds between Yahoo polls (default 60); Yahoo has
+        no push feed.
+    get_fundamental_provider -- builds the company-financials source used by
+        the equities investor, not the scalper.
+    FUNDAMENTAL_SOURCES -- ordered comma-separated list ("simfin" default,
+        also "yfinance"/"yahoo", or "none"). Sources are chained and the first
+        non-empty answer wins, so a primary can fall back to a secondary.
+    _REGISTRY -- maps those source names to fully-qualified class paths, which
+        are imported by string so an unused vendor's package is never loaded.
 """
 
 import logging

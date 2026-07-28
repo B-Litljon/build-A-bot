@@ -10,6 +10,118 @@ Design constraints:
 - Tick callback runs synchronously on the provider's blocking stream thread;
   it must return in <50 µs and do NO blocking I/O.
 - Software SL/TP only — never pass native brackets to the broker.
+
+⚠️ THIS IS THE ORCHESTRATOR CURRENTLY RUNNING LIVE (the M15 practice-account
+soak, relaunched automatically by soak_watchdog.sh). Treat edits accordingly.
+
+Two clocks run here at once, and most of the design follows from that:
+  * the SLOW path -- a bar seals, features are computed, the model is asked,
+    and a trade may open. Runs every bar (e.g. every 15 minutes).
+  * the FAST path -- every incoming quote is checked against the open
+    position's stop and target. Runs thousands of times per bar, on the
+    provider's stream thread, which is why it must stay microsecond-cheap.
+
+See GLOSSARY.md (angel/devil, chop veto, NATR, spread, bracket, sealed bar,
+heartbeat, watchdog).
+
+Glossary:
+    units_per_trade -- 1000, a FIXED position size. Note this path does not use
+        RiskManager.calculate_quantity; only the bracket logic is shared.
+    _warmup -- bars required before trading, taken from the strategy.
+    _max_bars -- warmup * 2, the per-symbol buffer cap, so memory stays flat
+        over a multi-day soak.
+    _bar_buffers -- rolling recent bars per symbol, the input to inference.
+    _positions -- symbol -> {entry, sl, tp, units, state}. Guarded by
+        _positions_lock because the tick thread reads it while the loop writes.
+    _positions_lock -- a threading.Lock, not an asyncio one, precisely because
+        a non-async thread touches this state.
+    flatten_on_exit -- whether shutdown closes everything. Default True: a
+        stopped bot must not leave unmonitored positions open, since stops are
+        enforced in software by THIS process.
+
+    ── history seam ──
+    _last_hist_ts / _seam_crossed -- warm-up history and the live stream
+        overlap in time. These track where the fetched history ended so the
+        first live bars are not double-counted or scored twice. The "seam" is
+        that junction between replayed and live data.
+    _prime_history -- fetches the warm-up bars at boot.
+    _last_scored_ts -- per symbol, the newest bar timestamp that actually went
+        through signal evaluation (streamed or catch-up). Deliberately NOT
+        reset on reconnect: it is the dedup that stops repeated re-primes
+        inside one bar period from scoring the same bar twice (= duplicate
+        orders).
+    _catch_up_missed_bars -- after every prime, scores the newest primed bar
+        if it sealed while the stream was down and is still fresh. Before this
+        existed, bars sealing during an outage were fetched into the buffer
+        but never evaluated (~6 of 15 would-be signals died in these gaps
+        during the 2026-07 soak).
+    _seam_catchup_max_age -- SEAM_CATCHUP_MAX_AGE_SECONDS; how stale a missed
+        bar may be and still be scored. -1 (default) = one bar period,
+        0 disables catch-up.
+    _evaluate_and_trade -- the decision tail (inference → guards → bracket →
+        order) shared by the stream path and the catch-up path.
+    _reconcile_on_boot -- asks the broker what is actually open before trading.
+        A restart must adopt reality rather than assume it is flat -- otherwise
+        a position left by a crashed process would run with nothing watching
+        its stop.
+
+    ── the fast path ──
+    _on_tick -- runs on the provider's stream thread for EVERY quote. Records
+        the spread and checks stop/target. Must return in under 50
+        microseconds and do no blocking I/O; anything slower stalls the feed.
+    _latest_spread / _latest_spread_ts -- most recent bid-ask gap per symbol,
+        written lock-free from that thread (single writer, so safe).
+    _spread_stale_seconds -- 5 (RISK_SPREAD_STALE_SECONDS). Older than this and
+        the cost gate falls back to its volatility-scaled estimate rather than
+        trusting a stale number.
+    _watchdog_close -- the actual software exit. Retries up to
+        _close_max_attempts (5, OANDA_CLOSE_MAX_ATTEMPTS) because a failed
+        close leaves a live position with no protection.
+
+    ── volatility tracking ──
+    _wilder_atr / _regime_natr / _regime_prev_close -- a running volatility
+        estimate advanced once per sealed bar in constant time, rather than
+        recomputing over a window every bar. Seeded once at boot from the
+        priming history.
+    _natr_period -- 14, deliberately matching v3_features._NATR_PERIOD so the
+        live gate and the model's features measure volatility identically.
+    _regime_window -- how many bars of volatility history the regime gate
+        sees; read from the RiskProfile so the two cannot disagree.
+
+    ── chop-gate telemetry ──
+    _devil_approved_total -- how many signals cleared BOTH model stages.
+    _spread_gate_rejections / _regime_gate_rejections / _time_gate_rejections
+        -- of those, how many each gate then vetoed. Split per gate so a soak
+        log answers "why didn't it trade?" with a specific constraint rather
+        than a shrug.
+    _a3_chop_rejections -- the combined count.
+
+    ── spread calibration (SPREAD_CALIB) ──
+    Purpose: the assumed trading cost (alpha = 0.15) was a placeholder. This
+    samples the REAL spread once per sealed bar -- off the fast path -- so the
+    assumption can be replaced with measured per-instrument values.
+    _spread_pct_samples / _baseline_natr_samples -- bounded deques of the two
+        quantities, both expressed as a percent of price so their ratio is
+        dimensionless and directly comparable to spread_atr_alpha.
+    _spread_calib_maxlen -- 20000 (SPREAD_CALIB_MAXLEN); bounded so memory is
+        flat and the estimate stays recency-weighted.
+    _spread_calib_interval -- log every 60 bars (SPREAD_CALIB_INTERVAL_BARS).
+    _log_spread_calibration -- emits the empirical alpha =
+        median(spread_pct) / median(baseline_natr) per instrument. These are
+        the numbers scripts/bake_spread_alphas.py turns into a table.
+
+    ── liveness ──
+    _stream_stale_seconds -- 60 (OANDA_STREAM_STALE_SECONDS). OANDA heartbeats
+        every ~5s, so a minute of silence means the feed is dead.
+    _check_stream_liveness / _liveness_watchdog -- the backstop: force a
+        reconnect and FLATTEN exposure if the feed goes quiet. Critical because
+        stops are software-enforced -- a dead feed means an unwatched position,
+        so the safe response is to hold nothing.
+    _stream_with_retry -- reconnect loop around the blocking stream.
+    _notify -- fires Discord posts off the event loop; they are blocking HTTP
+        calls with a 5s timeout and must never block the loop.
+    shutdown / _flatten_all -- graceful stop: stop the stream, optionally close
+        everything, then exit.
 """
 
 import asyncio
@@ -97,6 +209,22 @@ class OandaScalperOrchestrator:
         self._seam_crossed: Dict[str, bool] = {
             _to_oanda_symbol(s): False for s in symbols
         }
+
+        # Newest bar timestamp that went through signal evaluation, per
+        # symbol. NOT reset on reconnect — this is the dedup that keeps
+        # repeated re-primes inside one bar period from scoring (and
+        # potentially trading) the same bar twice.
+        self._last_scored_ts: Dict[str, Optional[datetime]] = {
+            _to_oanda_symbol(s): None for s in symbols
+        }
+
+        # Seam catch-up staleness bound, in seconds. Bars that sealed while
+        # the stream was down are only scored if at most this old. -1 means
+        # "one granularity period" (resolved at catch-up time, when the
+        # provider's granularity is known); 0 disables catch-up entirely.
+        self._seam_catchup_max_age = float(
+            os.getenv("SEAM_CATCHUP_MAX_AGE_SECONDS", "-1")
+        )
 
         # Position state: symbol -> {entry, sl, tp, units, state}
         self._positions: Dict[str, dict] = {}
@@ -491,6 +619,21 @@ class OandaScalperOrchestrator:
             )
             return
 
+        # Record this bar as scored BEFORE evaluating — even a None signal
+        # counts as "seen", so the seam catch-up can never rescore it.
+        self._last_scored_ts[symbol] = bar["timestamp"]
+
+        await self._evaluate_and_trade(symbol)
+
+    async def _evaluate_and_trade(self, symbol: str) -> None:
+        """
+        Decision tail shared by the stream path and the seam catch-up.
+
+        Reads the CURRENT bar buffer for ``symbol`` and runs: strategy
+        inference → position-state guards → bracket gates → order submit →
+        position record. Acts on the newest buffer row; callers own freshness
+        and dedup (``_last_scored_ts``).
+        """
         # ── generate signal ──
         df = pl.DataFrame(self._bar_buffers[symbol])
         try:
@@ -797,6 +940,79 @@ class OandaScalperOrchestrator:
                 self._last_hist_ts[norm_sym],
             )
 
+    async def _catch_up_missed_bars(self) -> None:
+        """
+        Score the newest primed bar per symbol if it was never evaluated.
+
+        Bars that seal while the stream is down (disconnect, restart, broker
+        maintenance) are fetched by ``_prime_history`` into the buffer, but
+        the stream never replays them — before this existed their signals
+        were silently lost (~6 of 15 would-be signals died in these gaps
+        during the 2026-07 soak). Runs after every prime, BEFORE the stream
+        (re)starts, so it cannot race ``_on_bar``.
+
+        Only the newest sealed bar is considered: older missed bars are
+        decisions whose moment has passed. ``_last_scored_ts`` dedups across
+        repeated reconnects inside one bar period; the age bound skips
+        weekend/maintenance gaps. At boot this may re-enter a position that
+        ``_reconcile_on_boot`` just flattened — deliberate: the signal is
+        still live, and a restart should re-adopt it with fresh brackets.
+        """
+        max_age = self._seam_catchup_max_age
+        gran_min = getattr(self._provider, "_stream_gran", 1)
+        if max_age < 0:
+            max_age = float(gran_min) * 60.0
+        if max_age == 0:
+            return
+        now = datetime.now(timezone.utc)
+        for norm_sym, buf in self._bar_buffers.items():
+            try:
+                if not buf or len(buf) < self._warmup:
+                    continue
+                bar = buf[-1]
+                ts = bar.get("timestamp")
+                if not isinstance(ts, datetime) or ts.tzinfo is None:
+                    logger.warning(
+                        "[%s] Seam catch-up skipped: newest primed bar has "
+                        "no usable timestamp (%r)",
+                        norm_sym,
+                        ts,
+                    )
+                    continue
+                sealed_at = ts + timedelta(minutes=gran_min)
+                age = (now - sealed_at).total_seconds()
+                if age < 0:
+                    continue  # not sealed yet (defensive; prime filters these)
+                if age > max_age:
+                    logger.info(
+                        "[%s] Seam catch-up: newest bar %s sealed %.0fs ago "
+                        "(> %.0fs) — too stale to act on, skipping",
+                        norm_sym,
+                        ts,
+                        age,
+                        max_age,
+                    )
+                    continue
+                last = self._last_scored_ts.get(norm_sym)
+                if last is not None and ts <= last:
+                    continue  # already scored (repeat reconnect in one bar)
+                logger.info(
+                    "SEAM_CATCHUP [%s] bar %s sealed %.0fs ago while the "
+                    "stream was down — scoring it now",
+                    norm_sym,
+                    ts,
+                    age,
+                )
+                # Mark BEFORE evaluating: a failed evaluation must not retry
+                # on the next reconnect — duplicate-order risk outranks one
+                # lost signal.
+                self._last_scored_ts[norm_sym] = ts
+                await self._evaluate_and_trade(norm_sym)
+            except Exception as e:
+                logger.error(
+                    "[%s] Seam catch-up failed: %s", norm_sym, e, exc_info=True
+                )
+
     async def _stream_with_retry(self) -> None:
         """Run the pricing stream with reconnect-on-disconnect."""
         while not self._shutdown_event.is_set():
@@ -823,6 +1039,9 @@ class OandaScalperOrchestrator:
                 self._seam_crossed[sym] = False
 
             await self._prime_history()
+
+            # Score anything that sealed while we were dark (fresh bars only)
+            await self._catch_up_missed_bars()
 
             # Defensive: clear provider stop event in case it was set
             self._provider.reset_stop()
@@ -901,6 +1120,11 @@ class OandaScalperOrchestrator:
         )
 
         await self._prime_history()
+
+        # A signal bar that sealed just before this process started (crash
+        # relaunch, watchdog restart) is in the primed history but would
+        # otherwise never be scored — catch it while it is still fresh.
+        await self._catch_up_missed_bars()
 
         # Run the pricing stream with reconnect-on-disconnect wrapper
         self._stream_task = asyncio.create_task(self._stream_with_retry())

@@ -68,6 +68,40 @@ that could not have been known until 16:00.  We prevent this via the
 
   Result: every 5-minute bar during a session receives only features that
   were finalised as of the PREVIOUS session's close.  No future data leaks.
+
+Part of the dormant V4.0 day-trade experiment. Reuses the shared
+BaseFeatureGenerator contract and FeaturePipeline from src/ml, but the feature
+set is its own -- the scalper's columns plus session-aware ones that only make
+sense when a trading day has a beginning, middle, and end.
+
+Glossary:
+    DayTradeBaseFeatures -- the same TA-Lib indicators as the scalper, computed
+        on 5-minute bars. Shares the scalper's period constants (_RSI_PERIOD 14,
+        _NATR_PERIOD 14, _SMA_PERIOD 50, ...).
+    DayTradeDailyJoin -- attaches yesterday's finished daily numbers to today's
+        bars. The lookahead guard is the whole point: only the PREVIOUS
+        session's close is used, never today's still-forming daily bar.
+    DayTradeIntradayFeatures -- where you are within the session.
+    DAY_TRADE_FEATURE_COLS -- the 22 model inputs in four groups: TA-Lib base
+        (10), macro-intraday context (6), microstructure carried over from the
+        scalper (4), and daily volatility context (2).
+
+    _RTH_OPEN_MINUTE -- 570, i.e. 09:30 ET expressed as minutes past midnight.
+    _RTH_DURATION_MINUTES -- 390, the 09:30-16:00 US session.
+    session_progress -- 0.0 at the open to 1.0 at the close. Lets the model
+        distinguish the volatile open from the drifting midday from the close.
+    vwap_dist -- distance from the volume-weighted average price, i.e. whether
+        price is above or below what the average participant paid today.
+    gap_pct -- overnight move from yesterday's close to today's open.
+    first_30m_vol_rel -- how active the first half-hour was versus normal; the
+        standard early read on whether a day is busy.
+    _FIRST_30M_BARS -- 6 (six 5-minute bars = 30 minutes).
+    _FIRST_30M_VOL_ROLLING_WINDOW -- 30 sessions of history for that "normal".
+    trend_vs_open -- position relative to the session's opening price.
+    range_exhaustion -- how much of a typical day's range has already been
+        used. Near 1.0 means the day may have little movement left.
+    daily_natr_14 / daily_atr_abs -- yesterday's volatility in percent and in
+        price terms. daily_atr_abs is what the targets scale their brackets by.
 """
 
 from __future__ import annotations

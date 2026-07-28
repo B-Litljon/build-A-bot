@@ -1,3 +1,31 @@
+"""
+Scans the whole Alpaca equity universe for stocks that "gapped" overnight.
+
+STATUS (glossary pass, 2026-07-27): nothing imports this, and no script runs
+it. The Haynes manual (table-o-content.md) lists it under legacy Alpaca data
+helpers. Documented as dormant, not removed.
+
+Glossary:
+    DiscoveryService -- holds the two Alpaca clients needed to list assets and
+        then snapshot their prices.
+    get_in_play_tickers -- returns symbols worth watching today, ranked by
+        volume, subject to the filters below.
+    min_price / max_price -- price band (default $10-$200): cheap enough to
+        size a position in, expensive enough to avoid penny-stock behaviour.
+    min_gap_pct -- minimum overnight move, in percent (default 2.0). The gap
+        is (today's close - previous close) / previous close, which despite the
+        name compares closes rather than yesterday's close to today's open.
+    top_n -- how many symbols to return after ranking by volume (default 50).
+    chunk_size -- 1000 symbols per snapshot request, since the universe is far
+        larger than one request allows. A failed chunk is logged and skipped.
+    tradable / marginable / fractionable -- Alpaca asset flags; all three are
+        required, which quietly excludes anything not available in fractional
+        shares.
+    IEX caveat -- volume comes from the free feed and covers only part of true
+        market volume, so the volume ranking is approximate. The class logs a
+        warning about this on construction.
+"""
+
 import logging
 from typing import List
 from alpaca.trading.client import TradingClient

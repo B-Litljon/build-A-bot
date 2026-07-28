@@ -10,6 +10,20 @@ acceptable for strategy validation and paper trading but **must not**
 be used for latency-sensitive live execution.
 
 No API key is required.
+
+Glossary:
+    YahooDataProvider -- the adapter. Satisfies the same interface as the real
+        feeds, so strategy code cannot tell the difference; the difference is
+        entirely in latency and reliability.
+    _BAR_SCHEMA -- local copy of the canonical six-column bar shape, kept in
+        sync with MarketDataProvider._BAR_SCHEMA by hand.
+    _FALLBACK_ACTIVE -- a hardcoded list of 15 well-known liquid tickers
+        (AAPL, MSFT, SPY, ...) returned when symbol discovery fails. Yahoo has
+        no "most active" endpoint, so this is a fixed stand-in, not a live
+        ranking -- do not read it as a market signal.
+    poll_interval -- seconds between polls in run_stream (default 60). This is
+        the latency floor: a bar can be up to this old before the strategy
+        sees it, which is why this provider is paper-only.
 """
 
 import logging

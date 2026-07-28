@@ -10,6 +10,16 @@ Concrete implementations:
 For production use, replace the yfinance PoC adapter with a FRED-backed
 implementation (fredapi) for authoritative macro series such as the Fed
 Funds Rate (FEDFUNDS), CPI (CPIAUCSL), and 10Y Treasury (DGS10).
+
+Glossary:
+    MacroProvider -- the contract for economy-wide time series (interest
+        rates, volatility indices) as opposed to per-company data.
+    get_macro_series -- returns one daily series for a named indicator from a
+        start date onward. Unknown names return an empty Series rather than
+        raising, so adding an indicator cannot break an existing caller.
+    indicator_name -- a human-readable key such as "VIX" or "10Y_YIELD". Each
+        adapter documents the names it supports; there is no shared registry.
+    start_date -- inclusive ISO-8601 "YYYY-MM-DD" string.
 """
 
 from __future__ import annotations

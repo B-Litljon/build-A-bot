@@ -1,3 +1,35 @@
+"""
+Alpaca crypto feed for the Factory orchestrator -- warm-up history plus a
+live bar stream.
+
+Note this is a SECOND, narrower feed abstraction that exists alongside
+``MarketDataProvider``: it is async, crypto-only, and adds the warm-up step
+(fetch recent history so indicators have enough bars to compute before the
+first live bar arrives). Only the Factory path uses it.
+
+Glossary:
+    MarketDataFeed -- the small async contract: warm up, subscribe, stop.
+    AlpacaCryptoFeed -- the only implementation, backed by Alpaca's crypto
+        REST and WebSocket clients.
+    warmup_history -- fetches the last `lookback_minutes` of bars per symbol
+        before going live, so indicators are not starting from nothing. Blocking
+        SDK calls are pushed to a worker thread to keep the event loop free.
+    lookback_minutes -- how much history to pre-load; must exceed the longest
+        indicator's warm-up requirement or early signals will be wrong.
+    _resolve_index_key -- works around Alpaca returning symbols in a different
+        form than requested ("BTC/USD" vs "BTCUSD"). Tries the exact string,
+        then slash-stripped, then a normalised comparison. Returns None if the
+        symbol is genuinely absent, which is logged and yields an empty frame
+        rather than an exception.
+    on_tick -- async callback invoked per live bar with the standard dict
+        (symbol, timestamp, open, high, low, close, volume).
+    _stream -- the live WebSocket client; None until subscribe() runs.
+
+NOTE (glossary pass): warmup_history contains several unconditional
+``print("[DEBUG] ...")`` calls left over from a hotfix. They write to stdout on
+every warm-up regardless of log level. Flagged, not changed.
+"""
+
 import abc
 import logging
 import asyncio

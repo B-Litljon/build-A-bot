@@ -104,6 +104,32 @@ The reversed-cum_max approach works as follows for a session with bars 1..N:
 This is equivalent to the bar-by-bar NumPy result and contains zero
 lookahead: no bar sees any information beyond what was available at its
 own timestamp.
+
+Part of the dormant V4.0 day-trade experiment. The labels differ from the
+scalper's in two ways worth understanding: every trade is closed at the end of
+the day (nothing is held overnight), and bracket sizes scale with the
+instrument's DAILY range rather than its 5-minute range.
+
+Glossary:
+    DayTradeTargets -- generates both labels in one pass.
+    MFE (Maximum Favorable Excursion) -- the best price reached in your favour
+        between entry and the close, i.e. the most the trade was ever worth.
+    ANGEL_MFE_MULT -- 0.6. The Angel label is 1 when that best-case move
+        reached at least 0.6x the stock's typical daily range: "was there a real
+        move here to catch?"
+    DEVIL_SL_MULT -- 0.4. The Devil label asks the harder question: did price
+        avoid falling 0.4x the daily range against you first. Direction is
+        worthless if you were stopped out on the way.
+    TP_MULT / SL_MULT -- 0.6 / 0.4 of daily range, so wins pay 1.5x what losses
+        cost.
+    ENTRY_WINDOW_MAX_PROGRESS -- 90/390 (about 0.2308). Only bars in the first
+        90 minutes (09:30-11:00 ET) can be labelled a positive. Later bars are
+        forced to 0, NOT null -- deliberately, so they stay in the dataset as
+        negative examples and the indicator warm-up is preserved. Rationale: an
+        end-of-day exit leaves a late entry too little time to work.
+    daily_atr_abs -- the daily range in price terms; every multiplier above is
+        relative to it, which is what makes one threshold work across a $20
+        stock and a $500 one.
 """
 
 from __future__ import annotations

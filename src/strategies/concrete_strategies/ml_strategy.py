@@ -15,6 +15,79 @@ Usage:
         devil_threshold=0.50,
         warmup_period=60
     )
+
+This is the decision-maker: bars in, Signal-or-None out. It owns no broker
+connection and places no orders -- an orchestrator calls it and acts on the
+result. Everything about it is arranged so that live inference matches training
+exactly; the feature pipeline is IMPORTED from src/ml rather than reimplemented,
+and its generator order is identical to the retrainer's.
+
+Glossary:
+    asset_class -- "equities" or "forex". Picks the default model directory
+        (models/<asset_class>/) when explicit paths are not given.
+    angel_path / devil_path -- the two model pickles. Resolved relative to the
+        project root if not found as given.
+    angel_threshold -- how confident stage one must be to propose. Default
+        from core.thresholds (0.40, env-overridable), then OVERRIDDEN by the
+        angel_threshold pinned in the model's threshold.json when present —
+        a pair must run at the bar its Devil and brackets were fitted for.
+    devil_threshold -- the approval bar for stage two. Set from the
+        constructor, then OVERWRITTEN by _load_thresholds() from the model's
+        threshold.json, because the retrainer tunes this value per model.
+    warmup_period -- 260 bars minimum before trading. Sized for a 50-period
+        average on 5-minute bars (50 x 5 = 250 plus headroom); acting sooner
+        means acting on half-computed indicators.
+    timeframe / htf_timeframe -- fast bar size in minutes, and the slower
+        context timeframe ("5m").
+    regime_window -- 260; must match RiskProfile.regime_window or the cost
+        feature and the live cost gate would disagree about baseline volatility.
+
+    self.pipeline -- the imported FeaturePipeline, built as
+        [V3BaseFeatures, V3HTFFeatures, V3SessionFeatures, V3CostFeatures].
+        This order is IDENTICAL to retrainer.py's; keeping them in lockstep is
+        what prevents training/inference skew.
+    _cost_gen -- the V3CostFeatures instance kept as a handle so hot-reload can
+        swap its alpha table in place without rebuilding the pipeline.
+    feature_names -- read from the trained model's own feature_names_in_, NOT
+        hardcoded. That way a retrain which changes the feature set propagates
+        without a code edit. Raises at construction if the model exposes no
+        names, since there would be no safe way to order the columns.
+
+    Fail-loud guards -- if the model was trained with cost_ratio but
+        spread_alphas.json is missing, or with regime features but the HMM
+        artifact is missing, the constructor raises. Deliberate: a boot-time
+        error is far better than silently scoring against a wrong-width
+        feature vector on the first live bar.
+    _validate_metadata -- checks metadata.json next to the model to confirm the
+        model's asset class matches. Warns (not raises) if absent.
+    _load_thresholds -- reads threshold.json from the model dir (the tuned
+        Devil bar and, since 2026-07, the pinned Angel bar); falls back to
+        the constructor values for missing keys.
+    _load_spread_table -- reads spread_alphas.json from the model dir, so a
+        model always uses the cost assumptions it was trained against.
+
+    Hot reload -- _check_model_updates() runs at the start of every bar and
+        compares file modification times; when the retrainer atomically swaps in
+        new pickles the strategy picks them up without a restart.
+    _reload_lock -- guards that swap so a reload cannot interleave with
+        inference.
+    angel_mtime / devil_mtime / _spread_table_mtime -- the last-seen
+        modification times driving that comparison.
+    n_jobs = 1 -- forced on both models: single-row inference is so small that
+        multi-process parallelism costs more in overhead than it saves.
+
+    generate_signals -- the entry point. Returns a Signal only when BOTH stages
+        approve, otherwise None.
+    Stale-bar guard -- feature cleaning drops rows with missing values. If the
+        NEWEST bar was the one dropped, the tail of the frame is an older bar,
+        and scoring it against the current price would trade on the wrong bar.
+        The strategy returns None instead.
+    _heartbeat_window / _heartbeat_counter -- per-symbol ring buffer of recent
+        Angel probabilities, summarised to the log every
+        _heartbeat_every_n_bars (default 15, MLSTRATEGY_HEARTBEAT_EVERY_N).
+        Exists so an operator can see the model is alive and evaluating during
+        long stretches with no trades -- rejections themselves log at debug
+        level and are normally invisible.
 """
 
 import json
@@ -33,10 +106,16 @@ warnings.filterwarnings("ignore", message=".*join_asof.*")
 
 from strategies.base import BaseStrategy, Signal
 from core.notification_manager import NotificationManager
+from core.thresholds import ANGEL_THRESHOLD as DEFAULT_ANGEL_THRESHOLD
 
 # CRITICAL: Import FeaturePipeline to prevent training/inference skew
 from ml.feature_pipeline import FeaturePipeline
-from ml.features.v3_features import V3BaseFeatures, V3HTFFeatures, V3SessionFeatures
+from ml.features.v3_features import (
+    V3BaseFeatures,
+    V3CostFeatures,
+    V3HTFFeatures,
+    V3SessionFeatures,
+)
 from ml.regimes.hmm_regime import (
     HMM_OUTPUT_COLS,
     load_hmm_models,
@@ -73,13 +152,14 @@ class MLStrategy(BaseStrategy):
         asset_class: str = "equities",
         angel_path: str | Path = None,
         devil_path: str | Path = None,
-        angel_threshold: float = 0.40,
+        angel_threshold: float = DEFAULT_ANGEL_THRESHOLD,
         devil_threshold: float = 0.50,
         warmup_period: int = 260,  # default for 1m base / 5m HTF
         timeframe: int = 1,
         htf_timeframe: str = "5m",
         angel_trainer=None,
         devil_trainer=None,
+        regime_window: int = 260,  # must match RiskProfile.regime_window
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -146,12 +226,27 @@ class MLStrategy(BaseStrategy):
         # Initialize notification manager for hot-reload alerts
         self.notification_manager = NotificationManager()
 
+        # Per-instrument spread-cost table (spread_alphas.json in the model
+        # dir, written by the retrainer on gate pass). None → V3CostFeatures
+        # is a no-op and the pipeline is bit-identical to the pre-cost era.
+        spread_table, self._spread_table_mtime = self._load_spread_table()
+
         # Initialize feature pipeline (imported, not duplicated!)
+        # V3CostFeatures must follow V3BaseFeatures (needs natr_14). Keep a
+        # handle so hot-reload can swap the alpha table in place.
+        self._cost_gen = V3CostFeatures(
+            alpha_table=spread_table["alphas"] if spread_table else None,
+            default_alpha=(
+                spread_table.get("default_alpha", 0.15) if spread_table else 0.15
+            ),
+            regime_window=regime_window,
+        )
         self.pipeline = FeaturePipeline(
             feature_generators=[
                 V3BaseFeatures(),
                 V3HTFFeatures(timeframe=htf_timeframe),
                 V3SessionFeatures(),
+                self._cost_gen,
             ]
         )
 
@@ -171,6 +266,18 @@ class MLStrategy(BaseStrategy):
             "MLStrategy feature schema sourced from model: %d features",
             len(self.feature_names),
         )
+
+        # If the model trained on cost_ratio, the spread table is REQUIRED —
+        # fail loudly at boot rather than obscurely at column selection on
+        # the first bar. (Same philosophy as the HMM guard below; note we
+        # load from angel_path.parent so side model dirs carry their own.)
+        if "cost_ratio" in self.feature_names and spread_table is None:
+            raise RuntimeError(
+                f"Angel model expects the 'cost_ratio' feature but "
+                f"{self.angel_path.parent / 'spread_alphas.json'} is missing "
+                "or unreadable. Retrain with RETRAIN_SPREAD_TABLE so the "
+                "table is persisted alongside the model, or restore the file."
+            )
 
         # If the model trained on HMM regime probs, load the per-symbol HMM
         # artifact persisted alongside Angel/Devil and apply it at inference.
@@ -195,10 +302,13 @@ class MLStrategy(BaseStrategy):
         # Validate metadata sidecar
         self._validate_metadata()
 
-        # Override devil_threshold with the value persisted by the retrainer
-        # (models/threshold.json).  Must be called AFTER self.devil_threshold is
-        # set above so _load_threshold() can use it as a fallback.
-        self.devil_threshold = self._load_threshold()
+        # Override both thresholds with the values persisted by the retrainer
+        # (threshold.json in the model dir). Must be called AFTER the
+        # instance values are set above so _load_thresholds() can use them as
+        # fallbacks. The Angel value pins the population the pair was
+        # trained/bracketed at; artifacts predating 2026-07 pin only the
+        # Devil and fall back to the constructor default for the Angel.
+        self.angel_threshold, self.devil_threshold = self._load_thresholds()
 
         # Heartbeat state: every N bars per symbol, log a summary of the
         # angel_prob distribution. Lets the operator see the model is
@@ -245,46 +355,101 @@ class MLStrategy(BaseStrategy):
                 raise
             logger.warning("_validate_metadata: failed to read %s (%s)", metadata_path, exc)
 
-    def _load_threshold(self) -> float:
+    def _load_thresholds(self) -> "tuple[float, float]":
         """
-        Load the Devil model's optimal threshold from the model directory's
-        threshold.json (next to the pkl artifacts, so side models carry their own).
+        Load pinned decision thresholds from the model directory's
+        threshold.json (next to the pkl artifacts, so side models carry
+        their own).
 
-        Written by retrainer.save_threshold() after a successful validation gate.
-        Falls back to self.devil_threshold (the value passed to __init__) if the
-        file is absent or corrupt.
+        Written by retrainer.save_threshold() after a successful validation
+        gate. ``devil_threshold`` has been persisted since the beginning;
+        ``angel_threshold`` since 2026-07 — it pins the population the pair
+        was trained and bracketed at, so a deployed model cannot be run at a
+        different Angel bar than it was fitted for. Either key falls back to
+        the current instance value (the constructor default) when absent, so
+        older artifacts keep working.
 
         Returns:
-            float: The production threshold for Devil approval decisions.
+            (angel_threshold, devil_threshold) for production decisions.
         """
         threshold_path = self.angel_path.parent / "threshold.json"
         if not threshold_path.exists():
             logger.warning(
-                "_load_threshold: %s not found — "
-                "using constructor default devil_threshold=%.2f",
+                "_load_thresholds: %s not found — using defaults "
+                "angel=%.2f devil=%.2f",
                 threshold_path,
+                self.angel_threshold,
                 self.devil_threshold,
             )
-            return self.devil_threshold
+            return self.angel_threshold, self.devil_threshold
         try:
             with open(threshold_path, "r") as fh:
                 data = json.load(fh)
-            threshold = float(data["devil_threshold"])
+            devil = float(data["devil_threshold"])
+            angel = float(data.get("angel_threshold", self.angel_threshold))
             logger.info(
-                "_load_threshold: loaded production threshold=%.4f from %s",
-                threshold,
+                "_load_thresholds: loaded production thresholds "
+                "angel=%.4f%s devil=%.4f from %s",
+                angel,
+                "" if "angel_threshold" in data else " (default; not pinned)",
+                devil,
                 threshold_path,
             )
-            return threshold
+            return angel, devil
         except Exception as exc:
             logger.warning(
-                "_load_threshold: failed to read %s (%s) — "
-                "using constructor default devil_threshold=%.2f",
+                "_load_thresholds: failed to read %s (%s) — using defaults "
+                "angel=%.2f devil=%.2f",
                 threshold_path,
                 exc,
+                self.angel_threshold,
                 self.devil_threshold,
             )
-            return self.devil_threshold
+            return self.angel_threshold, self.devil_threshold
+
+    def _load_spread_table(self) -> tuple:
+        """
+        Load the per-instrument spread-alpha table from the model directory's
+        spread_alphas.json (next to the pkl artifacts, so side models carry
+        their own — model and cost assumptions must travel together).
+
+        Written by retrainer.save_spread_table() on gate pass; baked from live
+        SPREAD_CALIB measurements by scripts/bake_spread_alphas.py.
+
+        Returns:
+            (table dict or None, file mtime or 0.0). None means no table —
+            V3CostFeatures no-ops and the feature space has no cost_ratio.
+        """
+        table_path = self.angel_path.parent / "spread_alphas.json"
+        if not table_path.exists():
+            logger.info(
+                "_load_spread_table: %s not found — cost_ratio feature "
+                "disabled (pre-cost model dir)",
+                table_path,
+            )
+            return None, 0.0
+        try:
+            with open(table_path, "r") as fh:
+                table = json.load(fh)
+            if not isinstance(table.get("alphas"), dict) or not table["alphas"]:
+                raise ValueError("no 'alphas' mapping")
+            logger.info(
+                "_load_spread_table: loaded %d instrument alphas from %s "
+                "(denomination=%sm): %s",
+                len(table["alphas"]),
+                table_path,
+                table.get("denomination_minutes"),
+                {k: round(v, 4) for k, v in sorted(table["alphas"].items())},
+            )
+            return table, os.path.getmtime(table_path)
+        except Exception as exc:
+            logger.warning(
+                "_load_spread_table: failed to read %s (%s) — cost_ratio "
+                "feature disabled",
+                table_path,
+                exc,
+            )
+            return None, 0.0
 
     @property
     def warmup_period(self) -> int:
@@ -371,16 +536,59 @@ class MLStrategy(BaseStrategy):
                     logger.critical(msg)
                     self.notification_manager.send_system_message(msg)
 
-                # Also reload the threshold — a retrain always produces a new
-                # threshold.json alongside the new model weights.
-                old_threshold = self.devil_threshold
-                self.devil_threshold = self._load_threshold()
-                if self.devil_threshold != old_threshold:
+                # Also reload the thresholds — a retrain always produces a
+                # new threshold.json alongside the new model weights.
+                old_angel = self.angel_threshold
+                old_devil = self.devil_threshold
+                self.angel_threshold, self.devil_threshold = (
+                    self._load_thresholds()
+                )
+                if self.angel_threshold != old_angel:
+                    logger.info(
+                        "[HOT-RELOAD] Angel threshold updated: %.4f -> %.4f",
+                        old_angel,
+                        self.angel_threshold,
+                    )
+                if self.devil_threshold != old_devil:
                     logger.info(
                         "[HOT-RELOAD] Devil threshold updated: %.4f -> %.4f",
-                        old_threshold,
+                        old_devil,
                         self.devil_threshold,
                     )
+
+                # Reload the spread-alpha table when it changed on disk or the
+                # refreshed schema newly requires cost_ratio (a cost-aware
+                # retrain landed over a pre-cost model dir).
+                table_path = self.angel_path.parent / "spread_alphas.json"
+                table_mtime = (
+                    os.path.getmtime(table_path) if table_path.exists() else 0.0
+                )
+                needs_cost = "cost_ratio" in self.feature_names
+                if table_mtime != self._spread_table_mtime or (
+                    needs_cost and self._cost_gen.alpha_table is None
+                ):
+                    new_table, self._spread_table_mtime = self._load_spread_table()
+                    with self._reload_lock:
+                        self._cost_gen.alpha_table = (
+                            new_table["alphas"] if new_table else None
+                        )
+                        if new_table:
+                            self._cost_gen.default_alpha = new_table.get(
+                                "default_alpha", 0.15
+                            )
+                    logger.info(
+                        "[HOT-RELOAD] Spread table %s",
+                        "updated" if new_table else "removed/unreadable",
+                    )
+                if needs_cost and self._cost_gen.alpha_table is None:
+                    msg = (
+                        "[HOT-RELOAD] SCHEMA MISMATCH: model expects "
+                        "cost_ratio but spread_alphas.json is missing from "
+                        f"{self.angel_path.parent} — predictions will fail "
+                        "until the table is restored."
+                    )
+                    logger.critical(msg)
+                    self.notification_manager.send_system_message(msg)
 
                 alert_message = (
                     "🔄 [HOT-RELOAD] New model weights ingested from disk. "
@@ -472,10 +680,18 @@ class MLStrategy(BaseStrategy):
             if self._heartbeat_counter[heartbeat_key] >= self._heartbeat_every_n_bars:
                 probs = list(self._heartbeat_window[heartbeat_key])
                 proposed = sum(1 for p in probs if p >= self.angel_threshold)
+                # Surface the model's view of trading cost when the cost
+                # feature is active — lets the operator read per-instrument
+                # affordability straight off the heartbeat.
+                cost_note = ""
+                if "cost_ratio" in features_df.columns:
+                    cost_note = " | cost_ratio=%.3f" % float(
+                        features_df["cost_ratio"].tail(1)[0]
+                    )
                 logger.info(
                     "[%s] Heartbeat: last %d bars angel_prob "
                     "median=%.3f p75=%.3f max=%.3f | proposed=%d/%d (%.1f%%) "
-                    "vs threshold=%.2f",
+                    "vs threshold=%.2f%s",
                     heartbeat_key,
                     len(probs),
                     float(np.median(probs)),
@@ -485,6 +701,7 @@ class MLStrategy(BaseStrategy):
                     len(probs),
                     100.0 * proposed / len(probs),
                     self.angel_threshold,
+                    cost_note,
                 )
                 self._heartbeat_counter[heartbeat_key] = 0
 

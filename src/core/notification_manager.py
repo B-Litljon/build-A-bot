@@ -1,3 +1,47 @@
+"""
+Discord webhook notifications -- the bot's only outbound human channel.
+
+Every alert the system sends (entries, exits, system status, retraining
+verdicts, drift warnings) is posted here as a Discord embed. If the webhook
+environment variable is unset the whole class degrades to a silent no-op, so
+the trading paths can call it unconditionally. Network failures are logged and
+swallowed: a Discord outage must never take down live trading.
+
+Called from the live orchestrators (Alpaca and OANDA), MLStrategy, and the
+offline feedback_loop / retrainer pipelines.
+
+Glossary:
+    webhook_url -- the Discord incoming-webhook URL, taken from the
+        DISCORD_WEBHOOK_URL environment variable unless passed explicitly.
+        None/unset disables every send in this class.
+    send_trade_alert -- entry/exit embed for the Alpaca path. Takes a
+        ``core.signal.Signal`` and reads angel_prob, devil_prob, sl_price,
+        tp_price and expected_pct_growth out of its ``metadata`` dict.
+    send_oanda_trade_alert -- the same idea for the forex path, but takes loose
+        primitives instead of a Signal, because the OANDA strategy emits the
+        other Signal shape (``strategies.base.Signal``). Keyword-only.
+    send_system_message -- one-line plain status update, no embed. Used for
+        startup, shutdown and connection events.
+    send_retraining_report -- posts the full validation-gate verdict after a
+        retrain: per-fold Brier/EV/win-rate/trade-count, the aggregate scores,
+        and PROMOTED vs REJECTED with the rejection reasons. Takes the
+        ``ValidationReport`` from retrainer.validate_candidate().
+    send_drift_alert -- posts degradation warnings from feedback_loop.py's
+        DriftEvaluator; escalates from WARNING to CRITICAL when Brier > 0.30 or
+        expected value < -0.001.
+    action -- "ENTRY" vs anything else; ENTRY embeds are green/red by direction
+        and include the bracket levels, closes are blue and omit them.
+    username -- the Discord display name, used as a crude persona tag so the
+        source is obvious at a glance: "Build-A-Bot Executive" (Alpaca),
+        "Build-A-Bot V5 Scalper" (OANDA), "The Accountant" (retraining and
+        drift).
+    color -- Discord embed sidebar colour as an integer: 0x00FF00 green (long /
+        promoted), 0xFF0000 red (short / rejected / critical), 0x00A2FF blue
+        (trade closed), 0xFFA500 orange (warning).
+    timeout=5 -- every POST is capped at 5 seconds so a hung webhook cannot
+        stall the caller's thread.
+"""
+
 import os
 import logging
 import requests

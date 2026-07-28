@@ -1,9 +1,50 @@
 import asyncio
 import unittest
 import warnings
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch, ANY
 import sys
 from pathlib import Path
+
+"""
+Tests for OandaScalperOrchestrator -- the live forex bot's control flow.
+
+The largest test file here, and it concentrates on the failure paths rather than
+the happy path, because with software-enforced stops the dangerous states are
+"we think we're flat but aren't" and "we tried to close and it didn't work".
+
+Glossary:
+    FakeSignal -- a minimal stand-in for strategies.base.Signal, so tests can
+        drive the orchestrator without loading real models.
+    test_rapid_breach_ticks_close_once -- quotes arrive far faster than a close
+        completes; a burst of breaching ticks must produce ONE close, not one
+        per tick.
+    test_close_not_called_synchronously_in_tick -- the tick callback runs on the
+        provider's stream thread and must return in microseconds, so the close
+        must be dispatched to the event loop rather than executed inline.
+    test_watchdog_close_failure_retries_then_parks -- when closing keeps
+        failing, the position is "parked" rather than forgotten. Forgetting it
+        would mean an open position nothing is watching.
+    test_no_entry_on_close_failed_position -- a symbol in that parked state must
+        not be re-entered.
+    test_boot_reconcile_* -- on startup the broker is asked what is actually
+        open: an orphan left by a crashed process is flattened, a flat account
+        is a no-op, and a failed sync ABORTS rather than proceeding blind.
+    test_reversal_records_authoritative_units -- after flipping direction the
+        BROKER's reported size is recorded, not the size that was requested.
+    test_failed_flip_restores_old_position_state -- a failed reversal must roll
+        local state back, so it still reflects what is really held.
+    test_tick_watchdog_ignores_reversing_position -- mid-flip the stop/target
+        are meaningless and must not fire.
+    test_seam_catchup_* -- after a (re)prime, the newest sealed bar must be
+        scored exactly once IF fresh: stale bars are skipped (weekend gap),
+        already-scored bars are skipped (repeat reconnects inside one bar must
+        not double-trade), warmup still applies, an exception inside the
+        evaluation must not escape (it would kill the reconnect loop), and
+        max_age=0 disables the feature.
+    test_stream_bar_marks_scored -- a bar scored by the normal stream path is
+        thereby ineligible for catch-up; both paths share one dedup record.
+"""
 
 # Suppress unawaited-coroutine RuntimeWarning when mocking asyncio.run_coroutine_threadsafe
 warnings.filterwarnings("ignore", category=RuntimeWarning)
@@ -35,6 +76,9 @@ class TestOandaScalperOrchestrator(unittest.TestCase):
     def _make_orchestrator(self, **overrides):
         """Build an orchestrator with all dependencies mocked."""
         provider = MagicMock()
+        # Real attribute, not an auto-mock: seam catch-up does arithmetic on
+        # the provider's granularity (minutes per bar).
+        provider._stream_gran = 15
         strategy = MagicMock()
         strategy.warmup_period = 3
         order_manager = MagicMock()
@@ -354,7 +398,144 @@ class TestOandaScalperOrchestrator(unittest.TestCase):
 
         self.assertNotIn("EUR_USD", orch._positions)
 
+    # ── (h) seam catch-up: bars sealed during stream outages ───────────
+
+    def test_seam_catchup_scores_fresh_missed_bar(self):
+        """A fresh bar sealed during the outage is scored and traded once."""
+        orch, _, strategy, order_manager, risk_manager = self._make_orchestrator()
+        strategy.generate_signals.return_value = FakeSignal(direction="long")
+        risk_manager.calculate_bracket.return_value = (0.00050, 0.00150)
+        order_manager.submit_target_position.return_value = {
+            "filled": 1000,
+            "avg_price": 1.08500,
+            "closed_units": 0,
+            "opened_units": 1000,
+            "position_units": 1000,
+            "position_avg_price": 1.08500,
+        }
+        bars = self._dt_bars(3)
+        orch._bar_buffers["EUR_USD"] = list(bars)
+
+        asyncio.run(orch._catch_up_missed_bars())
+
+        order_manager.submit_target_position.assert_called_once_with("EUR_USD", 1000)
+        # Catch-up must evaluate the buffer as-is, never re-append the bar
+        self.assertEqual(len(orch._bar_buffers["EUR_USD"]), 3)
+        self.assertEqual(
+            orch._last_scored_ts["EUR_USD"], bars[-1]["timestamp"]
+        )
+
+    def test_seam_catchup_skips_stale_bar(self):
+        """A bar sealed hours ago (weekend/long outage) must not be traded."""
+        orch, _, strategy, order_manager, _ = self._make_orchestrator()
+        orch._bar_buffers["EUR_USD"] = self._dt_bars(
+            3, newest_sealed_secs_ago=7200
+        )
+
+        asyncio.run(orch._catch_up_missed_bars())
+
+        strategy.generate_signals.assert_not_called()
+        order_manager.submit_target_position.assert_not_called()
+        self.assertIsNone(orch._last_scored_ts["EUR_USD"])
+
+    def test_seam_catchup_skips_already_scored(self):
+        """Repeat reconnects inside one bar period score the bar ONCE."""
+        orch, _, strategy, order_manager, risk_manager = self._make_orchestrator()
+        strategy.generate_signals.return_value = FakeSignal(direction="long")
+        risk_manager.calculate_bracket.return_value = (0.00050, 0.00150)
+        order_manager.submit_target_position.return_value = {
+            "filled": 1000,
+            "avg_price": 1.08500,
+            "closed_units": 0,
+            "opened_units": 1000,
+            "position_units": 1000,
+            "position_avg_price": 1.08500,
+        }
+        orch._bar_buffers["EUR_USD"] = self._dt_bars(3)
+
+        asyncio.run(orch._catch_up_missed_bars())
+        asyncio.run(orch._catch_up_missed_bars())  # second reconnect, same bar
+
+        # Dedup happens BEFORE inference, not via the position guard
+        self.assertEqual(strategy.generate_signals.call_count, 1)
+        order_manager.submit_target_position.assert_called_once()
+
+    def test_seam_catchup_respects_warmup(self):
+        """A short (post-failed-prime) buffer must not be scored."""
+        orch, _, strategy, order_manager, _ = self._make_orchestrator()
+        orch._bar_buffers["EUR_USD"] = self._dt_bars(2)  # warmup is 3
+
+        asyncio.run(orch._catch_up_missed_bars())
+
+        strategy.generate_signals.assert_not_called()
+        order_manager.submit_target_position.assert_not_called()
+
+    def test_seam_catchup_disabled_by_zero_max_age(self):
+        """SEAM_CATCHUP_MAX_AGE_SECONDS=0 turns the feature off."""
+        orch, _, strategy, order_manager, _ = self._make_orchestrator()
+        orch._seam_catchup_max_age = 0.0
+        orch._bar_buffers["EUR_USD"] = self._dt_bars(3)
+
+        asyncio.run(orch._catch_up_missed_bars())
+
+        strategy.generate_signals.assert_not_called()
+        order_manager.submit_target_position.assert_not_called()
+
+    def test_seam_catchup_swallows_evaluation_errors(self):
+        """An exception mid-evaluation must not escape (it would kill the
+        reconnect loop and leave the bot permanently disconnected)."""
+        orch, _, strategy, order_manager, risk_manager = self._make_orchestrator()
+        strategy.generate_signals.return_value = FakeSignal(direction="long")
+        risk_manager.calculate_bracket.side_effect = RuntimeError("boom")
+        orch._bar_buffers["EUR_USD"] = self._dt_bars(3)
+
+        asyncio.run(orch._catch_up_missed_bars())  # must not raise
+
+        order_manager.submit_target_position.assert_not_called()
+        # Marked as scored anyway: a failed evaluation must not retry into
+        # a possible duplicate order on the next reconnect
+        self.assertIsNotNone(orch._last_scored_ts["EUR_USD"])
+
+    def test_stream_bar_marks_scored(self):
+        """A bar scored by the stream path is ineligible for catch-up."""
+        orch, _, strategy, order_manager, risk_manager = self._make_orchestrator()
+        strategy.generate_signals.return_value = None  # no trade, just score
+        bars = self._dt_bars(3)
+        for bar in bars:
+            asyncio.run(orch._on_bar(bar))
+        self.assertEqual(strategy.generate_signals.call_count, 1)
+        self.assertEqual(orch._last_scored_ts["EUR_USD"], bars[-1]["timestamp"])
+
+        asyncio.run(orch._catch_up_missed_bars())
+
+        # Catch-up found nothing new to score
+        self.assertEqual(strategy.generate_signals.call_count, 1)
+
     # ── helpers ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _dt_bars(n, gran_min=15, newest_sealed_secs_ago=30, symbol="EUR_USD"):
+        """n sealed bars, the newest sealed newest_sealed_secs_ago ago."""
+        newest_open = (
+            datetime.now(timezone.utc)
+            - timedelta(seconds=newest_sealed_secs_ago)
+            - timedelta(minutes=gran_min)
+        )
+        bars = []
+        for i in range(n):
+            ts = newest_open - timedelta(minutes=gran_min * (n - 1 - i))
+            bars.append(
+                {
+                    "symbol": symbol,
+                    "timestamp": ts,
+                    "open": 1.08000,
+                    "high": 1.08100,
+                    "low": 1.07900,
+                    "close": 1.08050,
+                    "volume": 1.0,
+                }
+            )
+        return bars
 
     @staticmethod
     def _bar_dict(

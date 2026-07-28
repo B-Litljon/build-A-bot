@@ -1,3 +1,95 @@
+"""
+The feature generators -- every number the models actually look at.
+
+Four pluggable generators, each adding columns to the bar DataFrame. Training
+and live inference run the SAME generators in the same order; that symmetry is
+the whole point, because a feature computed differently in the two places
+silently poisons the model. See GLOSSARY.md (feature, NATR, HTF, lookahead).
+
+Column names produced here must match retrainer.BASE_FEATURE_COLS exactly.
+
+Glossary:
+    V3BaseFeatures -- the 14 single-bar columns, computed per symbol so one
+        instrument's history never bleeds into another's indicators.
+    _RSI_PERIOD / _PPO_FAST / _PPO_SLOW / _BB_PERIOD / _BB_STD / _SMA_PERIOD /
+        _NATR_PERIOD -- lookback lengths in bars for each indicator
+        (14/12/26/20/2/50/14). Changing any of these invalidates every existing
+        model, since the saved model expects the old distribution.
+    rsi_14 -- 0-100 measure of how one-sided recent moves have been. Near 100
+        means almost all recent movement was upward.
+    ppo -- momentum: the gap between a fast and a slow average, as a PERCENT of
+        price. The percentage is what lets one model span gold at $2000 and a
+        currency pair at 1.09.
+    natr_14 -- typical bar range as a percent of price. This is the volatility
+        measure everything else scales from: bracket widths, the cost gate, and
+        the position size all derive from it.
+    bb_pct_b -- where price sits inside its recent statistical range: 0 = at
+        the bottom edge, 1 = at the top, outside means an unusual move.
+    bb_width_pct -- how wide that range is; small means quiet/compressed.
+    price_sma50_ratio -- price divided by its 50-bar average (above 1 = above
+        trend).
+    dist_sma50 -- the same idea as a signed percentage distance.
+    log_return -- this bar's move versus the last, in log form so gains and
+        losses are symmetric.
+    hour_of_day -- UTC hour 0-23.
+    vol_rel -- this bar's activity versus its own recent 20-bar average. 1.0
+        means normal. Defaults to 1.0 when undefined rather than 0, so a
+        warm-up bar reads "normal" instead of "dead".
+    _RANGE_COIL_PERIOD -- 10 bars, the window for range_coil_10.
+    range_coil_10 -- this bar's range versus the recent average range. Below 1
+        means the market is coiling/compressing.
+    bar_body_pct -- how much of the bar is solid body versus wick. High means
+        decisive directional movement.
+    bar_upper_wick_pct / bar_lower_wick_pct -- fraction of the bar spent in the
+        upper/lower wick. A long upper wick means price pushed up and was
+        rejected -- the "stop-hunt defense" signal these were added for.
+
+    V3SessionFeatures -- four 0/1 flags for which trading session a bar falls
+        in, derived from the UTC hour. Added because the same indicator values
+        mean different things at 03:00 than at 14:00.
+    session_asia / session_london / session_ny -- 00-09, 07-16, 12-21 UTC.
+        Deliberately overlapping, and chosen as conservative midpoints so they
+        stay roughly right across daylight-saving shifts.
+    session_overlap -- 12-16 UTC, when London and New York are both open. The
+        busiest, most tradeable window.
+
+    V3CostFeatures -- adds one column, cost_ratio, letting the model SEE
+        trading cost instead of having cost silently filtered out behind it.
+    cost_ratio -- alpha_sym * baseline_natr / natr_14, i.e. the live cost gate's
+        own inequality rearranged. Higher means the toll is large relative to
+        the move being targeted, so the setup is expensive. Falls when
+        volatility rises above its baseline -- trading gets relatively cheaper.
+    alpha_table -- {symbol: measured cost} from live measurements. Mutable on
+        purpose: hot-reload swaps it in place after a retrain lands. When it is
+        None or empty the generator is a NO-OP and the column never appears, so
+        old models behave exactly as before this feature existed.
+    default_alpha -- 0.15, used for any symbol missing from the table (warned
+        once per symbol via _warned_missing).
+    regime_window -- 260 bars, the window for the baseline volatility median.
+    min_samples=1 -- REQUIRED, not a detail: a strict window would leave
+        cost_ratio null across the whole live warm-up, every row would then be
+        dropped as incomplete, and the strategy would return no signal forever.
+
+    V3HTFFeatures -- higher-timeframe context: what the slower chart says,
+        joined onto each fast bar.
+    timeframe -- the slower bar size, default "5m".
+    htf_rsi_14 / htf_vol_rel / htf_bb_pct_b -- the same measures as above but
+        computed on the slower bars.
+    htf_trend_agreement -- +1 if price is above the slow 50-bar average, -1 if
+        below, 0 if unknown. The cheap "am I trading with or against the bigger
+        move" signal.
+    available_at -- THE LOOKAHEAD GUARD, and the subtlest thing in this file. A
+        5-minute bar stamped 12:00 is not FINISHED until 12:05, so using it at
+        12:01 would be reading the future. Each slow bar's timestamp is pushed
+        forward by one full timeframe, and the join only matches slow bars
+        already available. Get this wrong and backtests look brilliant while
+        live trading fails.
+    join_asof(strategy="backward") -- attaches the most recent ALREADY-
+        AVAILABLE slow bar to each fast bar.
+    Columns prefixed "_" (_htf_sma_50, _htf_bb_upper, ...) -- intermediates,
+        dropped before returning.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -166,6 +258,97 @@ class V3SessionFeatures(BaseFeatureGenerator):
             hour.is_between(12, 21, closed="left").cast(pl.Int8).alias("session_ny"),
             hour.is_between(12, 16, closed="left").cast(pl.Int8).alias("session_overlap"),
         )
+
+
+class V3CostFeatures(BaseFeatureGenerator):
+    """
+    Per-instrument spread-cost feature: ``cost_ratio``.
+
+        cost_ratio = alpha_sym * baseline_natr / natr_14
+
+    where ``alpha_sym`` is the instrument's empirically measured spread cost
+    as a fraction of a typical move (baked from live SPREAD_CALIB samples by
+    scripts/bake_spread_alphas.py) and ``baseline_natr`` is the per-symbol
+    rolling median of ``natr_14`` over ``regime_window`` bars.
+
+    This is exactly the live Gate A inequality rearranged
+    (``sl_dist < k_eff * alpha * baseline_ATR``), so the model sees the same
+    quantity the cost gate thresholds on.  Time-varying: when current
+    volatility rises above baseline, the ratio falls — trading gets cheaper.
+
+    Symmetry contract: computed from bar data + the alpha table ONLY, in both
+    training and live.  The live per-tick spread is deliberately NOT used here
+    (training can never see it); the tick spread keeps its existing job as
+    Gate A's hard veto input.
+
+    Notes:
+      * ``alpha_table is None`` → generate() is a NO-OP (df returned
+        unchanged).  The generator is always present in pipelines; model dirs
+        without a ``spread_alphas.json`` behave bit-identically to before this
+        feature existed.
+      * ``min_samples=1`` (expanding median below a full window) is
+        REQUIRED: a strict window would null ``cost_ratio`` across the whole
+        live warmup buffer, clean_data would drop every row, and the
+        strategy's latest-bar staleness guard would silently return None
+        forever.  It also matches the training chop-veto baseline
+        (expanding-then-rolling median in retrainer._compute_chop_veto_mask).
+      * TA-Lib NATR emits float NaN (not null) for its first bars; polars
+        rolling aggregates skip nulls but PROPAGATE NaN, so we fill_nan(None)
+        here — clean_data runs too late.
+      * Known, accepted divergence from the training veto: numpy's median
+        yields NaN on windows containing leading NaNs (Gate A then skips via
+        isfinite) while this feature skips them; affects only roughly the
+        first regime_window + NATR-period bars per symbol.
+      * ``alpha_table`` is intentionally a mutable attribute — live
+        hot-reload swaps it in place after a retrain lands.
+    """
+
+    def __init__(
+        self,
+        alpha_table: Optional[dict] = None,
+        default_alpha: float = 0.15,
+        regime_window: int = 260,
+    ):
+        self.alpha_table = alpha_table
+        self.default_alpha = default_alpha
+        self.regime_window = regime_window
+        self._warned_missing: set = set()
+
+    def generate(self, df: pl.DataFrame) -> pl.DataFrame:
+        if not self.alpha_table:
+            return df
+        if "natr_14" not in df.columns:
+            raise ValueError(
+                "V3CostFeatures requires 'natr_14' — order it after "
+                "V3BaseFeatures in the pipeline."
+            )
+
+        natr = pl.col("natr_14").fill_nan(None)
+        baseline = natr.rolling_median(
+            window_size=self.regime_window, min_samples=1
+        )
+        if "symbol" in df.columns:
+            # Pooled training frames are already sorted (symbol, timestamp)
+            # by V3BaseFeatures; live single-symbol frames are time-ordered.
+            baseline = baseline.over("symbol")
+            missing = set(df["symbol"].unique().to_list()) - set(self.alpha_table)
+            new_missing = missing - self._warned_missing
+            if new_missing:
+                logger.warning(
+                    "V3CostFeatures: no alpha for %s — using default_alpha=%.4f",
+                    sorted(new_missing), self.default_alpha,
+                )
+                self._warned_missing |= new_missing
+            alpha = pl.col("symbol").replace_strict(
+                self.alpha_table, default=self.default_alpha,
+                return_dtype=pl.Float64,
+            )
+        else:
+            alpha = pl.lit(self.default_alpha, dtype=pl.Float64)
+
+        # natr_14 == 0 → Inf; clean_data nulls it and drops the row
+        # (degenerate-volatility bars — correct to skip).
+        return df.with_columns((alpha * baseline / natr).alias("cost_ratio"))
 
 
 class V3HTFFeatures(BaseFeatureGenerator):

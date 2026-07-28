@@ -1,4 +1,37 @@
 #!/usr/bin/env python3
+"""
+Ad-hoc SPY backtest at a 0.60 confidence threshold.
+
+⚠️ BROKEN AS WRITTEN (verified 2026-07-27, glossary pass). It cannot run
+against the current code:
+
+  * ``MLStrategy(model_path=..., threshold=...)`` -- neither kwarg exists any
+    more. The current constructor takes angel_path / devil_path and
+    angel_threshold / devil_threshold, so these are silently swallowed into
+    **kwargs and the model paths fall back to the default
+    ``models/equities/``, WHICH DOES NOT EXIST -> FileNotFoundError at
+    construction.
+  * ``strategy.get_order_params()`` -- this method is not defined anywhere in
+    the repo -> AttributeError.
+
+It predates the Angel/Devil split (it assumes ONE model and one threshold) and
+expects the OrderParams shape from src/core/order_management.py, which is
+itself dead. The two are dead together. Flagged, not fixed or removed.
+
+Glossary:
+    BOM -- a small local "basic order manager" defined in this file: applies
+        fixed percentage brackets and tracks fake fills. Unrelated to the real
+        RiskManager or OandaOrderManager.
+    op -- the order params object it expects from the strategy, with
+        risk_percentage / sl_multiplier / tp_multiplier -- the OrderParams
+        shape.
+    logging.disable(CRITICAL) -- silences ALL logging repo-wide at import, so
+        this script prints only its own output.
+    data/raw/SPY_1min.parquet -- the input bars.
+    start -- 2024-01-01, the cutoff after which bars are treated as the test
+        set.
+"""
+
 import sys, os, logging
 logging.disable(logging.CRITICAL)
 for name in logging.Logger.manager.loggerDict:

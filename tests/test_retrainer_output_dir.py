@@ -5,6 +5,19 @@ the promoted model in models/forex/. These tests pin that contract:
   - default output dir is models/<asset_class> (the production location),
   - RETRAIN_MODEL_DIR redirects it while leaving asset_class unchanged,
   - an actual save lands ONLY in the override dir.
+
+Why this matters more than it looks: RETRAIN_MODEL_DIR is the isolation
+mechanism for experiments. If it leaked, a side experiment would overwrite the
+promoted model that a live bot hot-reloads -- silently swapping the running
+strategy's brain for an unvalidated candidate.
+
+Glossary:
+    asset_class stays unchanged -- the override redirects ONLY the save
+        destination. Every feature, gate and hyperparameter path stays
+        identical, so the side model is a fair comparison rather than a
+        different experiment.
+    "lands ONLY in the override dir" -- the assertion that matters: the
+        production directory must be untouched afterwards.
 """
 import json
 import os
@@ -19,6 +32,7 @@ project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root / "src"))
 
 from core.retrainer import get_asset_config, save_models, save_threshold
+from core.thresholds import ANGEL_THRESHOLD
 
 
 class TestRetrainerOutputDir(unittest.TestCase):
@@ -59,6 +73,14 @@ class TestRetrainerOutputDir(unittest.TestCase):
             meta = json.loads((override / "metadata.json").read_text())
             self.assertEqual(meta["asset_class"], "forex")
             self.assertEqual(meta["trained_on_symbols"], ["XAU_USD", "XAG_USD"])
+
+            # threshold.json pins BOTH bars: the tuned Devil value passed in,
+            # and the Angel bar the pair was trained at (added 2026-07 so a
+            # deployed model can't run at a different population than it was
+            # fitted for).
+            thr = json.loads((override / "threshold.json").read_text())
+            self.assertEqual(thr["devil_threshold"], 0.27)
+            self.assertEqual(thr["angel_threshold"], round(ANGEL_THRESHOLD, 4))
 
 
 if __name__ == "__main__":

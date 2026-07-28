@@ -3,6 +3,27 @@ from unittest.mock import MagicMock, patch
 import sys
 from pathlib import Path
 
+"""
+Tests for OandaOrderManager entry logic -- net-position arithmetic.
+
+Positions are tracked as ONE signed number per instrument (US rules forbid
+holding both directions at once), so every entry is really "move from current
+units to target units". These tests pin that arithmetic.
+
+Glossary:
+    test_flat_to_long -- the simple case: no position to a positive one.
+    test_long_to_short_reversal -- crossing through zero in a single order,
+        which is one instruction rather than a close followed by an open.
+    test_delta_zero_noop -- already at target sends NO order. Important because
+        the interface is "end at N units", so a repeat call must be harmless;
+        that is what makes retrying after an ambiguous network failure safe.
+    test_api_error_leaves_state -- a rejected order must leave local state
+        untouched, so the bot never believes a failed order succeeded.
+    test_add_to_existing_position_weighted_avg -- adding to a position
+        recomputes the average entry price by size-weighting, since that price
+        is what the stop and target are measured from.
+"""
+
 # Add src to path
 project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root / "src"))

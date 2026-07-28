@@ -1,3 +1,40 @@
+"""
+Clock-aligned aggregation of live 1-minute bars into higher-timeframe candles.
+
+One instance per (symbol, timeframe) pair turns a broker's 1-minute bar stream
+into sealed OHLCV candles. Used by the live orchestrators and the backtest
+harness; the DataFrame it maintains is the input every strategy and indicator
+reads. Domain terms (sealed bar, OHLCV, HTF) are defined in GLOSSARY.md.
+
+Glossary:
+    LiveBarAggregator -- one instance per (symbol, timeframe) pair; owns the
+        buffer and the rolling candle history for that pair.
+    _SCHEMA -- the six-column Polars schema (timestamp/open/high/low/close/
+        volume) every downstream consumer relies on. Timestamps are microsecond
+        UTC, all prices and volume are Float64.
+    timeframe -- minutes per aggregated candle (e.g. 5 or 15). Must be >= 1 and
+        divide 60 evenly so windows line up with the wall clock.
+    history_size -- how many sealed candles to retain in memory (default 400).
+        Sized for higher-timeframe indicator warm-up, not for storage.
+    buffer -- the raw 1-minute bars received so far for the window that is
+        still open; collapsed into a single candle when that window closes.
+    current_window_start -- UTC start of the window currently accumulating;
+        None until the very first bar arrives.
+    history_df -- the rolling DataFrame of sealed candles, trimmed to
+        history_size. This is the public output; consumers treat it as
+        read-only.
+    add_bar() -> bool -- True means a window just sealed (the caller's cue to
+        run a strategy); False means the bar was only buffered.
+    _window_floor -- rounds a timestamp down to its logical window start, so a
+        12:34 bar lands in the 12:30 window rather than wherever a naive bar
+        count happened to fall.
+    _forward_fill_gaps -- inserts synthetic flat candles (OHLC = prior close,
+        volume 0) across gaps in the feed so the series stays evenly spaced and
+        TA-Lib indicators remain mathematically valid.
+    last_close -- the price carried forward across a gap by those synthetic
+        candles.
+"""
+
 import polars as pl
 import logging
 from datetime import datetime, timedelta, timezone

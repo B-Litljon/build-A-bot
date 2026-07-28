@@ -26,6 +26,39 @@ Usage:
 
 Output:
     models/v4_investor_lgbm.txt   (LightGBM native text format)
+
+Step 3 of the V4 Investor, with its own promotion gate -- structurally the same
+idea as the scalper's retrainer, but scored on RANKING quality rather than
+profit factor.
+
+Glossary:
+    LambdaRank -- a learning-to-rank objective. It optimises the ORDER of the
+        list rather than each stock's individual score, which matches the job:
+        only the relative ordering decides what gets bought.
+    Group unit -- one trading date is one ranking problem ("rank today's 96
+        candidates"), which is why dates form the query groups.
+    TRAIN_DAYS -- 504, the minimum expanding training window (~2 years).
+    TEST_DAYS -- 60, the width of each out-of-sample fold and the roll-forward
+        step.
+    EMBARGO_DAYS -- 60, AND THIS IS THE SUBTLE ONE. The target looks 60 days
+        ahead, so the last 60 days of any training window overlap the future of
+        the test window. Skipping a 60-day gap between them prevents the model
+        being scored on outcomes it partly saw during training.
+    P@K (precision at K) -- of the top K names the model picked, what fraction
+        really landed in the top quintile.
+    lift -- P@K divided by the base rate. Since the target is a top QUINTILE,
+        random guessing scores 0.20; a lift of 1.3 means 30% better than chance.
+        Lift, not raw precision, is what the gate thresholds on.
+    GATE_P1_MIN_LIFT / GATE_P2_MIN_LIFT -- 1.3 / 1.2 for the top 1 and 2 picks.
+    GATE_P8_MIN_LIFT -- 1.1, and the one that actually matters: the orchestrator
+        deploys TOP_K=8, so this measures the gate at the depth really traded.
+        Added when the strategy moved from 2 concentrated picks to 8.
+    GATE_NDCG_MIN -- 0.0, i.e. informational only until calibrated. NDCG scores
+        the whole ordering, rewarding good names placed near the top.
+    FORCE_SAVE -- INVESTOR_GATE_FORCE=1, an escape hatch to save a model that
+        failed the gate. Deliberately awkward to trigger.
+    _EXCLUDE_COLS -- columns never fed to the model (identifiers, raw prices,
+        the target itself).
 """
 
 from __future__ import annotations

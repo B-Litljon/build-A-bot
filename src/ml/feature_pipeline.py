@@ -7,6 +7,35 @@ V3.3: Multi-Timeframe (MTF) extension.
   lookahead bias prevention via available_at logic implemented in V3HTFFeatures.
 
 Abstracted to dynamic injection structure using Core Interfaces.
+
+This is the assembly point: callers hand it a LIST of generators and it runs
+them in order, then scrubs the result. The live strategy and the retrainer each
+build their own list, which is how they stay in lockstep -- same generators,
+same order, same cleaning.
+
+Glossary:
+    FeaturePipeline -- holds an ordered list of feature generators plus one
+        optional target generator, and runs them.
+    feature_generators -- ORDER MATTERS. Later generators depend on columns
+        earlier ones added (V3CostFeatures raises outright if natr_14 is
+        missing because it was placed before V3BaseFeatures).
+    target_generator -- training only; None for live inference, where there is
+        no answer to attach.
+    run() -- generate everything, then clean_data. Always returns a frame ready
+        to hand to a model.
+    clean_data -- converts NaN AND infinity to null, then drops incomplete
+        rows. Infinity is the non-obvious half: normalised features divide, and
+        a perfectly flat bar makes the denominator zero. Model fitting rejects
+        infinity, so it must be scrubbed rather than passed through.
+    feature_cols -- when given, only these columns are checked for
+        completeness. Without it a null in ANY column drops the row, including
+        columns the model never looks at.
+    _RAW_DIR / _PROCESSED_DIR -- data/raw/ (input, one parquet per symbol) and
+        data/processed/ (output). Used only by main().
+    main() -- the standalone script path: read every data/raw/*_1min.parquet,
+        run a fixed pipeline, write data/processed/training_data.parquet. The
+        production retrainer does NOT use this; it builds its own pipeline in
+        memory.
 """
 
 from __future__ import annotations

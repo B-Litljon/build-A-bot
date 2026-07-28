@@ -5,6 +5,36 @@ from unittest.mock import MagicMock
 import sys
 from pathlib import Path
 
+"""
+Tests for the stream-liveness watchdog -- what happens when the price feed goes
+silent.
+
+The scenario these exist for: a TCP connection that half-opens without closing.
+No error is raised, the reader simply blocks forever, and stops enforced in
+software stop being enforced at all. Silence is therefore treated as failure.
+
+Glossary:
+    TestStreamLiveness -- the orchestrator's response.
+    test_stale_stream_flattens_and_reconnects -- THE CORE SAFETY BEHAVIOUR:
+        a quiet feed means reconnect AND close everything. Holding a position
+        you cannot see is worse than being flat.
+    test_stale_stream_no_positions_still_reconnects -- reconnect even with
+        nothing at risk, so the bot recovers instead of sitting idle.
+    test_fresh_stream_no_action / test_stream_not_running_no_action -- no
+        false alarms on a healthy feed, and no action before startup.
+    TestProviderLivenessState -- the provider's own age tracking.
+    test_age_none_before_stream -- age is None (unknown), not 0 (fresh), before
+        the stream starts. Zero would read as healthy.
+    test_age_tracks_monotonic -- measured on a monotonic clock, so a system
+        clock adjustment cannot make the feed look fresh or ancient.
+    test_force_disconnect_noop_without_stream -- forcing a disconnect with no
+        stream is harmless.
+    test_force_disconnect_terminates_active_request -- and does terminate a real
+        one.
+    test_reset_stop_clears_event -- the stop flag can be cleared so the stream
+        can restart after a shutdown signal.
+"""
+
 # Add src to path
 project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root / "src"))

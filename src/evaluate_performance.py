@@ -16,6 +16,31 @@ Exit Logic:
     - SL: Entry - (0.5 * ATR)
     - TP: Entry + (3.0 * ATR)
     - Max Hold: 45 bars
+
+This is what run_pipeline.sh's "Phase 3: Trade Resolution" actually runs --
+NOT src/core/resolver.py, despite that module's usage line claiming otherwise.
+Both write data/resolved_ledger.csv; this one is the live path and uses
+volatility-scaled brackets rather than fixed percentages.
+
+Glossary:
+    BARS_PATH -- data/oos_bars.parquet, the bars to grade against.
+    LEDGER_PATH -- data/signal_ledger.parquet (note: PARQUET, matching
+        replay_test.py's output; core/resolver.py expects a CSV of the same
+        base name and is the odd one out).
+    OUTPUT_PATH -- data/evaluation_results.parquet.
+    DRIFT_REPORT_PATH -- data/drift_report.json, read for the regime-aware
+        thresholds below.
+    SL_MULTIPLIER / TP_MULTIPLIER / MAX_HOLD_BARS -- 0.5 / 3.0 / 45. Must match
+        the retrainer's bracket definition or the grades describe trades the
+        bot would never have taken.
+    BASE_THRESHOLD -- 0.50, the normal conviction requirement.
+    HIGH_VOLATILITY_THRESHOLD -- 0.75. In a high-volatility regime the bar is
+        RAISED, because that is where the drift analysis found calibration
+        breaking down. A regime-aware threshold rather than one flat number.
+    Max Drawdown -- the worst peak-to-trough fall in the equity curve; how much
+        pain the strategy would have put you through, as opposed to where it
+        ended up.
+    Profit Factor -- gross wins divided by gross losses; 1.0 is break-even.
 """
 
 from __future__ import annotations

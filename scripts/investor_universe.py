@@ -1,3 +1,24 @@
+"""
+V4 Investor stock universe -- the list of companies the monthly ranker chooses
+from, plus each one's sector.
+
+Single source of truth, imported by the data miner, the feature pipeline and
+the portfolio orchestrator, so the three can never disagree about which
+companies exist.
+
+Glossary:
+    UNIVERSE -- the 96 tickers considered each month. Widened from 46 on
+        2026-07-03 to cover all 11 sectors. Every name was chosen to have a
+        full 5-year daily history -- no recent listings or spin-offs -- so that
+        walk-forward folds have data at every point and are not silently
+        unbalanced by companies that did not yet exist.
+    SECTORS -- ticker to sector name. Used by the orchestrator's diversified
+        selection to cap how many picks may come from one sector, so a single
+        sector's bad month cannot sink the whole basket. MUST be kept in sync
+        with UNIVERSE.
+    GICS -- the standard 11-sector classification scheme these names follow.
+"""
+
 # V4 Investor Stock Universe — Sector-Balanced Large-Caps (all 11 GICS sectors)
 # Deduplicated definition used by data miner, feature pipeline, and orchestrator.
 #

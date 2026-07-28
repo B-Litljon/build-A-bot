@@ -17,6 +17,35 @@ Deps:   pip install "mcp[cli]"
 Env:    SOAK_PIDFILE (default /tmp/soak.pid), SOAK_LOGPATH_FILE
         (default /tmp/soak_logpath), SOAK_REPO_DIR (default the repo path) —
         the logpath file stores a path relative to the repo, so we resolve it.
+
+Turns the manual soak check-in commands into tools an AI assistant can call
+directly. Everything is derived by reading the pidfile, the logs and `ps` --
+it never touches a broker.
+
+Glossary:
+    PID_FILE -- /tmp/soak.pid (SOAK_PIDFILE), how the soak process is located.
+    LOGPATH_FILE -- /tmp/soak_logpath (SOAK_LOGPATH_FILE), holds the current
+        soak log's path RELATIVE to the repo, resolved against REPO_DIR.
+    REPO_DIR -- repo root (SOAK_REPO_DIR).
+    TRADEABLE_ALPHA_MAX -- 1/1.5 = 0.667. The cost threshold an instrument must
+        beat to be tradeable, derived from the cost gate's base multiplier: if
+        the toll exceeds this share of a typical move, no stop can clear the
+        gate. Instruments above it are effectively untradeable at this
+        timeframe.
+    soak_status -- is it alive, for how long, which log.
+    calibration -- the latest measured spread costs per instrument.
+    gate_activity -- which chop gates have been vetoing signals.
+    retrain_status -- progress of a retrain, from its log.
+    start_soak / stop_soak -- the ONLY tools that change anything, and only
+        the practice-account soak process. They never trade, retrain or promote.
+    two-step confirm token -- the safety mechanism on those two: the first call
+        returns a PREVIEW plus a random token and does nothing; acting requires
+        a second call carrying that token with identical arguments. An assistant
+        cannot start or stop the bot in one turn by accident.
+    start_soak double-start guard -- refuses if a soak is already running.
+    _CALIB_RE / _REJECT_RE -- regexes parsing SPREAD_CALIB and gate-veto lines
+        out of the soak log.
+    _tail -- bounded log reads, so a multi-day log is never loaded whole.
 """
 from __future__ import annotations
 

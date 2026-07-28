@@ -1,3 +1,27 @@
+"""
+Launcher for the Factory path (Alpaca crypto) -- FactoryOrchestrator.
+
+Root-level entry point. Its real job is the sys.path bootstrap: it prepends
+src/ so that bare module names ("execution.factory_orchestrator") resolve, then
+assembles the four pieces and hands control to the orchestrator.
+
+The assembly is the useful thing to read -- it shows the whole dependency shape
+of a running bot in one place:
+
+    AlpacaCryptoFeed   (where bars come from)
+    MLFactoryStrategy  (what decides)
+    RiskManager        (what sizes and vetoes)
+    FactoryOrchestrator(what sequences and executes)
+
+Glossary:
+    _SRC_DIR -- the src/ directory, inserted at the front of sys.path. This is
+        why modules elsewhere import as "data.feed" rather than "src.data.feed";
+        the entry point decides which convention holds.
+    load_dotenv -- reads the .env file, which is where broker credentials live.
+    main() -- the async entry point; constructs the four objects above and
+        awaits the orchestrator's run loop.
+"""
+
 import asyncio
 import logging
 import os

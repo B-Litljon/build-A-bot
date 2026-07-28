@@ -2,6 +2,26 @@
 """
 Data fetcher for Universal Scalper training.
 Fetches 1-minute historical data for specified tickers and stores as Parquet.
+
+STATUS (glossary pass, 2026-07-27): APPARENTLY DEAD. Nothing imports this
+module and no script runs it.
+
+⚠️ NAME COLLISION: ``retrainer.py`` defines a FUNCTION also called
+``fetch_training_data``, and that function is the one actually used --
+``chop_ab_test.py`` and ``scripts/generate_feature_stats.py`` both import it
+from ``src.core.retrainer``, not from here. This module is unrelated to it.
+The live training path fetches through MarketDataProvider; this module calls
+the Alpaca SDK directly and writes a different file layout.
+
+Glossary:
+    _RAW_DIR -- data/raw/, resolved relative to this file's location.
+    symbols -- hardcoded in main(): SPY, TSLA, NVDA, COIN. Note this basket
+        differs from harvester.py's and from the retrainer's.
+    days_back -- 60, hardcoded in main().
+    fetch_ticker_data -- one ticker's 1-minute bars, converted row by row into
+        a Polars frame.
+    Output layout -- one file per symbol, data/raw/<SYMBOL>_1min.parquet, as
+        opposed to harvester.py's single combined file.
 """
 
 import os

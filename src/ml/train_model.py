@@ -7,6 +7,40 @@ Implements a two-stage training system:
 
 Usage:
     python -m ml.train_model
+
+STATUS: LEGACY. This is the original two-stage trainer -- RandomForest, no
+validation gate, saving to src/ml/models/. The production path is
+``src/core/retrainer.py``, which uses LightGBM, adds the walk-forward promotion
+gate, and saves to models/<asset_class>/. Only ``src/replay_test.py`` still
+imports from here. Useful as the clearest statement of the two-stage idea; do
+not use it to produce a model you intend to trade.
+
+Glossary:
+    Angel (stage one) -- trained for RECALL: catch as many real opportunities
+        as possible, tolerating false alarms. It proposes.
+    Devil (stage two) -- trained for PRECISION on only the bars the Angel
+        liked: of these candidates, which are actually worth taking. It vetoes.
+        Two stages exist because one model tuned for both jobs does neither
+        well. See GLOSSARY.md.
+    ANGEL_THRESHOLD -- the confidence above which the Angel proposes; imported
+        from core.thresholds (0.40 unless env-overridden).
+    DEVIL_THRESHOLD -- 0.50, the confidence above which the Devil approves.
+        (Production learns this value per retrain instead of fixing it.)
+    EXCLUDE_COLS -- columns that must never be fed to the model: timestamp,
+        symbol, the raw prices and volume, un-normalised indicator
+        intermediates (bb_upper, sma_50, the htf_* and _htf_* columns,
+        available_at), and the target itself. Two distinct reasons: leaving the
+        target in lets the model read the answer, and raw price levels let it
+        memorise a specific instrument at a specific era instead of learning a
+        pattern that transfers.
+    ModelTrainingOrchestrator -- runs the two-stage fit end to end.
+    _PROCESSED_DIR -- data/processed/, where it reads training_data.parquet.
+    _MODEL_DIR -- src/ml/models/. NOTE this is a different location from the
+        production models/<asset_class>/, so nothing here can overwrite a live
+        model.
+    TimeSeriesSplit -- splits chronologically, never randomly: training must
+        always come from before validation, or the model learns from its own
+        future.
 """
 
 from __future__ import annotations
@@ -21,6 +55,7 @@ import pandas as pd
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import classification_report, precision_score, roc_auc_score, recall_score
 
+from core.thresholds import ANGEL_THRESHOLD
 from ml.core.interfaces import BaseTrainer
 from ml.trainers.v3_rf_trainer import V3RandomForestTrainer
 
@@ -33,8 +68,8 @@ logger = logging.getLogger(__name__)
 _PROCESSED_DIR = Path("data/processed")
 _MODEL_DIR = Path("src/ml/models")
 
-# Meta-Labeling Configuration
-ANGEL_THRESHOLD = 0.40
+# Meta-Labeling Configuration — the Angel bar comes from core.thresholds
+# (shared repo-wide; the ANGEL_THRESHOLD env var overrides it).
 DEVIL_THRESHOLD = 0.50
 
 # Columns to exclude from features (prevent data leakage)

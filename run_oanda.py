@@ -11,6 +11,28 @@ Usage:
     python3 run_oanda.py                      # default EUR/USD
     python3 run_oanda.py --symbols GBP/USD    # override basket
     OANDA_UNITS=500 python3 run_oanda.py      # override position size
+
+⚠️ THIS IS THE LAUNCHER FOR THE CURRENTLY-RUNNING BOT. The live M15 soak is
+`run_oanda.py --daemon --env practice --granularity 15`, kept alive by
+soak_watchdog.sh (cron, every 5 minutes). To stop it, `touch soak.off` BEFORE
+killing the process, or the watchdog resurrects it within 5 minutes.
+
+Glossary:
+    _SRC_DIR -- src/, prepended to sys.path so bare module names resolve.
+    FALLBACK_SYMBOLS -- ["EUR/USD"], used only when nothing else specifies a
+        basket. The real basket normally comes from the model's metadata.
+    _MODEL_DIR -- which model directory to load; this is what selects between
+        models/forex and a side candidate like models/forex_m15.
+    _METADATA_PATH -- metadata.json in that directory. Read so the bot trades
+        the instruments and timeframe the model was actually TRAINED on rather
+        than whatever the command line happens to say.
+    _GRANULARITY_PROFILES -- maps bar size to (higher-timeframe, warm-up bars),
+        matching scripts/probe_model.py. Picking the wrong pair here would feed
+        the model differently-computed features than it trained on.
+    --granularity -- bar size in minutes (15 for the current soak).
+    --env -- "practice" (paper money) or "live" (real). Defaults to practice.
+    --daemon -- headless mode; log to file, no interactive display.
+    OANDA_UNITS -- position size override.
 """
 
 import argparse
@@ -189,6 +211,11 @@ async def _main() -> None:
     )
     order_manager = OandaOrderManager(environment=args.env)
     
+    # Forex volatility is a fraction of Equities. Use a derived 2.0 pips stop-loss floor
+    # so the chop filter doesn't reject everything.
+    # Set round_precision=5 since Forex pairs are quoted to 5 decimal places natively.
+    risk_profile = RiskProfile.for_asset_class("forex")
+
     htf_tf, warmup_pd = _GRANULARITY_PROFILES[args.granularity]
     strategy = MLStrategy(
         asset_class="forex",
@@ -197,13 +224,29 @@ async def _main() -> None:
         timeframe=args.granularity,
         htf_timeframe=htf_tf,
         warmup_period=warmup_pd,
+        # cost_ratio feature baseline must use the same window as the live
+        # regime gate — one source of truth for both sides.
+        regime_window=risk_profile.regime_window,
     )
-    
-    # Forex volatility is a fraction of Equities. Use a derived 2.0 pips stop-loss floor
-    # so the chop filter doesn't reject everything.
-    # Set round_precision=5 since Forex pairs are quoted to 5 decimal places natively.
-    risk_profile = RiskProfile.for_asset_class("forex")
-    risk_manager = RiskManager(profile=risk_profile)
+
+    # Per-instrument spread alphas shipped with the model (spread_alphas.json,
+    # written by the retrainer on gate pass). Used by Gate A's stale-spread
+    # proxy branch; fresh tick spreads always win. Absent → flat env alpha.
+    alpha_overrides = None
+    try:
+        with open(_MODEL_DIR / "spread_alphas.json") as fh:
+            alpha_overrides = json.load(fh).get("alphas") or None
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.warning("Could not read spread_alphas.json: %s", e)
+    logger.info(
+        "Gate A spread proxy mode: %s",
+        f"per-instrument ({len(alpha_overrides)} alphas)"
+        if alpha_overrides
+        else f"flat alpha={risk_profile.spread_atr_alpha}",
+    )
+    risk_manager = RiskManager(profile=risk_profile, alpha_overrides=alpha_overrides)
 
     orchestrator = OandaScalperOrchestrator(
         symbols=symbols,

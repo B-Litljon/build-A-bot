@@ -22,6 +22,127 @@ Environment Variables:
     ALPACA_API_KEY: Alpaca API key
     ALPACA_SECRET_KEY: Alpaca API secret
     DISCORD_WEBHOOK_URL: Discord webhook for retraining reports (optional)
+
+This is the training half of the system. Nothing here runs during live trading;
+it fetches history, builds labels, trains the two models, tests them on data
+they never saw, and only overwrites the live model files if that test passes.
+Domain terms (angel/devil, ATR/NATR, bracket, chop veto, walk-forward, OOS,
+Brier score, profit factor) are defined in GLOSSARY.md.
+
+Artifacts written on promotion, into ``model_dir`` (default models/<asset_class>/):
+    angel_latest.pkl, devil_latest.pkl, metadata.json, threshold.json,
+    feature_stats.json, and spread_alphas.json when the cost experiment is on.
+All are written to a temp name then os.replace()d, so the live bot's
+hot-reloader can never read a half-written file.
+
+Glossary:
+    DAYS_BACK -- how many days of history to train on (default 60, override
+        RETRAIN_DAYS_BACK).
+    _DEFAULT_TICKERS_BY_CLASS -- the default instrument basket per asset class.
+        The forex basket is volatility-first (two metals plus JPY/commonwealth
+        crosses) because the calm G7 majors failed the gate outright. Override
+        with RETRAIN_SYMBOLS.
+    get_asset_config -- turns DATA_SOURCE ("oanda" -> forex, else equities)
+        into one dict of every knob the run needs: basket, bracket multipliers,
+        hold limit, bar size, and where to save.
+    model_dir -- save destination. Defaults to the production models/<class>/;
+        set RETRAIN_MODEL_DIR to train a side candidate without overwriting the
+        promoted model, while keeping every other setting identical.
+    get_hyperparameters -- returns (angel_params, devil_params) for LightGBM.
+        Both are deterministic by construction (fixed seed, force_row_wise) so
+        two runs on the same data give the same model.
+
+    SL_ATR_MULTIPLIER / TP_ATR_MULTIPLIER -- bracket width in units of the
+        instrument's own recent volatility: stop at 0.5x, target at 3.0x (a
+        6:1 payoff). ⚠️ These are the EQUITIES/default values and are only
+        function defaults here -- get_asset_config() takes the real numbers
+        from RiskProfile.for_asset_class(), and the FOREX profile overrides
+        them to 1.0x / 2.0x (a 2:1 payoff). Check the profile, not these
+        constants, when reasoning about a forex run. Either way the value must
+        match the live orchestrator's or the model is trained on trades the bot
+        would never take.
+    MAX_HOLD_BARS -- 45. A trade that reaches neither level within 45 bars is
+        labelled a loss (timeout), because capital was tied up for nothing.
+    SURVIVAL_BARS -- 5. The horizon for the Devil's survival label, below.
+    ANGEL_THRESHOLD -- imported from core.thresholds (0.40 unless the env var
+        overrides at process start). Minimum Angel probability for a bar to count as a
+        proposed trade.
+    DEVIL_THRESHOLD -- 0.50, fallback only. The real threshold is chosen per
+        run by _find_optimal_threshold() and saved to threshold.json.
+
+    BRIER_THRESHOLD -- 0.30 gate ceiling on probability calibration. Raised
+        from 0.25 deliberately: the survival label's ~45% base rate puts a
+        do-nothing classifier near 0.25, so the old value rejected honest
+        models.
+    EV_THRESHOLD -- 0.0005, minimum average return per trade to promote.
+    PROFIT_FACTOR_THRESHOLD -- 1.2, minimum gross-win / gross-loss ratio.
+    MIN_OOS_TRADES_FOR_PF -- 100, the legacy single-fold sample-size floor,
+        superseded by the pooled floor below but still referenced.
+    BASELINE_POOLED_OOS_TRADES -- 300. Trades are pooled across all folds and
+        the requirement is scaled down by the chop veto's drop rate
+        (effective_floor = 300 x (1 - chop_veto_rate)), so a filter that
+        correctly discards a third of the bars is not punished for the trades
+        it removed. This floor exists because a handful of lucky wins at 6:1
+        payoff can fake a passing profit factor.
+    USE_HMM_FEATURES -- off by default (RETRAIN_USE_HMM=1 to enable). Adds
+        3 hidden-regime probability features, fit per fold to avoid leakage.
+    _SPREAD_TABLE_PATH / SPREAD_TABLE -- optional per-instrument trading-cost
+        table (RETRAIN_SPREAD_TABLE). When set, the cost gate uses each
+        instrument's measured cost instead of one flat assumption, a
+        ``cost_ratio`` feature is added so the model can see cost directly, and
+        the table is copied next to the model on promotion. Unset, runs are
+        bit-identical to before that experiment.
+
+    BASE_FEATURE_COLS -- the 22 always-on model inputs, in four groups:
+        10 single-bar indicators, 4 higher-timeframe (htf_*) views of the
+        slower chart, 4 candle-shape microstructure measures, and 4 one-hot
+        trading-session flags.
+    FEATURE_COLS -- BASE_FEATURE_COLS plus cost_ratio and/or the HMM columns
+        when those experiments are enabled. This exact list and order must
+        match what the live strategy feeds the model.
+
+    FoldMetrics -- one walk-forward fold's scorecard: sizes, Brier, expected
+        value, win rate, and both trade counts.
+    angel_proposed_trades vs devil_approved_trades -- how many bars stage one
+        liked versus how many survived stage two. The ratio is the Devil's
+        selectivity.
+    ValidationReport -- the aggregate verdict across folds, plus gate_passed
+        and the human-readable rejection_reasons list that gets posted to
+        Discord.
+    chop_veto_rate -- fraction of training rows the chop veto discarded.
+    effective_trade_floor -- the drop-rate-scaled trade count actually required.
+
+    fetch_training_data -- pulls raw bars per symbol from the configured
+        provider and stacks them into one frame.
+    _compute_devil_targets_atr -- the MACRO label: replay each bar forward up
+        to max_hold and record whether target or stop came first. Stop is
+        checked first each bar, so a bar touching both is scored a loss.
+    _compute_devil_survival_target -- the label actually trained on: did price
+        avoid the stop for the next 5 bars. Introduced because the Devil's
+        inputs describe a 1-5 minute horizon, so asking it about a 45-bar
+        outcome was an unlearnable mismatch.
+    _compute_chop_veto_mask -- vectorised copy of the live pre-trade veto, so
+        the model only ever learns from bars the live bot would actually
+        trade. Gate A rejects bars where the stop is too tight relative to
+        trading cost; Gate B rejects bars whose volatility sits too low in its
+        own recent range (dead, choppy conditions).
+    engineer_features_and_labels -- runs the feature pipeline, builds both
+        labels, applies the veto, and returns the clean training frame.
+    generate_time_decay_weights -- weights recent rows more heavily
+        (decay_factor 0.95) so the model leans toward current market behaviour.
+    refit_models -- trains the Angel then the Devil on one window.
+    _find_optimal_threshold -- sweeps candidate Devil cut-offs and picks the
+        one maximising expected value, subject to a minimum trade count.
+    validate_candidate -- the gate itself: 3 expanding walk-forward folds,
+        each trained on the past and scored on the future it never saw. The
+        full-data production model is trained only after the gate passes.
+    promote_or_reject -- the single decision point. On pass it writes the model
+        files; on fail it returns False and the previous production weights are
+        left untouched.
+    save_models / save_threshold / save_spread_table -- the atomic writers for
+        the artifacts listed above.
+    Exit codes -- 0 promoted, 1 execution error, 2 trained but rejected. Note
+        that 2 is not a failure of this script; it means the gate did its job.
 """
 
 from __future__ import annotations
@@ -52,7 +173,13 @@ from src.execution.risk_manager import (
     coupled_keff,
 )
 from src.ml.feature_pipeline import FeaturePipeline
-from src.ml.features.v3_features import V3BaseFeatures, V3HTFFeatures, V3SessionFeatures
+from src.ml.feature_stats import compute_feature_stats, save_feature_stats
+from src.ml.features.v3_features import (
+    V3BaseFeatures,
+    V3CostFeatures,
+    V3HTFFeatures,
+    V3SessionFeatures,
+)
 from src.ml.regimes.hmm_regime import (
     HMM_OUTPUT_COLS,
     fit_regime_models,
@@ -203,7 +330,12 @@ SURVIVAL_BARS = 5  # Phase 5.5: Devil survival window (bars)
 # INFERENCE THRESHOLDS (must match MLStrategy)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-ANGEL_THRESHOLD = 0.40
+# The Angel bar is imported, not defined here: core.thresholds is the single
+# source of truth (ANGEL_THRESHOLD env var overrides at process start). The
+# Devil trains only on Angel-approved rows (Phase 5.5) and the bracket
+# optimizer fits on the same population — one value, or the stages drift.
+from src.core.thresholds import ANGEL_THRESHOLD  # noqa: E402
+
 # Legacy: used as a fallback. In validate_candidate(), the Devil threshold
 # is dynamically selected per-fold via _find_optimal_threshold().
 DEVIL_THRESHOLD = 0.50
@@ -237,6 +369,34 @@ BASELINE_POOLED_OOS_TRADES = int(os.getenv("RETRAIN_POOLED_TRADE_FLOOR", "300"))
 # its posterior state probabilities are appended as 3 additional features.
 # Default off so a plain LightGBM swap can be evaluated without confounds.
 USE_HMM_FEATURES = os.getenv("RETRAIN_USE_HMM", "0").strip() == "1"
+
+# Per-instrument spread-cost table (2026-07-07 cost-awareness experiment).
+# Points at a JSON baked by scripts/bake_spread_alphas.py from live
+# SPREAD_CALIB measurements. When set:
+#   * the chop-veto Gate A uses each instrument's measured alpha instead of
+#     the flat profile.spread_atr_alpha (0.15) — fixes a real train/live
+#     asymmetry where training kept e.g. GBP_NZD (alpha ~0.90) setups that
+#     live always vetoes;
+#   * V3CostFeatures appends a ``cost_ratio`` feature so the model can SEE
+#     cost and learn to suppress conviction on untradeable instruments;
+#   * on gate pass the table is copied into model_dir/spread_alphas.json so
+#     model + cost assumptions travel together (live loads it from there).
+# Unset → prod retrains are bit-identical to before this experiment.
+_SPREAD_TABLE_PATH = os.getenv("RETRAIN_SPREAD_TABLE", "").strip()
+
+
+def _load_spread_table(path: str) -> Optional[dict]:
+    """Parse a bake_spread_alphas.py JSON table; raise on malformed input."""
+    with open(path, "r") as fh:
+        table = json.load(fh)
+    if "alphas" not in table or not isinstance(table["alphas"], dict):
+        raise ValueError(f"Spread table {path} has no 'alphas' mapping")
+    return table
+
+
+SPREAD_TABLE: Optional[dict] = (
+    _load_spread_table(_SPREAD_TABLE_PATH) if _SPREAD_TABLE_PATH else None
+)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # FEATURE COLUMNS (must match MLStrategy.feature_names and FeaturePipeline output)
@@ -276,7 +436,9 @@ BASE_FEATURE_COLS: List[str] = [
 ]
 
 FEATURE_COLS: List[str] = (
-    BASE_FEATURE_COLS + HMM_OUTPUT_COLS if USE_HMM_FEATURES else BASE_FEATURE_COLS
+    BASE_FEATURE_COLS
+    + (["cost_ratio"] if SPREAD_TABLE else [])
+    + (HMM_OUTPUT_COLS if USE_HMM_FEATURES else [])
 )
 
 
@@ -561,7 +723,10 @@ def _compute_devil_survival_target(
 
 
 def _compute_chop_veto_mask(
-    df: pl.DataFrame, profile: RiskProfile, sl_mult: float
+    df: pl.DataFrame,
+    profile: RiskProfile,
+    sl_mult: float,
+    alpha_table: Optional[dict] = None,
 ) -> np.ndarray:
     """
     Vectorized hybrid chop veto, mirroring ``RiskManager._evaluate_dynamic_gates``
@@ -575,6 +740,13 @@ def _compute_chop_veto_mask(
         volatility-scaled proxy; ``close`` cancels on both sides). The spread
         proxy scales with each era's *baseline* (median-window) volatility —
         not a static historical constant — so it is era-robust.
+
+    ``alpha_table`` (2026-07-07): optional per-instrument spread alphas
+    ({symbol: alpha_emp} from a bake_spread_alphas.py table). When provided,
+    each symbol's measured alpha replaces the flat ``profile.spread_atr_alpha``
+    in Gate A — instruments the table doesn't list fall back to the profile
+    value. This fixes the asymmetry where training priced GBP_NZD (measured
+    ~0.90) at the flat 0.15 and kept setups live always vetoes.
 
     Returns a boolean array (True = veto/drop) aligned to ``df`` rows. Rows are
     dropped only as trade *entries*; the bracket walk in the target functions
@@ -598,12 +770,14 @@ def _compute_chop_veto_mask(
     w = int(profile.regime_window)
     mins = int(profile.regime_min_samples)
     p_thresh = profile.regime_pctile / 100.0
-    alpha = profile.spread_atr_alpha
 
     symbols = df["symbol"].to_numpy() if "symbol" in df.columns else np.zeros(n_total)
     natr_all = df["natr_14"].to_numpy().astype(float)
 
     for sym in np.unique(symbols):
+        # Per-instrument measured alpha when a table is provided; flat profile
+        # value otherwise (and for symbols the table doesn't list).
+        alpha = (alpha_table or {}).get(str(sym), profile.spread_atr_alpha)
         idx = np.where(symbols == sym)[0]  # contiguous, time-ordered per symbol
         natr = natr_all[idx]
         m = len(natr)
@@ -649,6 +823,14 @@ def _compute_chop_veto_mask(
             gate_a &= np.isfinite(baseline)
 
         veto[idx] = gate_a | gate_b
+        # Per-symbol diagnostics — critical when alpha_table is active: an
+        # expensive instrument (GBP_NZD ~0.90) should thin dramatically.
+        logger.info(
+            "  Chop veto [%s]: alpha=%.4f | gate_a=%d gate_b=%d | vetoed %d/%d (%.1f%%)",
+            sym, alpha, int(gate_a.sum()), int(gate_b.sum()),
+            int((gate_a | gate_b).sum()), m,
+            100.0 * (gate_a | gate_b).mean() if m else 0.0,
+        )
 
     return veto
 
@@ -666,6 +848,7 @@ def engineer_features_and_labels(
     survival_bars: int = SURVIVAL_BARS,
     htf_timeframe: str = "5m",
     risk_profile: Optional[RiskProfile] = None,
+    alpha_table: Optional[dict] = None,
 ) -> Tuple[pl.DataFrame, List[str], float]:
     """
     Engineer technical features and generate ATR-dynamic target labels.
@@ -708,6 +891,16 @@ def engineer_features_and_labels(
             V3BaseFeatures(),
             V3HTFFeatures(timeframe=htf_timeframe),
             V3SessionFeatures(),
+            # No-op when alpha_table is None; needs natr_14 → after V3Base.
+            V3CostFeatures(
+                alpha_table=alpha_table,
+                default_alpha=(
+                    risk_profile.spread_atr_alpha if risk_profile else 0.15
+                ),
+                regime_window=(
+                    risk_profile.regime_window if risk_profile else 260
+                ),
+            ),
         ]
     )
     for gen in pipeline.feature_generators:
@@ -783,7 +976,9 @@ def engineer_features_and_labels(
     chop_veto_rate = 0.0
     if risk_profile is not None:
         pre_veto = df.height
-        veto_mask = _compute_chop_veto_mask(df, risk_profile, sl_mult)
+        veto_mask = _compute_chop_veto_mask(
+            df, risk_profile, sl_mult, alpha_table=alpha_table
+        )
         n_veto = int(veto_mask.sum())
         chop_veto_rate = n_veto / pre_veto if pre_veto else 0.0
         if n_veto > 0:
@@ -799,10 +994,15 @@ def engineer_features_and_labels(
     # CLEANUP: Drop NaN/null rows (uses FeaturePipeline.clean_data)
     # ═══════════════════════════════════════════════════════════════════
     initial_count = len(df)
+    # cost_ratio exists iff an alpha_table was provided (V3CostFeatures is a
+    # no-op otherwise) — include it in cleaning and the returned schema so it
+    # reaches the models. Keyed off the function param, not the module global,
+    # so behavior follows what was actually computed.
+    base_cols = BASE_FEATURE_COLS + (["cost_ratio"] if alpha_table else [])
     # Clean on BASE features only — HMM regime probs (when enabled) are
     # appended later inside validate_candidate so each fold fits its own HMM.
     df = FeaturePipeline.clean_data(
-        df, feature_cols=BASE_FEATURE_COLS + ["angel_target", "devil_target"]
+        df, feature_cols=base_cols + ["angel_target", "devil_target"]
     )
     dropped_count = initial_count - len(df)
 
@@ -810,11 +1010,11 @@ def engineer_features_and_labels(
         f"Dropped {dropped_count:,} rows with nulls ({dropped_count / initial_count:.1%})"
     )
     logger.info(f"Final dataset: {len(df):,} rows")
-    logger.info(f"Base feature columns ({len(BASE_FEATURE_COLS)}): {BASE_FEATURE_COLS}")
+    logger.info(f"Base feature columns ({len(base_cols)}): {base_cols}")
     if USE_HMM_FEATURES:
         logger.info(f"HMM regime features ENABLED — will be appended per-fold: {HMM_OUTPUT_COLS}")
 
-    return df, BASE_FEATURE_COLS, chop_veto_rate
+    return df, base_cols, chop_veto_rate
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1756,6 +1956,8 @@ def promote_or_reject(
 
         save_models(angel_model, devil_model, asset_config)
         save_threshold(threshold, asset_config)
+        if SPREAD_TABLE is not None:
+            save_spread_table(_SPREAD_TABLE_PATH, asset_config)
         if hmm_models is not None:
             asset_class = asset_config.get("asset_class", "equities")
             model_dir = Path(asset_config.get("model_dir") or f"models/{asset_class}")
@@ -1851,6 +2053,7 @@ def save_models(
         "trained_at": datetime.now(timezone.utc).isoformat(),
         "trained_on_symbols": asset_config.get("tickers", []),
         "data_source": os.getenv("DATA_SOURCE", "alpaca").strip().lower(),
+        "angel_threshold": ANGEL_THRESHOLD,
     }
     with open(metadata_temp, "w") as f:
         json.dump(metadata, f, indent=2)
@@ -1881,6 +2084,11 @@ def save_threshold(threshold: float, asset_config: dict) -> None:
 
     data = {
         "devil_threshold": round(threshold, 4),
+        # Pin the Angel bar the pair was trained at: the Devil's training
+        # population and the bracket fit are conditioned on it, so the live
+        # strategy must run the model at this value (MLStrategy overrides
+        # its default with this key when present).
+        "angel_threshold": round(ANGEL_THRESHOLD, 4),
         "updated_at": datetime.now().isoformat(),
     }
 
@@ -1892,6 +2100,35 @@ def save_threshold(threshold: float, asset_config: dict) -> None:
 
     logger.info(
         f"[ATOMIC] Threshold saved: {threshold_path} (devil_threshold={threshold:.4f})"
+    )
+
+
+def save_spread_table(source_path: str, asset_config: dict) -> None:
+    """
+    Copy the per-instrument spread-alpha table into the model directory as
+    ``spread_alphas.json`` so the model and its cost assumptions travel
+    together.  MLStrategy / run_oanda load it from the model dir — a model
+    trained against one cost table must never run against another.
+
+    Written atomically, same pattern as save_threshold().
+    """
+    asset_class = asset_config.get("asset_class", "equities")
+    model_dir = Path(asset_config.get("model_dir") or f"models/{asset_class}")
+    model_dir.mkdir(parents=True, exist_ok=True)
+    table_path = model_dir / "spread_alphas.json"
+
+    with open(source_path, "r") as f:
+        table = json.load(f)
+
+    temp_path = model_dir / "spread_alphas_temp.json"
+    with open(temp_path, "w") as f:
+        json.dump(table, f, indent=2)
+    os.replace(temp_path, table_path)
+
+    logger.info(
+        f"[ATOMIC] Spread table saved: {table_path} "
+        f"({len(table.get('alphas', {}))} instruments, "
+        f"denomination={table.get('denomination_minutes')}m)"
     )
 
 
@@ -1950,6 +2187,28 @@ def main() -> int:
             timeframe_minutes=asset_config["timeframe_minutes"]
         )
 
+        # ─── Phase 2.5: Per-instrument spread-cost table (optional) ────────
+        spread_alphas: Optional[dict] = None
+        if SPREAD_TABLE is not None:
+            spread_alphas = SPREAD_TABLE["alphas"]
+            denom = SPREAD_TABLE.get("denomination_minutes")
+            if denom != asset_config["timeframe_minutes"]:
+                logger.warning(
+                    "⚠️  SPREAD TABLE DENOMINATION MISMATCH: table measured on "
+                    "%s-minute bars but retraining on %s-minute bars. Baseline "
+                    "NATR is timeframe-dependent — these alphas are NOT valid "
+                    "here. Re-bake from a soak at this granularity.",
+                    denom, asset_config["timeframe_minutes"],
+                )
+            logger.info(
+                "Per-instrument spread table ACTIVE (%s): %s",
+                _SPREAD_TABLE_PATH,
+                {k: round(v, 4) for k, v in sorted(spread_alphas.items())},
+            )
+            logger.info(
+                "cost_ratio feature enabled → %d features", len(FEATURE_COLS)
+            )
+
         # ─── Phase 3: Engineer features with ATR-dynamic labels ────────────
         features_df, feature_cols, chop_veto_rate = engineer_features_and_labels(
             raw_data,
@@ -1961,6 +2220,7 @@ def main() -> int:
             # Same RiskProfile path that sources sl_mult/tp_mult → the chop
             # veto simulated here is identical to the live execution gate.
             risk_profile=RiskProfile.for_asset_class(asset_config["asset_class"]),
+            alpha_table=spread_alphas,
         )
 
         # ─── Phase 4: Walk-forward validation (3-fold expanding window) ────
@@ -2008,6 +2268,11 @@ def main() -> int:
         if promoted:
             asset_class = asset_config.get("asset_class", "equities")
             saved_dir = asset_config.get("model_dir") or f"models/{asset_class}"
+            # Feature-distribution sidecar for the drift probe
+            # (scripts/probe_model.py). Computed from the exact post-veto,
+            # post-clean population the promoted models trained on.
+            stats = compute_feature_stats(features_df, feature_cols)
+            save_feature_stats(stats, saved_dir)
             logger.info("=" * 70)
             logger.info(f"✅ MODELS PROMOTED ({asset_class}) — Ready for next market open")
             logger.info(f"  Models saved in: {saved_dir}/")

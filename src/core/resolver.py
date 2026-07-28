@@ -13,6 +13,43 @@ Inputs:
 
 Output:
     - data/resolved_ledger.csv (resolved trades with outcomes)
+
+This is the LEGACY offline evaluation path, not the live system: it grades
+signals against fixed percentage brackets, whereas production sizes brackets
+from the instrument's own volatility. See GLOSSARY.md ("bracket", "OOS").
+
+STATUS (glossary pass, 2026-07-27): APPARENTLY ORPHANED. Nothing imports this
+module, and run_pipeline.sh's "Phase 3: Trade Resolution" step actually runs
+``python -m src.evaluate_performance``, not ``python -m src.core.resolver`` as
+the usage line above claims. Both write data/resolved_ledger.csv, so the file
+feedback_loop.py reads comes from evaluate_performance.py in practice.
+Flagged, not removed.
+
+Glossary:
+    LEDGER_PATH -- data/signal_ledger.csv, the BUY signals emitted by
+        replay_test.py. Read-only input.
+    BARS_PATH -- data/oos_bars.parquet, the 1-minute out-of-sample bars used to
+        decide what happened after each signal. Read-only input.
+    OUTPUT_PATH -- data/resolved_ledger.csv, this module's only output.
+    TP_MULTIPLIER / SL_MULTIPLIER -- the legacy fixed brackets, +0.5% and
+        -0.2% of entry price. Superseded in production by ATR-scaled brackets
+        (see retrainer.py); kept so old ledgers stay reproducible.
+    TradeOutcome -- what happened to one signal: the two bracket levels, where
+        and when it actually exited, how long it was held, and the verdict.
+    TradeOutcome.outcome -- the ground-truth label: 1 = win, 0 = loss. This is
+        what the models are ultimately trained to predict.
+    time_in_trade_mins -- minutes between entry and exit.
+    TradeResolver.ledger -- the loaded signal ledger, filtered to BUY rows
+        (the only rows that represent an actual trade).
+    TradeResolver.bars -- the loaded bar history, sorted by (symbol,
+        timestamp) so each signal's future can be sliced cheaply.
+    _resolve_trade -- walks bars forward from entry and checks the STOP LOSS
+        FIRST on every bar. When a single bar's range spans both levels the
+        real order of events is unknowable, so assuming the loss is the
+        conservative choice and keeps this consistent with the live simulator.
+    EOD fallback -- if neither level is touched before the data runs out, the
+        trade is closed at the last available price and counted a win only if
+        that price beat entry.
 """
 
 from __future__ import annotations

@@ -8,6 +8,23 @@ Usage:
 Environment Variables:
     ALPACA_API_KEY: Alpaca API key
     ALPACA_SECRET_KEY: Alpaca API secret
+
+Phase 1 of run_pipeline.sh: pull the recent bars the replay-and-grade loop
+will run over. Talks to the Alpaca SDK directly instead of going through
+MarketDataProvider, which predates that abstraction.
+
+Glossary:
+    DATA_PATH -- data/oos_bars.parquet, the single output file. Overwritten
+        on every run.
+    TICKERS -- the hardcoded basket (TSLA, NVDA, MARA, COIN, SMCI). Not
+        configurable by environment variable, unlike the retrainer's basket.
+    TIMEFRAME -- 1-minute bars.
+    DATA_FEED -- IEX, the free tier. Volume is therefore partial.
+    LOOKBACK_DAYS -- 7. How far back to fetch.
+    fetch_ticker_data -- fetches one ticker and returns empty on failure, so
+        one bad symbol does not abort the harvest.
+    harvest_oos_data -- fetches every ticker, concatenates, sorts by
+        (timestamp, symbol), and writes the Parquet file.
 """
 
 from __future__ import annotations

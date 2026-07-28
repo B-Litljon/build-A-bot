@@ -11,6 +11,20 @@ Usage:
     python3 run_live.py --daemon               # headless / systemd mode
     SYMBOLS="TSLA,NVDA" python3 run_live.py    # override basket via env
 
+STATUS: launcher for the ALPACA equities/crypto scalper, which is NOT the
+currently-live bot. The live one is run_oanda.py. Kept working; listed under
+the Boneyard in table-o-content.md.
+
+Glossary:
+    sys.path injection -- the only real work this file does before delegating;
+        it prepends src/ so bare module names resolve inside the tree.
+    --daemon -- headless mode: suppresses the interactive dashboard and logs to
+        file instead, for running under a service manager.
+    SYMBOLS -- comma-separated basket override read from the environment;
+        without it LiveOrchestrator's DEFAULT_SYMBOLS applies.
+    LiveOrchestrator -- everything actually happens there; see
+        src/execution/live_orchestrator.py.
+
 This script is intentionally thin.  All trading logic lives in:
     src/execution/live_orchestrator.py
 """

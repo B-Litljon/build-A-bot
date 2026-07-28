@@ -16,6 +16,27 @@ promote or overwrite production model weights.
 Run (from repo root, env loaded):
     PYTHONPATH=src:. python chop_ab_test.py
 Honors RETRAIN_DAYS_BACK / RETRAIN_SYMBOLS like the retrainer.
+
+A controlled experiment on the chop filter. The design is the point: fetch the
+data ONCE and cache it, then run the identical validation twice with only one
+environment variable changed, so any difference in the result can be attributed
+to the filter and not to a different data window or a different fetch.
+
+Glossary:
+    ROOT -- repo root; also inserted into sys.path so both "src.x" and "x"
+        imports resolve.
+    Arm A (control) -- RISK_CHOP_FILTER_ENABLED off; trains on every bar.
+    Arm B (treatment) -- filter on; trains only on bars the live bot would
+        actually be allowed to trade.
+    Byte-identical dataset -- the cached parquet is reused for both arms. Any
+        re-fetch would introduce a second variable and void the comparison.
+    fetch_training_data -- imported from src.core.retrainer (the FUNCTION,
+        not the same-named dead module src/data/fetch_training_data.py).
+    validate_candidate -- the retrainer's own gate, reused unchanged as the
+        scorer, so the experiment measures the metric that actually governs
+        promotion.
+    Profit Factor delta -- the headline output: gross wins over gross losses in
+        arm B minus arm A.
 """
 import hashlib
 import logging

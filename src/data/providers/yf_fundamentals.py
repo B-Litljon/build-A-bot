@@ -9,6 +9,15 @@ adapter for feature prototyping and backtesting only.  Do not rely on it
 for production capital allocation decisions.
 
 No API key is required.
+
+Glossary:
+    YFinanceFundamentalProvider -- pulls company data from Yahoo. Returns
+        empty on any failure, which the composite provider treats as "try the
+        next source".
+    _COMPANY_INFO_KEYS -- the subset of Yahoo's large, unstable info blob this
+        adapter actually reads (name, sector, industry, country, ...). Pinning
+        the list means an upstream schema change drops fields instead of
+        crashing.
 """
 
 from __future__ import annotations
