@@ -1,6 +1,6 @@
 # `tests/`
 
-**136 tests, all passing.** Run with:
+**137 tests, all passing.** Run with:
 
 ```bash
 PYTHONPATH=src:. python -m pytest -q
@@ -13,7 +13,7 @@ webhook on import).
 
 > ⚠️ **`verify_warmup.py` is never run.** It contains a real test case, but
 > collection also requires the default `test_*.py` filename pattern and this
-> file doesn't match. The suite reports 136 collected and this one isn't among
+> file doesn't match. The suite reports 137 collected and this one isn't among
 > them. Renaming it to `test_warmup.py` would include it. Flagged, not changed.
 
 **No network, no broker, no real models.** Every test stubs its dependencies —
@@ -37,7 +37,7 @@ See the root [GLOSSARY.md](../GLOSSARY.md) for domain terms.
 |---|---:|---|
 | `test_composite_fundamentals.py` | 18 | Provider chaining: first non-empty wins; a raising source is a miss, not an error |
 | `test_risk_manager.py` | 16 | The bracket floors and all three chop gates |
-| `test_oanda_scalper.py` | 30 | The live bot's control flow — mostly failure paths |
+| `test_oanda_scalper.py` | 31 | The live bot's control flow — mostly failure paths |
 | `test_feature_stats.py` | 12 | The stats artifact and the PSI maths |
 | `test_stream_liveness.py` | 9 | What happens when the price feed goes silent |
 | `test_cost_feature.py` | 9 | The per-instrument cost feature and veto alphas |

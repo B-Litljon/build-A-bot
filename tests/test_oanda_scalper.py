@@ -29,7 +29,9 @@ Glossary:
         not be re-entered.
     test_boot_reconcile_* -- on startup the broker is asked what is actually
         open: an orphan left by a crashed process is flattened, a flat account
-        is a no-op, and a failed sync ABORTS rather than proceeding blind.
+        is a no-op, a TRANSIENT sync failure is retried (a 2026-07-28 blip
+        cost 15min of downtime via the watchdog's crash-loop brake), and a
+        persistent one ABORTS rather than proceeding blind.
     test_reversal_records_authoritative_units -- after flipping direction the
         BROKER's reported size is recorded, not the size that was requested.
     test_failed_flip_restores_old_position_state -- a failed reversal must roll
@@ -310,11 +312,28 @@ class TestOandaScalperOrchestrator(unittest.TestCase):
     def test_boot_reconcile_aborts_on_sync_failure(self):
         """Unverifiable broker state -> startup refuses to proceed."""
         orch, _, _, order_manager, _ = self._make_orchestrator()
+        orch._reconcile_retry_delay = 0.0
         order_manager.sync_position.return_value = False
 
         with self.assertRaises(RuntimeError):
             asyncio.run(orch._reconcile_on_boot())
 
+        self.assertEqual(
+            order_manager.sync_position.call_count, orch._reconcile_max_attempts
+        )
+        order_manager.close_position.assert_not_called()
+
+    def test_boot_reconcile_retries_transient_sync_failure(self):
+        """A blip (e.g. the 2026-07-28 401) must not abort startup: one
+        transient error costs 15min of downtime via the crash-loop brake."""
+        orch, _, _, order_manager, _ = self._make_orchestrator()
+        orch._reconcile_retry_delay = 0.0
+        order_manager.sync_position.side_effect = [False, True]
+        order_manager.get_net_position.return_value = 0
+
+        asyncio.run(orch._reconcile_on_boot())  # must not raise
+
+        self.assertEqual(order_manager.sync_position.call_count, 2)
         order_manager.close_position.assert_not_called()
 
     # ── (f) reversal accounting (H1 hardening) ─────────────────────────

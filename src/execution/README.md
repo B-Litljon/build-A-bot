@@ -68,7 +68,7 @@ Note the forex profile overrides the bracket multipliers to **1.0× / 2.0×**
 - **Data artifacts:** none directly; reads per-instrument costs passed in from
   the model dir's `spread_alphas.json`.
 
-### `oanda_scalper_orchestrator.py` (1395 lines) — ⚠️ the live bot
+### `oanda_scalper_orchestrator.py` (1429 lines) — ⚠️ the live bot
 `OandaScalperOrchestrator`. Two clocks run at once, and most of the design
 follows from that:
 

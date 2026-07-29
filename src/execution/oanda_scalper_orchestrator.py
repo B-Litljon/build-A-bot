@@ -76,7 +76,10 @@ Glossary:
     _reconcile_on_boot -- asks the broker what is actually open before trading.
         A restart must adopt reality rather than assume it is flat -- otherwise
         a position left by a crashed process would run with nothing watching
-        its stop.
+        its stop. Unverifiable state still refuses to start, but only after
+        _reconcile_max_attempts tries (OANDA_RECONCILE_MAX_ATTEMPTS / _RETRY_DELAY):
+        one transient error used to cost 15 minutes of downtime via the cron
+        watchdog's crash-loop brake.
 
     ── the fast path ──
     _on_tick -- runs on the provider's stream thread for EVERY quote. Records
@@ -340,6 +343,17 @@ class OandaScalperOrchestrator:
 
         # Watchdog close retry policy (C1 hardening)
         self._close_max_attempts = int(os.getenv("OANDA_CLOSE_MAX_ATTEMPTS", "5"))
+
+        # Boot reconciliation retry policy. Refusing to start when broker
+        # state is unverifiable is deliberate, but a single transient error
+        # should not trigger it — with the cron watchdog's crash-loop brake,
+        # one blip costs 15 minutes of downtime.
+        self._reconcile_max_attempts = int(
+            os.getenv("OANDA_RECONCILE_MAX_ATTEMPTS", "3")
+        )
+        self._reconcile_retry_delay = float(
+            os.getenv("OANDA_RECONCILE_RETRY_DELAY", "3")
+        )
 
         # Stream liveness policy (C3 hardening). The provider's read
         # timeout is the primary stall defense; this watchdog is the
@@ -990,17 +1004,37 @@ class OandaScalperOrchestrator:
         an orphan (crash recovery, failed watchdog close from a prior run)
         with no known SL/TP — flatten it. If broker state cannot even be
         *verified*, abort startup: never trade blind.
+
+        That refusal is retried before it becomes fatal. On 2026-07-28 a
+        single transient 401 on one instrument aborted startup, and the
+        cron watchdog's crash-loop brake then kept the bot down for 15
+        minutes over a blip that had cleared seconds later. Retrying costs
+        nothing and does not weaken the guard: startup still refuses if the
+        broker cannot be reached after every attempt.
         """
         loop = asyncio.get_running_loop()
         for symbol in self._symbols:
             norm_sym = _to_oanda_symbol(symbol)
 
-            ok = await loop.run_in_executor(
-                None, self._order_manager.sync_position, norm_sym
-            )
+            ok = False
+            for attempt in range(1, self._reconcile_max_attempts + 1):
+                ok = await loop.run_in_executor(
+                    None, self._order_manager.sync_position, norm_sym
+                )
+                if ok:
+                    break
+                if attempt < self._reconcile_max_attempts:
+                    delay = self._reconcile_retry_delay * attempt
+                    logger.warning(
+                        "[%s] Boot reconciliation attempt %d/%d could not "
+                        "verify broker state; retrying in %.1fs",
+                        norm_sym, attempt, self._reconcile_max_attempts, delay,
+                    )
+                    await asyncio.sleep(delay)
             if not ok:
                 raise RuntimeError(
-                    f"[{norm_sym}] Boot reconciliation failed: could not "
+                    f"[{norm_sym}] Boot reconciliation failed after "
+                    f"{self._reconcile_max_attempts} attempts: could not "
                     "verify broker position state — refusing to start."
                 )
 
