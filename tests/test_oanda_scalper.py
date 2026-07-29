@@ -44,6 +44,14 @@ Glossary:
         max_age=0 disables the feature.
     test_stream_bar_marks_scored -- a bar scored by the normal stream path is
         thereby ineligible for catch-up; both paths share one dedup record.
+    test_seam_backfill_* -- the bar in flight when the stream dies is dropped
+        as partial but HAS sealed, so its complete version is re-fetched from
+        REST and scored: the happy path, the REST-lag retry, giving up
+        quietly when REST never publishes it, tolerating a fetch exception
+        (this runs inside the bar callback), and refusing to append out of
+        order or rescore.
+    test_reconnect_delay_* -- backoff grows, stays inside [cap/2, cap], and
+        never exceeds the configured maximum.
 """
 
 # Suppress unawaited-coroutine RuntimeWarning when mocking asyncio.run_coroutine_threadsafe
@@ -53,6 +61,8 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root / "src"))
 sys.path.insert(0, str(project_root))
+
+import polars as pl
 
 from src.execution.oanda_scalper_orchestrator import OandaScalperOrchestrator
 from src.execution.oanda_order_manager import OrderCloseError
@@ -510,6 +520,146 @@ class TestOandaScalperOrchestrator(unittest.TestCase):
 
         # Catch-up found nothing new to score
         self.assertEqual(strategy.generate_signals.call_count, 1)
+
+    # ── (i) seam backfill: the bar in flight when the stream died ──────
+
+    def _armed_for_drop(self, orch, bars):
+        """Prime the seam state so the next _on_bar hits the drop branch."""
+        orch._bar_buffers["EUR_USD"] = list(bars[:-1])
+        orch._last_hist_ts["EUR_USD"] = bars[-2]["timestamp"]
+        orch._seam_crossed["EUR_USD"] = False
+
+    @staticmethod
+    def _rest_frame(bar):
+        """A get_historical_bars-shaped frame containing exactly one bar."""
+        return pl.DataFrame(
+            {
+                "timestamp": [bar["timestamp"]],
+                "open": [bar["open"]],
+                "high": [bar["high"]],
+                "low": [bar["low"]],
+                "close": [bar["close"]],
+                "volume": [bar["volume"]],
+            }
+        )
+
+    def test_seam_backfill_scores_dropped_bar(self):
+        """The dropped partial bar is re-fetched from REST and traded."""
+        orch, provider, strategy, order_manager, risk_manager = self._make_orchestrator()
+        strategy.generate_signals.return_value = FakeSignal(direction="long")
+        risk_manager.calculate_bracket.return_value = (0.00050, 0.00150)
+        order_manager.submit_target_position.return_value = {
+            "filled": 1000, "avg_price": 1.08500, "closed_units": 0,
+            "opened_units": 1000, "position_units": 1000,
+            "position_avg_price": 1.08500,
+        }
+        bars = self._dt_bars(4)
+        self._armed_for_drop(orch, bars)
+        # REST holds the COMPLETE version of the bar the stream only has
+        # partially — different close, so we can prove which one was used.
+        complete = {**bars[-1], "close": 1.09999}
+        provider.get_historical_bars.return_value = self._rest_frame(complete)
+
+        asyncio.run(orch._on_bar(bars[-1]))
+
+        order_manager.submit_target_position.assert_called_once_with("EUR_USD", 1000)
+        buf = orch._bar_buffers["EUR_USD"]
+        self.assertEqual(len(buf), 4)
+        self.assertEqual(buf[-1]["close"], 1.09999)  # REST copy, not the partial
+        self.assertEqual(buf[-1]["symbol"], "EUR_USD")
+        self.assertEqual(orch._last_scored_ts["EUR_USD"], bars[-1]["timestamp"])
+
+    def test_seam_backfill_retries_when_rest_lags_the_seal(self):
+        """REST publishes the sealed candle a beat late -> retry succeeds."""
+        orch, provider, strategy, order_manager, risk_manager = self._make_orchestrator()
+        orch._seam_backfill_retry_delay = 0.0
+        strategy.generate_signals.return_value = None
+        bars = self._dt_bars(4)
+        self._armed_for_drop(orch, bars)
+        provider.get_historical_bars.side_effect = [
+            pl.DataFrame({"timestamp": [], "open": [], "high": [],
+                          "low": [], "close": [], "volume": []}),
+            self._rest_frame(bars[-1]),
+        ]
+
+        asyncio.run(orch._on_bar(bars[-1]))
+
+        self.assertEqual(provider.get_historical_bars.call_count, 2)
+        strategy.generate_signals.assert_called_once()
+
+    def test_seam_backfill_gives_up_without_evaluating(self):
+        """REST never publishes it -> no evaluation, no crash, not marked."""
+        orch, provider, strategy, order_manager, _ = self._make_orchestrator()
+        orch._seam_backfill_retry_delay = 0.0
+        bars = self._dt_bars(4)
+        self._armed_for_drop(orch, bars)
+        provider.get_historical_bars.return_value = pl.DataFrame(
+            {"timestamp": [], "open": [], "high": [],
+             "low": [], "close": [], "volume": []}
+        )
+
+        asyncio.run(orch._on_bar(bars[-1]))
+
+        strategy.generate_signals.assert_not_called()
+        order_manager.submit_target_position.assert_not_called()
+        self.assertIsNone(orch._last_scored_ts["EUR_USD"])
+        self.assertEqual(len(orch._bar_buffers["EUR_USD"]), 3)
+
+    def test_seam_backfill_survives_fetch_exception(self):
+        """A REST failure must not escape the bar callback."""
+        orch, provider, strategy, _, _ = self._make_orchestrator()
+        orch._seam_backfill_retry_delay = 0.0
+        bars = self._dt_bars(4)
+        self._armed_for_drop(orch, bars)
+        provider.get_historical_bars.side_effect = RuntimeError("api down")
+
+        asyncio.run(orch._on_bar(bars[-1]))  # must not raise
+
+        strategy.generate_signals.assert_not_called()
+
+    def test_seam_backfill_skips_already_scored_bar(self):
+        """If the bar was already scored, no fetch and no rescore."""
+        orch, provider, strategy, _, _ = self._make_orchestrator()
+        bars = self._dt_bars(4)
+        self._armed_for_drop(orch, bars)
+        orch._last_scored_ts["EUR_USD"] = bars[-1]["timestamp"]
+
+        asyncio.run(orch._on_bar(bars[-1]))
+
+        provider.get_historical_bars.assert_not_called()
+        strategy.generate_signals.assert_not_called()
+
+    def test_seam_backfill_disabled_by_zero_attempts(self):
+        """SEAM_BACKFILL_ATTEMPTS=0 restores the plain drop."""
+        orch, provider, strategy, _, _ = self._make_orchestrator()
+        orch._seam_backfill_attempts = 0
+        bars = self._dt_bars(4)
+        self._armed_for_drop(orch, bars)
+
+        asyncio.run(orch._on_bar(bars[-1]))
+
+        provider.get_historical_bars.assert_not_called()
+        strategy.generate_signals.assert_not_called()
+
+    # ── (j) reconnect backoff ──────────────────────────────────────────
+
+    def test_reconnect_delay_grows_and_stays_in_jitter_band(self):
+        """Backoff doubles per consecutive failure, jittered within [cap/2, cap]."""
+        orch, _, _, _, _ = self._make_orchestrator()
+        for attempt, ceiling in ((0, 5.0), (1, 10.0), (2, 20.0), (3, 40.0)):
+            for _ in range(20):
+                d = orch._reconnect_delay(attempt)
+                self.assertGreaterEqual(d, ceiling / 2)
+                self.assertLessEqual(d, ceiling)
+
+    def test_reconnect_delay_capped(self):
+        """Deep backoff never exceeds the cap (which sits under the 60s
+        liveness-watchdog flatten threshold)."""
+        orch, _, _, _, _ = self._make_orchestrator()
+        for _ in range(20):
+            d = orch._reconnect_delay(20)
+            self.assertLessEqual(d, orch._reconnect_max_delay)
+            self.assertGreaterEqual(d, orch._reconnect_max_delay / 2)
 
     # ── helpers ────────────────────────────────────────────────────────
 

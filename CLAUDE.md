@@ -73,7 +73,7 @@ Verified during the 2026-07-27 glossary pass:
 ## Testing
 
 ```bash
-PYTHONPATH=src:. python -m pytest -q     # 128 tests
+PYTHONPATH=src:. python -m pytest -q     # 136 tests
 ```
 
 `PYTHONPATH=src:.` is required — entry points prepend `src/` to the path, which

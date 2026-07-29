@@ -68,7 +68,7 @@ Note the forex profile overrides the bracket multipliers to **1.0× / 2.0×**
 - **Data artifacts:** none directly; reads per-instrument costs passed in from
   the model dir's `spread_alphas.json`.
 
-### `oanda_scalper_orchestrator.py` (1218 lines) — ⚠️ the live bot
+### `oanda_scalper_orchestrator.py` (1395 lines) — ⚠️ the live bot
 `OandaScalperOrchestrator`. Two clocks run at once, and most of the design
 follows from that:
 
@@ -87,6 +87,16 @@ Things worth knowing:
   stream was down and is still fresh (`SEAM_CATCHUP_MAX_AGE_SECONDS`; default
   one bar period). Before this existed, signals sealing during an outage were
   silently lost — ~6 of 15 would-be signals in the 2026-07 soak.
+  Its other half, `_backfill_seam_bar`, handles the bar that was *in flight*
+  when the stream died: the stream's copy is incomplete so it is dropped, but
+  it has sealed, so the complete version is re-fetched from REST and scored
+  (`SEAM_BACKFILL_ATTEMPTS`, `SEAM_BACKFILL_RETRY_DELAY`). Measured cost
+  without it: 5 lost evaluations per symbol in the first 16h of the
+  2026-07-28 soak, ~8% of bars.
+- **Reconnect backoff** — jittered exponential, 5s base / 60s cap, reset after
+  120s of healthy streaming (`OANDA_RECONNECT_*`). The cap sits below the
+  liveness watchdog's 60s flatten threshold, so backing off never leaves a
+  position unwatched longer than the stall response already permits.
 - **`_reconcile_on_boot`** — asks the broker what's actually open before
   trading. A restart must adopt reality, not assume it's flat, or a position
   left by a crashed process runs with nothing watching its stop.
