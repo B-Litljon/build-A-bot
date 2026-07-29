@@ -58,6 +58,19 @@ Glossary:
     _seam_catchup_max_age -- SEAM_CATCHUP_MAX_AGE_SECONDS; how stale a missed
         bar may be and still be scored. -1 (default) = one bar period,
         0 disables catch-up.
+    _backfill_seam_bar -- the OTHER half of the reconnect gap: the bar in
+        flight when the stream died is dropped (the stream's copy is
+        incomplete), but it has sealed by then, so its complete version is
+        re-fetched from REST and scored. Costs one evaluation per symbol per
+        reconnect if absent -- measured at 5/symbol in 16h on 2026-07-28.
+    _seam_backfill_attempts / _seam_backfill_retry_delay --
+        SEAM_BACKFILL_ATTEMPTS (3, 0 disables) and SEAM_BACKFILL_RETRY_DELAY
+        (2s). REST can lag the bar seal by a second or two.
+    _reconnect_delay / _reconnect_base_delay / _reconnect_max_delay /
+        _reconnect_healthy_seconds -- jittered capped exponential backoff
+        (5s base, 60s cap, reset after 120s of healthy streaming) so a
+        flapping endpoint is not hammered on a fixed cadence. The cap sits
+        below the liveness watchdog's 60s flatten threshold.
     _evaluate_and_trade -- the decision tail (inference → guards → bracket →
         order) shared by the stream path and the catch-up path.
     _reconcile_on_boot -- asks the broker what is actually open before trading.
@@ -128,6 +141,7 @@ import asyncio
 import functools
 import logging
 import os
+import random
 import signal as sig
 import threading
 import time
@@ -224,6 +238,30 @@ class OandaScalperOrchestrator:
         # provider's granularity is known); 0 disables catch-up entirely.
         self._seam_catchup_max_age = float(
             os.getenv("SEAM_CATCHUP_MAX_AGE_SECONDS", "-1")
+        )
+
+        # Seam backfill: how hard to chase the complete version of a dropped
+        # in-flight bar from REST (0 disables), and how long to wait between
+        # tries when REST has not published the sealed candle yet.
+        self._seam_backfill_attempts = int(os.getenv("SEAM_BACKFILL_ATTEMPTS", "3"))
+        self._seam_backfill_retry_delay = float(
+            os.getenv("SEAM_BACKFILL_RETRY_DELAY", "2")
+        )
+
+        # Reconnect backoff. A flat retry hammers a struggling endpoint:
+        # 2026-07-28 saw six reconnects in two minutes, each re-priming all
+        # eight instruments, while OANDA's stream edge went silent for 20s
+        # at a time. Capped below the liveness watchdog's flatten threshold
+        # so a backoff never leaves a position unwatched longer than the
+        # stall response already allows.
+        self._reconnect_base_delay = float(
+            os.getenv("OANDA_RECONNECT_BASE_DELAY", "5")
+        )
+        self._reconnect_max_delay = float(
+            os.getenv("OANDA_RECONNECT_MAX_DELAY", "60")
+        )
+        self._reconnect_healthy_seconds = float(
+            os.getenv("OANDA_RECONNECT_HEALTHY_SECONDS", "120")
         )
 
         # Position state: symbol -> {entry, sl, tp, units, state}
@@ -589,6 +627,11 @@ class OandaScalperOrchestrator:
                     symbol,
                     bar["timestamp"],
                 )
+                # The stream's copy of this bar is incomplete (it missed the
+                # ticks from before the reconnect), but it HAS sealed — REST
+                # holds the complete version. Fetch and score that instead of
+                # losing the bar outright.
+                await self._backfill_seam_bar(symbol, bar["timestamp"])
                 return  # Drop the first bar > last_ts (the partial seam bar)
 
         # ── update rolling buffer ──
@@ -624,6 +667,113 @@ class OandaScalperOrchestrator:
         self._last_scored_ts[symbol] = bar["timestamp"]
 
         await self._evaluate_and_trade(symbol)
+
+    async def _backfill_seam_bar(self, symbol: str, ts: "datetime") -> None:
+        """
+        Re-fetch a dropped partial seam bar from REST and score it.
+
+        The bar in flight when a disconnect happens is lost twice over: the
+        re-prime cannot see it (it had not sealed yet) and the stream's own
+        copy is incomplete, so ``_on_bar`` drops it. It has nonetheless
+        SEALED by the time that drop fires — this runs at the bar boundary —
+        so REST holds a complete version. Without this, every reconnect
+        silently costs one evaluation per symbol (measured: 5 per symbol in
+        the first 16h of the 2026-07-28 soak, ~8% of bars).
+
+        Retries a few times because REST can lag the seal by a second or two;
+        ``get_historical_bars`` filters out still-forming candles, so a miss
+        is an empty frame rather than a partial bar. Failure is logged and
+        dropped — never raised — because this runs inside the bar callback.
+        """
+        if self._seam_backfill_attempts <= 0:
+            return
+
+        last = self._last_scored_ts.get(symbol)
+        if last is not None and ts <= last:
+            return  # already scored by another path
+
+        gran_min = getattr(self._provider, "_stream_gran", 1)
+        loop = asyncio.get_running_loop()
+        start = ts - timedelta(seconds=1)
+        end = ts + timedelta(minutes=gran_min)
+
+        for attempt in range(1, self._seam_backfill_attempts + 1):
+            df = None
+            try:
+                df = await loop.run_in_executor(
+                    None,
+                    self._provider.get_historical_bars,
+                    symbol,
+                    gran_min,
+                    start,
+                    end,
+                )
+            except Exception as e:
+                logger.warning(
+                    "[%s] Seam backfill fetch failed (attempt %d/%d): %s",
+                    symbol, attempt, self._seam_backfill_attempts, e,
+                )
+
+            row = None
+            if df is not None and not df.is_empty():
+                match = df.filter(pl.col("timestamp") == ts)
+                if match.height:
+                    row = match.row(0, named=True)
+
+            if row is None:
+                if attempt < self._seam_backfill_attempts:
+                    await asyncio.sleep(self._seam_backfill_retry_delay)
+                continue
+
+            if row["timestamp"].tzinfo is None:
+                logger.warning(
+                    "[%s] Seam backfill got a timezone-naive bar at %s — "
+                    "skipping (seam dedup would misbehave)",
+                    symbol, row["timestamp"],
+                )
+                return
+
+            buf = self._bar_buffers.get(symbol)
+            if not buf:
+                return
+            # Re-check ordering after the await: a later bar must never be
+            # overtaken by this one, or the buffer stops being monotonic.
+            newest = buf[-1].get("timestamp")
+            if newest is not None and ts <= newest:
+                return
+            if len(buf) < self._warmup:
+                return
+
+            buf.append({**row, "symbol": symbol})
+            if len(buf) > self._max_bars:
+                buf.pop(0)
+
+            self._update_regime(symbol, buf[-1])
+            self._sample_spread_calibration(symbol, buf[-1]["close"])
+            self._spread_calib_bars += 1
+
+            logger.info(
+                "SEAM_BACKFILL [%s] recovered the in-flight bar %s from REST "
+                "(attempt %d) — scoring it now",
+                symbol, ts, attempt,
+            )
+            # Mark before evaluating: a failure here must not be retried into
+            # a possible duplicate order on the next reconnect.
+            self._last_scored_ts[symbol] = ts
+            try:
+                await self._evaluate_and_trade(symbol)
+            except Exception as e:
+                logger.error(
+                    "[%s] Seam backfill evaluation failed: %s",
+                    symbol, e, exc_info=True,
+                )
+            return
+
+        logger.warning(
+            "[%s] Seam backfill gave up after %d attempts — the in-flight "
+            "bar at %s is lost (one missed evaluation, no position risk)",
+            symbol, self._seam_backfill_attempts, ts,
+        )
 
     async def _evaluate_and_trade(self, symbol: str) -> None:
         """
@@ -1013,9 +1163,24 @@ class OandaScalperOrchestrator:
                     "[%s] Seam catch-up failed: %s", norm_sym, e, exc_info=True
                 )
 
+    def _reconnect_delay(self, attempt: int) -> float:
+        """
+        Jittered, capped exponential backoff for reconnects (0-based attempt).
+
+        Jitter spreads retries so a flapping endpoint is not hammered on a
+        fixed cadence; the result is always in [cap/2, cap] and never exceeds
+        ``_reconnect_max_delay``.
+        """
+        ceiling = min(
+            self._reconnect_base_delay * (2 ** attempt), self._reconnect_max_delay
+        )
+        return ceiling * (0.5 + 0.5 * random.random())
+
     async def _stream_with_retry(self) -> None:
         """Run the pricing stream with reconnect-on-disconnect."""
+        attempt = 0
         while not self._shutdown_event.is_set():
+            started = time.monotonic()
             try:
                 await asyncio.to_thread(self._provider.run_stream)
             except Exception as e:
@@ -1029,8 +1194,20 @@ class OandaScalperOrchestrator:
             if self._shutdown_event.is_set():
                 break
 
-            logger.warning("Stream reconnect in 5s; re-priming history on resume")
-            await asyncio.sleep(5)
+            # A stream that ran healthily before dying is a fresh incident,
+            # not an escalating one — start the backoff over.
+            if time.monotonic() - started >= self._reconnect_healthy_seconds:
+                attempt = 0
+
+            delay = self._reconnect_delay(attempt)
+            attempt += 1
+            logger.warning(
+                "Stream reconnect in %.1fs (consecutive failure %d); "
+                "re-priming history on resume",
+                delay,
+                attempt,
+            )
+            await asyncio.sleep(delay)
 
             # Reset seam state so re-prime + new stream dedup cleanly
             for sym in list(self._bar_buffers.keys()):
