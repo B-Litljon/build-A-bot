@@ -278,6 +278,23 @@ model leans toward current market behaviour.
 live ones. Failing is a *healthy* outcome, not a crash: the retrainer exits 2 and
 the previous weights stay in place.
 
+**lift over random vs lift over benchmark** — two different questions, and for a
+long time the investor only asked the first. "Better than guessing" is measured
+against the base rate (a top-*quintile* target makes random guessing score 0.20).
+"Better than doing nothing" is measured against equal-weighting the whole
+universe. A model can pass the first and fail the second — the 2026-07-03
+investor promotion did exactly that — so the investor's gate now requires both.
+
+**benchmark gate** — the investor's lift-over-benchmark check
+(`scripts/investor_train_model.py`). Simulates the basket actually deployed
+(top 8, max 2 per sector) against equal-weighting all 96 names, and demands the
+monthly excess clear its floor at *every* fold alignment, not once. The floor is
+deliberately above zero and the multi-alignment requirement is deliberately
+strict: measured 2026-08-03, four reasonable implementations of this same number
+spanned about 50 basis points, and a one-row-per-day change in how the
+top-quintile label rounds (19 names vs 20, out of 96) moved it by 23. A single
+measurement of portfolio excess return, on a few years of data, is not evidence.
+
 ## Scoring
 
 **Brier score** — mean squared error between predicted probabilities and what

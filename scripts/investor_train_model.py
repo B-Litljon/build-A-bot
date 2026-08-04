@@ -59,6 +59,43 @@ Glossary:
         failed the gate. Deliberately awkward to trigger.
     _EXCLUDE_COLS -- columns never fed to the model (identifiers, raw prices,
         the target itself).
+
+    ── benchmark gate (added 2026-08-03) ──
+    Every gate above measures lift over RANDOM. That cannot distinguish
+    "better than guessing" from "better than doing nothing", and on
+    2026-08-02 a model passed all of them while failing to beat an
+    equal-weighted basket of the whole universe out of sample. These
+    measure lift over DOING NOTHING.
+    GATE_BENCH_MIN_EXCESS_BPS -- INVESTOR_GATE_BENCH_BPS, default 25.0. The
+        mean monthly return of the deployed basket minus the mean monthly
+        return of equal-weighting all 96, in basis points, averaged over
+        every out-of-sample month. Must clear this to promote. The floor is
+        NOT zero on purpose: measured 2026-08-03, four reasonable
+        implementations of this same quantity spanned ~50 bps, so a floor
+        inside that band would gate on implementation noise.
+    GATE_BENCH_ALIGNMENTS -- fold-start offsets in trading days
+        (default 0,7,14,21,28). The benchmark is re-measured at each, since
+        one measurement of it is not trustworthy. Rounding the top-quintile
+        label from 19 names to 20 -- ONE row per day out of 96 -- moved the
+        measured excess by 23 bps.
+    GATE_BENCH_MIN_PASS_SHARE -- 1.0, i.e. every alignment must clear the
+        floor. This is what distinguishes a structural edge from a lucky
+        slice, and is the part of the gate doing the real work.
+    _benchmark_at_alignment -- re-runs the whole walk-forward with the start
+        slid by N trading days and returns that slice's mean excess.
+    alignment_results -- offset -> mean excess in bps, the spread the gate
+        actually decides on.
+    TOP_K / SECTOR_CAP -- 8 and 2, mirroring portfolio_orchestrator so the
+        gate simulates the basket actually traded, not the raw ranking.
+    _load_close_matrix -- dates x symbols closing prices from the raw
+        parquet, needed because the training frame carries no prices.
+        If it cannot be loaded the benchmark gate FAILS CLOSED: an
+        unmeasurable model must not be promoted.
+    _sector_capped_pick -- the orchestrator's greedy top-K-with-sector-cap
+        selection, duplicated here rather than imported to keep the trainer
+        independent of the broker-facing module.
+    bench_months -- one row per held month across all folds:
+        (month, basket return, equal-weight return).
 """
 
 from __future__ import annotations
@@ -78,8 +115,12 @@ import pandas as pd
 # ── paths ─────────────────────────────────────────────────────────────
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT / "src"))
+sys.path.insert(0, str(_PROJECT_ROOT / "scripts"))
+
+from investor_universe import SECTORS  # noqa: E402
 
 _INPUT_PATH  = _PROJECT_ROOT / "data" / "processed" / "v4_training_features.parquet"
+_RAW_PATH    = _PROJECT_ROOT / "data" / "raw" / "v4_investor_data.parquet"
 _MODEL_PATH  = _PROJECT_ROOT / "models" / "v4_investor_lgbm.txt"
 
 # ── logging ───────────────────────────────────────────────────────────
@@ -103,6 +144,30 @@ GATE_P2_MIN_LIFT = float(os.getenv("INVESTOR_GATE_P2_LIFT", "1.2"))  # P@2 ≥ 1
 GATE_P8_MIN_LIFT = float(os.getenv("INVESTOR_GATE_P8_LIFT", "1.1"))  # P@8 ≥ 1.1× base — the depth we deploy (orchestrator TOP_K=8)
 GATE_NDCG_MIN    = float(os.getenv("INVESTOR_GATE_NDCG_MIN", "0.0")) # absolute NDCG floor (0 = informational until calibrated)
 FORCE_SAVE       = os.getenv("INVESTOR_GATE_FORCE", "0").strip() == "1"  # escape hatch
+
+# ── Benchmark gate: lift over DOING NOTHING, not over random ─────────
+# Added 2026-08-03. Every threshold above compares the model to a coin
+# flip; none of them notices a model that ranks better than chance while
+# still losing to an equal-weighted basket of the same universe — which is
+# exactly what the 2026-07-03 promotion turned out to be.
+GATE_BENCH_MIN_EXCESS_BPS = float(os.getenv("INVESTOR_GATE_BENCH_BPS", "25.0"))
+TOP_K: int = 8        # mirrors portfolio_orchestrator.TOP_K
+SECTOR_CAP: int = 2   # mirrors portfolio_orchestrator.SECTOR_CAP
+
+# Fold-start offsets, in trading days, at which the benchmark is measured.
+# Measured 2026-08-03: rounding the top-quintile label from 19 names to 20
+# (one row per day out of 96) moved the measured monthly excess by 23 bps,
+# and four reasonable implementations of the same measurement spanned ~50
+# bps. A single number is therefore inside the noise; the gate requires the
+# result to survive re-slicing instead. Set to "0" to restore single-shot
+# behaviour (not recommended — that is the configuration that promoted the
+# 2026-07-03 model).
+GATE_BENCH_ALIGNMENTS: list[int] = [
+    int(x) for x in os.getenv("INVESTOR_GATE_BENCH_ALIGNMENTS", "0,7,14,21,28").split(",")
+    if x.strip()
+]
+# Share of alignments that must clear the floor. 1.0 = all of them.
+GATE_BENCH_MIN_PASS_SHARE = float(os.getenv("INVESTOR_GATE_BENCH_SHARE", "1.0"))
 
 # ── columns excluded from the feature matrix ─────────────────────────
 # OHLCV: raw price data leaks forward returns if included as features.
@@ -168,6 +233,187 @@ def _build_groups(df: pd.DataFrame, date_col: str = "date") -> np.ndarray:
         "Ensure df is sorted by date before calling _build_groups()."
     )
     return sizes
+
+
+def _load_close_matrix() -> pd.DataFrame | None:
+    """
+    Closing prices as a dates x symbols matrix.
+
+    The training frame deliberately carries no prices (they leak the
+    forward return), so the benchmark gate reads them from the raw
+    parquet.  Returns None if unavailable — the caller must then FAIL the
+    gate rather than skip it.
+    """
+    try:
+        raw = pd.read_parquet(_RAW_PATH, columns=["symbol", "close"])
+    except Exception as exc:                       # noqa: BLE001
+        logger.error("Benchmark gate: cannot read %s (%s)", _RAW_PATH, exc)
+        return None
+
+    if "date" not in raw.columns:
+        raw = raw.reset_index()
+    if "date" not in raw.columns:
+        logger.error("Benchmark gate: no 'date' column or index in %s", _RAW_PATH)
+        return None
+
+    raw["date"] = pd.to_datetime(raw["date"], utc=True)
+    px = raw.pivot_table(index="date", columns="symbol", values="close")
+    return px.sort_index()
+
+
+def _month_ends(index: pd.DatetimeIndex) -> list[pd.Timestamp]:
+    """Last available trading date of each calendar month, in order."""
+    s = pd.Series(index, index=index)
+    return sorted(s.groupby([index.year, index.month]).max())
+
+
+def _sector_capped_pick(
+    symbols: list[str],
+    scores: np.ndarray,
+    k: int = TOP_K,
+    cap: int = SECTOR_CAP,
+) -> list[str]:
+    """
+    Greedy top-k walk that skips any name whose sector is already full.
+
+    Mirrors portfolio_orchestrator.predict_and_rank so the gate scores the
+    basket that would really be bought, not the unconstrained ranking.
+    """
+    order = np.argsort(-np.asarray(scores, dtype=float))
+    picked: list[str] = []
+    per_sector: dict[str, int] = {}
+    for i in order:
+        sym = symbols[i]
+        sector = SECTORS.get(sym, "unknown")
+        if per_sector.get(sector, 0) >= cap:
+            continue
+        picked.append(sym)
+        per_sector[sector] = per_sector.get(sector, 0) + 1
+        if len(picked) == k:
+            break
+    return picked
+
+
+def _fold_basket_months(
+    test_df: pd.DataFrame,
+    scores: np.ndarray,
+    px: pd.DataFrame,
+) -> list[tuple[pd.Timestamp, float, float]]:
+    """
+    Simulate the deployed monthly rebalance across one fold's test window.
+
+    At each month-end inside the window the fold's model picks a basket;
+    it is held to the next month-end and compared with equal-weighting
+    every symbol that has prices at both ends.
+
+    The closing date may fall outside the test window — that is correct
+    and not leakage: the pick used only in-window information, and the
+    holding period's outcome is exactly what live trading would realise.
+    """
+    scored = test_df[["date", "symbol"]].copy()
+    scored["score"] = scores
+
+    all_month_ends = _month_ends(px.index)
+    window_ends = [m for m in all_month_ends
+                   if scored["date"].min() <= m <= scored["date"].max()]
+
+    out: list[tuple[pd.Timestamp, float, float]] = []
+    for d0 in window_ends:
+        later = [m for m in all_month_ends if m > d0]
+        if not later or d0 not in px.index:
+            continue
+        d1 = later[0]
+        if d1 not in px.index:
+            continue
+
+        day = scored[scored["date"] == d0]
+        if day.empty:
+            continue
+
+        p0, p1 = px.loc[d0], px.loc[d1]
+        tradable = [s for s in px.columns
+                    if np.isfinite(p0.get(s, np.nan)) and np.isfinite(p1.get(s, np.nan))]
+        if not tradable:
+            continue
+
+        day = day[day["symbol"].isin(tradable)]
+        if day.empty:
+            continue
+
+        picks = _sector_capped_pick(
+            day["symbol"].tolist(), day["score"].to_numpy()
+        )
+        if not picks:
+            continue
+
+        basket = float(np.mean([p1[s] / p0[s] - 1 for s in picks]))
+        bench = float(np.mean([p1[s] / p0[s] - 1 for s in tradable]))
+        out.append((d0, basket, bench))
+
+    return out
+
+
+def _benchmark_at_alignment(
+    df: pd.DataFrame,
+    X_df: pd.DataFrame,
+    y_all: np.ndarray,
+    px: pd.DataFrame,
+    offset: int,
+) -> tuple[float, int]:
+    """
+    Mean monthly excess over equal-weight, with the walk-forward started
+    `offset` trading days later.
+
+    Sliding the start reshuffles every fold boundary and the month
+    composition without changing the data or the rules — the cheapest
+    honest way to ask whether a result is structural or a lucky slice.
+
+    Returns (mean excess in bps, months measured). NaN if unmeasurable.
+    """
+    dates = pd.DatetimeIndex(sorted(df["date"].unique()))
+    if offset >= len(dates):
+        return float("nan"), 0
+
+    keep = df["date"] >= dates[offset]
+    d = df[keep].reset_index(drop=True)
+    Xd = X_df[keep.values].reset_index(drop=True)
+    yd = y_all[keep.values]
+
+    sub_dates = pd.DatetimeIndex(sorted(d["date"].unique()))
+    n = len(sub_dates)
+    months: list[tuple[pd.Timestamp, float, float]] = []
+
+    fold = 0
+    while True:
+        train_end = TRAIN_DAYS + fold * TEST_DAYS
+        embargo_end = train_end + EMBARGO_DAYS
+        test_end = embargo_end + TEST_DAYS
+        if test_end > n:
+            break
+
+        train_mask = d["date"] <= sub_dates[train_end - 1]
+        test_mask = ((d["date"] > sub_dates[embargo_end - 1])
+                     & (d["date"] <= sub_dates[test_end - 1]))
+        if not train_mask.any() or not test_mask.any():
+            fold += 1
+            continue
+
+        train_df = d[train_mask]
+        model = lgb.LGBMRanker(**LGBM_PARAMS)
+        model.fit(
+            Xd[train_mask.values],
+            yd[train_mask.values],
+            group=_build_groups(train_df),
+            callbacks=[lgb.log_evaluation(period=-1)],
+        )
+        scores = model.predict(Xd[test_mask.values])
+        months.extend(_fold_basket_months(d.loc[test_mask, ["date", "symbol"]], scores, px))
+        fold += 1
+
+    if not months:
+        return float("nan"), 0
+    excess = np.array([b - h for _, b, h in months], dtype=float)
+    return float(excess.mean() * 10_000), len(months)
 
 
 def _precision_at_k(
@@ -280,6 +526,10 @@ def _main_impl() -> int:
     fold_results: list[dict] = []
     fold_num = 0
 
+    # Prices for the benchmark gate. None => unmeasurable => gate fails.
+    px = _load_close_matrix()
+    bench_months: list[tuple[pd.Timestamp, float, float]] = []
+
     logger.info("\n%s", "─" * 70)
 
     while True:
@@ -340,6 +590,10 @@ def _main_impl() -> int:
         p_at_2 = _precision_at_k(test_df, scores, k=2)
         p_at_8 = _precision_at_k(test_df, scores, k=8)  # deployed basket depth
 
+        # Benchmark gate: what this fold's model would actually have earned
+        if px is not None:
+            bench_months.extend(_fold_basket_months(test_df, scores, px))
+
         logger.info(
             "Fold %2d │ Train → %s (%4d dates, %5d rows) │ "
             "Embargo → %s │ Test %s→%s │ "
@@ -394,6 +648,56 @@ def _main_impl() -> int:
     p8_pass = mean_p8 >= p8_floor
     ndcg_pass = mean_ndcg >= GATE_NDCG_MIN
 
+    # ── Benchmark gate — lift over doing nothing ─────────────────────
+    if px is None:
+        bench_pass = False
+        bench_excess_bps = float("nan")
+        bench_beat_share = float("nan")
+        bench_basket_ret = bench_bench_ret = float("nan")
+        logger.error(
+            "Benchmark gate: prices unavailable — FAILING CLOSED. "
+            "An unmeasurable model must not be promoted."
+        )
+    elif not bench_months:
+        bench_pass = False
+        bench_excess_bps = float("nan")
+        bench_beat_share = float("nan")
+        bench_basket_ret = bench_bench_ret = float("nan")
+        logger.error(
+            "Benchmark gate: no held months produced — FAILING CLOSED."
+        )
+    else:
+        basket = np.array([m[1] for m in bench_months], dtype=float)
+        bench = np.array([m[2] for m in bench_months], dtype=float)
+        excess = basket - bench
+        bench_excess_bps = float(excess.mean() * 10_000)
+        bench_beat_share = float((basket > bench).mean())
+        bench_basket_ret = float(np.prod(1 + basket) - 1)
+        bench_bench_ret = float(np.prod(1 + bench) - 1)
+
+    # ── Stability across fold alignments ─────────────────────────────
+    # A single measurement of this quantity is not trustworthy: see
+    # GATE_BENCH_ALIGNMENTS. Re-measure at several fold starts and require
+    # the result to hold at (nearly) all of them.
+    alignment_results: dict[int, float] = {}
+    if px is not None and bench_months:
+        logger.info("\nBenchmark stability — re-measuring at %d fold alignments ...",
+                    len(GATE_BENCH_ALIGNMENTS))
+        for off in GATE_BENCH_ALIGNMENTS:
+            bps, n_months = _benchmark_at_alignment(df, X_df, y_all, px, off)
+            alignment_results[off] = bps
+            logger.info("  offset %3d trading days: %+8.1f bps  (%d months)",
+                        off, bps, n_months)
+
+    if alignment_results:
+        cleared = [b for b in alignment_results.values()
+                   if np.isfinite(b) and b >= GATE_BENCH_MIN_EXCESS_BPS]
+        pass_share = len(cleared) / len(alignment_results)
+        bench_pass = pass_share >= GATE_BENCH_MIN_PASS_SHARE
+    else:
+        pass_share = 0.0
+        bench_pass = False
+
     logger.info("=" * 70)
     logger.info("VALIDATION GATE SUMMARY")
     logger.info("=" * 70)
@@ -402,9 +706,31 @@ def _main_impl() -> int:
     logger.info(f"Mean Precision@2     : {mean_p2:.4f} vs floor {p2_floor:.4f} (lift required: {GATE_P2_MIN_LIFT}x) -> {'PASS' if p2_pass else 'FAIL'}")
     logger.info(f"Mean Precision@8     : {mean_p8:.4f} vs floor {p8_floor:.4f} (lift required: {GATE_P8_MIN_LIFT}x, deployed basket depth) -> {'PASS' if p8_pass else 'FAIL'}")
     logger.info(f"Mean NDCG            : {mean_ndcg:.4f} vs floor {GATE_NDCG_MIN:.4f} -> {'PASS' if ndcg_pass else 'FAIL'}")
+    logger.info("-" * 70)
+    logger.info("BENCHMARK GATE (lift over equal-weighting the universe)")
+    if bench_months:
+        logger.info(
+            f"Held months          : {len(bench_months)} "
+            f"({bench_months[0][0].date()} → {bench_months[-1][0].date()})"
+        )
+        logger.info(f"Basket total return  : {bench_basket_ret * 100:+.1f}%")
+        logger.info(f"Equal-weight return  : {bench_bench_ret * 100:+.1f}%")
+        logger.info(f"Months beating bench : {bench_beat_share * 100:.0f}%")
+    logger.info(f"Mean monthly excess  : {bench_excess_bps:+.1f} bps (base alignment)")
+    if alignment_results:
+        spread = "  ".join(f"{o}d:{b:+.0f}" for o, b in sorted(alignment_results.items()))
+        logger.info(f"Across alignments    : {spread}")
+        logger.info(
+            f"Cleared {GATE_BENCH_MIN_EXCESS_BPS:+.0f} bps at   : "
+            f"{pass_share * 100:.0f}% of alignments vs required "
+            f"{GATE_BENCH_MIN_PASS_SHARE * 100:.0f}% -> "
+            f"{'PASS' if bench_pass else 'FAIL'}"
+        )
+    else:
+        logger.info(f"Stability            : not measured -> FAIL")
     logger.info("=" * 70)
 
-    gate_passed = p1_pass and p2_pass and p8_pass and ndcg_pass
+    gate_passed = p1_pass and p2_pass and p8_pass and ndcg_pass and bench_pass
 
     if not gate_passed and not FORCE_SAVE:
         logger.warning("=" * 70)
@@ -458,6 +784,26 @@ def _main_impl() -> int:
             "mean_precision_at_2": round(float(mean_p2), 4),
             "mean_precision_at_8": round(float(mean_p8), 4),
             "positive_base_rate": round(float(base_rate), 4),
+        },
+        "benchmark": {
+            "held_months": len(bench_months),
+            "mean_monthly_excess_bps": (
+                round(bench_excess_bps, 1) if bench_months else None
+            ),
+            "months_beating_benchmark": (
+                round(bench_beat_share, 3) if bench_months else None
+            ),
+            "basket_total_return": (
+                round(bench_basket_ret, 4) if bench_months else None
+            ),
+            "equal_weight_total_return": (
+                round(bench_bench_ret, 4) if bench_months else None
+            ),
+            "floor_bps": GATE_BENCH_MIN_EXCESS_BPS,
+            "alignments_bps": {str(k): round(v, 1) for k, v in alignment_results.items()},
+            "alignment_pass_share": round(pass_share, 3),
+            "required_pass_share": GATE_BENCH_MIN_PASS_SHARE,
+            "passed": bool(bench_pass),
         },
         "gate_passed": bool(gate_passed),
     }

@@ -101,3 +101,14 @@ cannot act, i.e. an AI assistant can't start or stop the live bot by accident.
 
 ### `__init__.py` / `execution/__init__.py`
 Empty package markers.
+
+**`test_investor_benchmark_gate.py`** — covers the investor's lift-over-benchmark
+gate: the sector cap it simulates, the month-pairing that turns model scores into
+realised returns (including the holding period that legitimately closes *outside*
+the test window), and that an unmeasurable model **fails closed** rather than
+sliding through. One test asserts the gate's `TOP_K`/`SECTOR_CAP` still equal the
+orchestrator's — if the deployed basket shape changes, the gate must fail loudly
+rather than quietly measure a basket nobody trades.
+
+### `__init__.py` / `execution/__init__.py`
+Empty package markers.

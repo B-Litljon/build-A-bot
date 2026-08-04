@@ -79,8 +79,24 @@ Two subtleties:
   chance. `GATE_P8_MIN_LIFT = 1.1` is the one that matters in practice — the
   orchestrator deploys `TOP_K=8`, so it gates at the depth actually traded.
   `INVESTOR_GATE_FORCE=1` is a deliberately awkward escape hatch.
+- **The benchmark gate (added 2026-08-03) is the one that bites.** Every
+  threshold above measures lift over *random*, which cannot tell "better than
+  guessing" from "better than doing nothing" — on 2026-07-03 a model passed
+  all of them while losing to an equal-weighted basket of the same universe.
+  The benchmark gate simulates the deployed basket (`TOP_K=8`, `SECTOR_CAP=2`)
+  against equal-weighting the whole universe, and requires the monthly excess
+  to clear `INVESTOR_GATE_BENCH_BPS` (default 25) at **every** fold alignment
+  in `INVESTOR_GATE_BENCH_ALIGNMENTS` (default `0,7,14,21,28`). Both the
+  non-zero floor and the multi-alignment requirement are deliberate: a single
+  measurement of this quantity moves ~50 bps between reasonable
+  implementations, so anything less gates on noise. If prices cannot be
+  loaded, the gate **fails closed**.
 
-- **Writes:** `models/v4_investor_lgbm.txt`.
+- **Reads:** `data/processed/v4_training_features.parquet`, plus
+  `data/raw/v4_investor_data.parquet` (closing prices — the training frame
+  carries none, since prices leak the forward return).
+- **Writes:** `models/v4_investor_lgbm.txt` and its `.metadata.json` sidecar
+  (now including a `benchmark` block with the per-alignment spread).
 
 ### `portfolio_orchestrator.py`
 The only part that places real orders. Monthly cron
