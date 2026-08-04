@@ -69,18 +69,23 @@ Glossary:
     GATE_BENCH_MIN_EXCESS_BPS -- INVESTOR_GATE_BENCH_BPS, default 25.0. The
         mean monthly return of the deployed basket minus the mean monthly
         return of equal-weighting all 96, in basis points, averaged over
-        every out-of-sample month. Must clear this to promote. The floor is
-        NOT zero on purpose: measured 2026-08-03, four reasonable
-        implementations of this same quantity spanned ~50 bps, so a floor
-        inside that band would gate on implementation noise.
+        every out-of-sample month. A sanity floor, not the real bar --
+        see GATE_BENCH_MIN_T.
+    GATE_BENCH_MIN_T -- INVESTOR_GATE_BENCH_T, default 2.0, AND THIS IS THE
+        ONE THAT BINDS. The mean monthly excess divided by its standard
+        error. That standard error is about 60 bps on ~30 months, so t >= 2
+        means roughly +120 bps/month. Deliberately stringent: on this much
+        data, nothing smaller can be distinguished from luck. Every target
+        tried so far lands within one or two standard errors of zero.
     GATE_BENCH_ALIGNMENTS -- fold-start offsets in trading days
-        (default 0,7,14,21,28). The benchmark is re-measured at each, since
-        one measurement of it is not trustworthy. Rounding the top-quintile
-        label from 19 names to 20 -- ONE row per day out of 96 -- moved the
-        measured excess by 23 bps.
+        (default 0,7,14,21,28). The benchmark is re-measured at each to
+        catch results that hang on one lucky set of fold boundaries.
     GATE_BENCH_MIN_PASS_SHARE -- 1.0, i.e. every alignment must clear the
-        floor. This is what distinguishes a structural edge from a lucky
-        slice, and is the part of the gate doing the real work.
+        floor. Guards against a lucky slice -- but DO NOT read it as five
+        confirmations: the alignments share nearly all their rows and their
+        excess series correlate 0.71, so five of them are worth about 2.2
+        independent samples (measured 2026-08-04). Statistical power comes
+        from GATE_BENCH_MIN_T, not from this.
     _benchmark_at_alignment -- re-runs the whole walk-forward with the start
         slid by N trading days and returns that slice's mean excess.
     alignment_results -- offset -> mean excess in bps, the spread the gate
@@ -150,18 +155,35 @@ FORCE_SAVE       = os.getenv("INVESTOR_GATE_FORCE", "0").strip() == "1"  # escap
 # flip; none of them notices a model that ranks better than chance while
 # still losing to an equal-weighted basket of the same universe — which is
 # exactly what the 2026-07-03 promotion turned out to be.
+#
+# Sizing the bar (revised 2026-08-04): the mean monthly excess over ~30
+# months has a standard error of roughly 60 bps. Everything measured so far
+# — the shipped model, and every alternative target tried — lands inside
+# one or two standard errors of zero. A gate on the point estimate alone is
+# therefore weak, so the t-statistic below is the binding constraint and
+# the bps floor is a secondary sanity check.
 GATE_BENCH_MIN_EXCESS_BPS = float(os.getenv("INVESTOR_GATE_BENCH_BPS", "25.0"))
+# Mean excess divided by its standard error. At ~30 months and SE ~60 bps,
+# t >= 2 means roughly +120 bps/month — deliberately stringent, because on
+# this much data nothing smaller can be told apart from luck. If nothing
+# ever clears it, that is the honest finding, not a broken gate: the
+# fallback is equal-weighting, which the evidence supports as well as any
+# model produced so far.
+GATE_BENCH_MIN_T = float(os.getenv("INVESTOR_GATE_BENCH_T", "2.0"))
 TOP_K: int = 8        # mirrors portfolio_orchestrator.TOP_K
 SECTOR_CAP: int = 2   # mirrors portfolio_orchestrator.SECTOR_CAP
 
 # Fold-start offsets, in trading days, at which the benchmark is measured.
-# Measured 2026-08-03: rounding the top-quintile label from 19 names to 20
-# (one row per day out of 96) moved the measured monthly excess by 23 bps,
-# and four reasonable implementations of the same measurement spanned ~50
-# bps. A single number is therefore inside the noise; the gate requires the
-# result to survive re-slicing instead. Set to "0" to restore single-shot
-# behaviour (not recommended — that is the configuration that promoted the
-# 2026-07-03 model).
+# Re-slicing catches results that depend on one lucky set of fold
+# boundaries — for instance, rounding the top-quintile label from 19 names
+# to 20 (one row per day out of 96) moves the measured excess by 23 bps.
+#
+# BUT DO NOT READ "passed at all 5" AS FIVE CONFIRMATIONS. Measured
+# 2026-08-04: the alignments' monthly excess series correlate 0.71 on
+# average, because they share almost all the same rows — five alignments
+# are worth about 2.2 independent samples. This is a guard against a lucky
+# slice, not a substitute for statistical power. That is what
+# GATE_BENCH_MIN_T is for.
 GATE_BENCH_ALIGNMENTS: list[int] = [
     int(x) for x in os.getenv("INVESTOR_GATE_BENCH_ALIGNMENTS", "0,7,14,21,28").split(",")
     if x.strip()
@@ -654,6 +676,7 @@ def _main_impl() -> int:
         bench_excess_bps = float("nan")
         bench_beat_share = float("nan")
         bench_basket_ret = bench_bench_ret = float("nan")
+        bench_excess_t = float("nan")
         logger.error(
             "Benchmark gate: prices unavailable — FAILING CLOSED. "
             "An unmeasurable model must not be promoted."
@@ -663,6 +686,7 @@ def _main_impl() -> int:
         bench_excess_bps = float("nan")
         bench_beat_share = float("nan")
         bench_basket_ret = bench_bench_ret = float("nan")
+        bench_excess_t = float("nan")
         logger.error(
             "Benchmark gate: no held months produced — FAILING CLOSED."
         )
@@ -672,6 +696,16 @@ def _main_impl() -> int:
         excess = basket - bench
         bench_excess_bps = float(excess.mean() * 10_000)
         bench_beat_share = float((basket > bench).mean())
+        # t on the paired monthly excess. Pairing against the benchmark is
+        # already the tightest available comparison: differencing two model
+        # baskets instead does NOT help, because they hold different names
+        # (monthly-return correlation ~0.7) and the idiosyncratic variance
+        # dominates the market variance that pairing removes.
+        _sd = float(excess.std(ddof=1)) if len(excess) > 1 else float("nan")
+        bench_excess_t = (
+            float(excess.mean() / (_sd / np.sqrt(len(excess))))
+            if _sd and np.isfinite(_sd) and _sd > 0 else float("nan")
+        )
         bench_basket_ret = float(np.prod(1 + basket) - 1)
         bench_bench_ret = float(np.prod(1 + bench) - 1)
 
@@ -693,10 +727,15 @@ def _main_impl() -> int:
         cleared = [b for b in alignment_results.values()
                    if np.isfinite(b) and b >= GATE_BENCH_MIN_EXCESS_BPS]
         pass_share = len(cleared) / len(alignment_results)
-        bench_pass = pass_share >= GATE_BENCH_MIN_PASS_SHARE
+        stability_pass = pass_share >= GATE_BENCH_MIN_PASS_SHARE
     else:
         pass_share = 0.0
-        bench_pass = False
+        stability_pass = False
+
+    # The t-statistic is the binding constraint; stability is the guard
+    # against a lucky slice. Both must hold.
+    t_pass = np.isfinite(bench_excess_t) and bench_excess_t >= GATE_BENCH_MIN_T
+    bench_pass = stability_pass and t_pass
 
     logger.info("=" * 70)
     logger.info("VALIDATION GATE SUMMARY")
@@ -717,6 +756,11 @@ def _main_impl() -> int:
         logger.info(f"Equal-weight return  : {bench_bench_ret * 100:+.1f}%")
         logger.info(f"Months beating bench : {bench_beat_share * 100:.0f}%")
     logger.info(f"Mean monthly excess  : {bench_excess_bps:+.1f} bps (base alignment)")
+    logger.info(
+        f"Excess t-statistic   : {bench_excess_t:+.2f} vs floor "
+        f"{GATE_BENCH_MIN_T:+.2f} -> {'PASS' if t_pass else 'FAIL'}   "
+        f"<-- the binding constraint"
+    )
     if alignment_results:
         spread = "  ".join(f"{o}d:{b:+.0f}" for o, b in sorted(alignment_results.items()))
         logger.info(f"Across alignments    : {spread}")
@@ -724,7 +768,8 @@ def _main_impl() -> int:
             f"Cleared {GATE_BENCH_MIN_EXCESS_BPS:+.0f} bps at   : "
             f"{pass_share * 100:.0f}% of alignments vs required "
             f"{GATE_BENCH_MIN_PASS_SHARE * 100:.0f}% -> "
-            f"{'PASS' if bench_pass else 'FAIL'}"
+            f"{'PASS' if stability_pass else 'FAIL'}   "
+            f"(~2.2 effective independent samples, not {len(alignment_results)})"
         )
     else:
         logger.info(f"Stability            : not measured -> FAIL")
@@ -800,9 +845,14 @@ def _main_impl() -> int:
                 round(bench_bench_ret, 4) if bench_months else None
             ),
             "floor_bps": GATE_BENCH_MIN_EXCESS_BPS,
+            "excess_t": (round(bench_excess_t, 3)
+                         if np.isfinite(bench_excess_t) else None),
+            "floor_t": GATE_BENCH_MIN_T,
+            "t_passed": bool(t_pass),
             "alignments_bps": {str(k): round(v, 1) for k, v in alignment_results.items()},
             "alignment_pass_share": round(pass_share, 3),
             "required_pass_share": GATE_BENCH_MIN_PASS_SHARE,
+            "stability_passed": bool(stability_pass),
             "passed": bool(bench_pass),
         },
         "gate_passed": bool(gate_passed),

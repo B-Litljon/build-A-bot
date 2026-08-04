@@ -287,13 +287,18 @@ investor promotion did exactly that — so the investor's gate now requires both
 
 **benchmark gate** — the investor's lift-over-benchmark check
 (`scripts/investor_train_model.py`). Simulates the basket actually deployed
-(top 8, max 2 per sector) against equal-weighting all 96 names, and demands the
-monthly excess clear its floor at *every* fold alignment, not once. The floor is
-deliberately above zero and the multi-alignment requirement is deliberately
-strict: measured 2026-08-03, four reasonable implementations of this same number
-spanned about 50 basis points, and a one-row-per-day change in how the
-top-quintile label rounds (19 names vs 20, out of 96) moved it by 23. A single
-measurement of portfolio excess return, on a few years of data, is not evidence.
+(top 8, max 2 per sector) against equal-weighting all 96 names. The bar that
+binds is a **t-statistic** on the monthly excess, not the excess itself: that
+quantity carries a standard error of roughly 60 basis points over ~30 months,
+so point estimates are nearly uninformative on their own. The shipped model is
+the worked example — +47.3 bps/month reads as substantial and is t = 0.75.
+
+**effective sample size** — how much independent evidence a set of overlapping
+measurements really contains. The gate re-measures at five fold alignments, but
+those share nearly all their rows and their excess series correlate 0.71, so
+they amount to about 2.2 independent samples. Re-slicing the same data guards
+against a lucky boundary; it does not manufacture statistical power. The same
+caution applies to the horizon study's "held at 5 of 5 alignments".
 
 ## Scoring
 

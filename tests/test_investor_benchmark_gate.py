@@ -158,20 +158,22 @@ class TestBenchmarkGateFailsClosed(unittest.TestCase):
         with mock.patch.object(itm, "_RAW_PATH", Path("/nonexistent/nope.parquet")):
             self.assertIsNone(itm._load_close_matrix())
 
-    def test_floor_sits_above_the_measurement_noise_band(self):
-        """
-        A zero floor gates on noise. Measured 2026-08-03: four reasonable
-        implementations of this same quantity spanned ~50 bps, and a
-        one-row-per-day label rounding change moved it 23 bps. The floor
-        must stay meaningfully above zero.
-        """
+    def test_floor_sits_above_zero(self):
+        """A zero floor gates on noise; SE on this quantity is ~60 bps."""
         self.assertGreaterEqual(itm.GATE_BENCH_MIN_EXCESS_BPS, 20.0)
+
+    def test_t_statistic_is_the_binding_constraint(self):
+        """
+        The point estimate alone is a weak filter at SE ~60 bps over ~30
+        months. The t floor is what makes the gate mean something, so it
+        must stay at a level that actually excludes noise.
+        """
+        self.assertGreaterEqual(itm.GATE_BENCH_MIN_T, 2.0)
 
     def test_stability_is_required_across_multiple_alignments(self):
         """
-        The multi-alignment requirement is the part of the gate doing the
-        real work — a single measurement passed the very model this gate
-        exists to catch.
+        Guard against a lucky slice. NOT a power source — the alignments
+        correlate ~0.71, so five are worth ~2.2 independent samples.
         """
         self.assertGreaterEqual(len(itm.GATE_BENCH_ALIGNMENTS), 3)
         self.assertEqual(itm.GATE_BENCH_MIN_PASS_SHARE, 1.0)

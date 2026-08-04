@@ -84,13 +84,18 @@ Two subtleties:
   guessing" from "better than doing nothing" — on 2026-07-03 a model passed
   all of them while losing to an equal-weighted basket of the same universe.
   The benchmark gate simulates the deployed basket (`TOP_K=8`, `SECTOR_CAP=2`)
-  against equal-weighting the whole universe, and requires the monthly excess
-  to clear `INVESTOR_GATE_BENCH_BPS` (default 25) at **every** fold alignment
-  in `INVESTOR_GATE_BENCH_ALIGNMENTS` (default `0,7,14,21,28`). Both the
-  non-zero floor and the multi-alignment requirement are deliberate: a single
-  measurement of this quantity moves ~50 bps between reasonable
-  implementations, so anything less gates on noise. If prices cannot be
-  loaded, the gate **fails closed**.
+  against equal-weighting the whole universe. **`INVESTOR_GATE_BENCH_T`
+  (default 2.0) is the constraint that binds** — the mean monthly excess has a
+  standard error of roughly 60 bps on ~30 months, so a point estimate on its
+  own means little. The current model illustrates it: +47.3 bps looks
+  substantial and is t = 0.75. `INVESTOR_GATE_BENCH_BPS` (default 25) is a
+  secondary sanity floor, checked at every alignment in
+  `INVESTOR_GATE_BENCH_ALIGNMENTS` (default `0,7,14,21,28`) to catch results
+  that hang on one lucky set of fold boundaries — but note the alignments'
+  excess series correlate ~0.71, so five are worth about **2.2 independent
+  samples**, not five. If prices cannot be loaded, the gate **fails closed**.
+  If nothing ever clears this bar, that is a finding, not a broken gate: the
+  fallback is equal-weighting.
 
 - **Reads:** `data/processed/v4_training_features.parquet`, plus
   `data/raw/v4_investor_data.parquet` (closing prices — the training frame

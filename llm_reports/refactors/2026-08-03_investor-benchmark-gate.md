@@ -145,6 +145,57 @@ four implementations, not a formal null distribution — it is a defensible
 guess, not a derived threshold. Transaction costs are still unmodelled.
 Everything inherits the 2.4-year, single-regime, survivorship-clean window.
 
+## Revision 2026-08-04 — the framing above was wrong in two places
+
+Re-examined on request. Two claims in this report do not survive scrutiny, and
+the gate was changed accordingly.
+
+**1. "Four implementations span ~50 bps" overstates the case.** Those four
+differ in *window* — the training frame ends 2026-04-07, the inference frame
+2026-07-31 — not only in implementation. They are measurements of different
+months, not four readings of one quantity. Only the label pair (same frame,
+features, folds, harness) is a true like-for-like comparison.
+
+**2. The label sensitivity is not a knife edge; it is ordinary noise.** The
+mean monthly excess has a standard error of ~60 bps at this sample size. The
+23 bps the label rounding moved it is **0.4 standard errors** — precisely what
+two nearly-identical estimators of a noisy quantity should do. The real finding
+is simpler and worse: *every* effect measured across this work — the shipped
+model, and every alternative target — sits inside one or two standard errors of
+zero. The label story was a symptom I mistook for a diagnosis.
+
+**3. Correction to the gate's own design.** The multi-alignment requirement was
+described here as "the part doing the real work". It is not. The alignments'
+monthly excess series correlate 0.71 (measured 2026-08-04), so five alignments
+carry about **2.2 independent samples**. "Passed at all five" reads as five
+confirmations and is closer to two. It is a guard against a lucky boundary, not
+a source of power.
+
+The gate now requires a **t-statistic ≥ 2.0** (`INVESTOR_GATE_BENCH_T`) on the
+monthly excess, with the bps floor demoted to a sanity check. Against the
+current model:
+
+```
+Mean monthly excess  : +47.3 bps (base alignment)
+Excess t-statistic   : +0.75 vs floor +2.00 -> FAIL   <-- the binding constraint
+Cleared +25 bps at   : 80% of alignments -> FAIL  (~2.2 effective samples, not 5)
+```
+
+That +47.3 bps is the whole lesson in one line: it looks substantial and is
+three-quarters of a standard error from zero.
+
+A t ≥ 2 bar at SE ~60 bps means roughly +120 bps/month. That is stringent by
+construction — on ~30 months of one regime, nothing smaller is distinguishable
+from luck. If nothing ever clears it, the honest conclusion is that this
+universe and horizon do not support a detectable stock-picking edge, and the
+fallback is equal-weighting.
+
+Also tested and rejected: pairing the model baskets against each other rather
+than against the benchmark, hoping the shared market months would cancel and
+tighten the estimate. It does not — the baskets hold different names
+(monthly-return correlation ~0.66-0.77), so idiosyncratic variance dominates
+and the paired SE (62.4 bps) is no better than the unpaired (63.5 bps).
+
 ## Risk & follow-ups
 
 1. **The gate will now block retrains that previously passed.** That is the
