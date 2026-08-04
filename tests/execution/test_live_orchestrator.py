@@ -130,7 +130,9 @@ class TestOnTradeUpdate(unittest.IsolatedAsyncioTestCase):
 
         await orch._on_trade_update(_make_event("fill", "SELL"))
 
-        orch._enter_cooling.assert_awaited_once_with(ctx)
+        orch._enter_cooling.assert_awaited_once_with(
+            ctx, close_price=100.0, hit_level=None,
+        )
 
     async def test_sell_fill_in_trade_enters_cooling(self):
         """SELL fill while IN_TRADE (bracket TP/SL hit) must transition to COOLING."""
@@ -139,7 +141,9 @@ class TestOnTradeUpdate(unittest.IsolatedAsyncioTestCase):
 
         await orch._on_trade_update(_make_event("fill", "SELL"))
 
-        orch._enter_cooling.assert_awaited_once_with(ctx)
+        orch._enter_cooling.assert_awaited_once_with(
+            ctx, close_price=100.0, hit_level=None,
+        )
 
     async def test_sell_partial_fill_does_not_enter_cooling(self):
         """SELL partial_fill must NOT transition to COOLING — wait for terminal fill."""

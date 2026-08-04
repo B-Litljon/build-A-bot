@@ -31,8 +31,10 @@ Glossary:
     _max_bars -- warmup * 2, the per-symbol buffer cap, so memory stays flat
         over a multi-day soak.
     _bar_buffers -- rolling recent bars per symbol, the input to inference.
-    _positions -- symbol -> {entry, sl, tp, units, state}. Guarded by
-        _positions_lock because the tick thread reads it while the loop writes.
+    _positions -- symbol -> {entry, sl, tp, units, state, breach_price?,
+        hit_level?}. Guarded by _positions_lock because the tick thread reads
+        it while the loop writes. breach_price and hit_level are set by
+        _on_tick at breach and consumed by _watchdog_close for notifications.
     _positions_lock -- a threading.Lock, not an asyncio one, precisely because
         a non-async thread touches this state.
     flatten_on_exit -- whether shutdown closes everything. Default True: a
@@ -85,6 +87,9 @@ Glossary:
     _on_tick -- runs on the provider's stream thread for EVERY quote. Records
         the spread and checks stop/target. Must return in under 50
         microseconds and do no blocking I/O; anything slower stalls the feed.
+        On breach it stores breach_price (the live bid/ask that triggered)
+        and hit_level ("TP"/"SL") in the position dict so _watchdog_close
+        can relay them accurately to the Discord close notification.
     _latest_spread / _latest_spread_ts -- most recent bid-ask gap per symbol,
         written lock-free from that thread (single writer, so safe).
     _spread_stale_seconds -- 5 (RISK_SPREAD_STALE_SECONDS). Older than this and
@@ -405,23 +410,41 @@ class OandaScalperOrchestrator:
         tp = pos["tp"]
         units = pos["units"]
 
-        breached = False
+        # Determine breach price and which bracket was hit
+        breach_price: float = 0.0
+        hit_level: str = ""
         if units > 0:  # long
-            if bid <= sl or bid >= tp:
+            if bid <= sl:
                 breached = True
+                breach_price = bid
+                hit_level = "SL"
+            elif bid >= tp:
+                breached = True
+                breach_price = bid
+                hit_level = "TP"
         elif units < 0:  # short
-            if ask >= sl or ask <= tp:
+            if ask >= sl:
                 breached = True
+                breach_price = ask
+                hit_level = "SL"
+            elif ask <= tp:
+                breached = True
+                breach_price = ask
+                hit_level = "TP"
 
         if not breached:
             return
 
-        # Idempotent guard — set state to PENDING_CLOSE under lock
+        # Idempotent guard — set state to PENDING_CLOSE under lock;
+        # also store breach metadata so _watchdog_close can relay them
+        # accurately to the Discord notification.
         with self._positions_lock:
             current = self._positions.get(symbol)
             if not current or current.get("state") != "OPEN":
                 return
             current["state"] = "PENDING_CLOSE"
+            current["breach_price"] = breach_price
+            current["hit_level"] = hit_level
 
         # Dispatch close OFF the stream thread onto the asyncio loop
         loop = self._loop
@@ -592,6 +615,10 @@ class OandaScalperOrchestrator:
                     action="WATCHDOG_CLOSE",
                     price=pos_snapshot.get("entry", 0.0),
                     units=units,
+                    sl_price=pos_snapshot.get("sl"),
+                    tp_price=pos_snapshot.get("tp"),
+                    close_price=pos_snapshot.get("breach_price"),
+                    hit_level=pos_snapshot.get("hit_level"),
                     reason="SL or TP breach detected by tick watchdog",
                 )
             return
@@ -616,6 +643,8 @@ class OandaScalperOrchestrator:
             action="CLOSE_FAILED",
             price=pos_snapshot.get("entry", 0.0),
             units=units,
+            sl_price=pos_snapshot.get("sl"),
+            tp_price=pos_snapshot.get("tp"),
             reason=(
                 f"MANUAL INTERVENTION REQUIRED: watchdog close failed "
                 f"{self._close_max_attempts} times ({last_error}). Position "

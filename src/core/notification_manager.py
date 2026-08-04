@@ -17,9 +17,13 @@ Glossary:
     send_trade_alert -- entry/exit embed for the Alpaca path. Takes a
         ``core.signal.Signal`` and reads angel_prob, devil_prob, sl_price,
         tp_price and expected_pct_growth out of its ``metadata`` dict.
+        On close actions metadata may also carry ``close_price`` and
+        ``hit_level`` ("TP"/"SL"), which replace the price line.
     send_oanda_trade_alert -- the same idea for the forex path, but takes loose
         primitives instead of a Signal, because the OANDA strategy emits the
         other Signal shape (``strategies.base.Signal``). Keyword-only.
+        On close actions ``close_price`` and ``hit_level`` provide the
+        exit price and which bracket was breached.
     send_system_message -- one-line plain status update, no embed. Used for
         startup, shutdown and connection events.
     send_retraining_report -- posts the full validation-gate verdict after a
@@ -30,7 +34,11 @@ Glossary:
         DriftEvaluator; escalates from WARNING to CRITICAL when Brier > 0.30 or
         expected value < -0.001.
     action -- "ENTRY" vs anything else; ENTRY embeds are green/red by direction
-        and include the bracket levels, closes are blue and omit them.
+        and include the bracket levels, closes are blue and show close_price
+        with the exit reason (hit_level: "TP" or "SL").
+    close_price -- the price at which the position was closed (exit-side only).
+        Displayed prominently; none produces the legacy single-price line.
+    hit_level -- "TP" or "SL" — which bracket was breached, shown with emoji.
     username -- the Discord display name, used as a crude persona tag so the
         source is obvious at a glance: "Build-A-Bot Executive" (Alpaca),
         "Build-A-Bot V5 Scalper" (OANDA), "The Accountant" (retraining and
@@ -73,7 +81,17 @@ class NotificationManager:
             title = f"🏁 TRADE CLOSED: {signal.symbol}"
             color = 0x00A2FF
 
-        description = f"💵 **Price:** ${signal.price:.2f}\n"
+        close_price = signal.metadata.get("close_price") if action != "ENTRY" else None
+        if close_price is not None:
+            description = f"💵 **Close Price:** ${close_price:.2f}\n"
+            if signal.price:
+                description += f"📥 **Entry Price:** ${signal.price:.2f}\n"
+            hit = signal.metadata.get("hit_level")
+            if hit:
+                emoji = "🚀" if hit == "TP" else "🛑"
+                description += f"{emoji} **{hit} HIT**\n"
+        else:
+            description = f"💵 **Price:** ${signal.price:.2f}\n"
 
         # Check for Meta-Labeling data
         if "angel_prob" in signal.metadata and "devil_prob" in signal.metadata:
@@ -84,15 +102,14 @@ class NotificationManager:
         else:
             description += f"📊 **Confidence:** {signal.confidence * 100:.1f}%\n"
 
-        # Append Stop Loss and Take Profit for Entry alerts
+        # Append Stop Loss and Take Profit for both entry and close alerts
         if (
-            action == "ENTRY"
-            and "sl_price" in signal.metadata
+            "sl_price" in signal.metadata
             and "tp_price" in signal.metadata
         ):
             description += f"\n🛑 **Stop Loss:** ${signal.metadata['sl_price']:.4f}\n"
             description += f"🚀 **Take Profit:** ${signal.metadata['tp_price']:.4f}\n"
-            if "expected_pct_growth" in signal.metadata:
+            if action == "ENTRY" and "expected_pct_growth" in signal.metadata:
                 description += f"📈 **Projected Growth:** {signal.metadata['expected_pct_growth']:.2f}%\n"
 
         payload = {
@@ -138,6 +155,8 @@ class NotificationManager:
         devil_prob: Optional[float] = None,
         reason: Optional[str] = None,
         timestamp: Optional[str] = None,
+        close_price: Optional[float] = None,
+        hit_level: Optional[str] = None,
     ) -> None:
         """
         Discord alert for the OANDA scalper path.
@@ -158,14 +177,22 @@ class NotificationManager:
             title = f"🏁 OANDA SCALPER {action}: {symbol}"
             color = 0x00A2FF
 
-        description = f"💵 **Price:** {price:.5f}\n"
+        if close_price is not None:
+            description = f"💵 **Close Price:** {close_price:.5f}\n"
+            if price:
+                description += f"📥 **Entry Price:** {price:.5f}\n"
+            if hit_level:
+                emoji = "🚀" if hit_level == "TP" else "🛑"
+                description += f"{emoji} **{hit_level} HIT**\n"
+        else:
+            description = f"💵 **Price:** {price:.5f}\n"
         description += f"📦 **Units:** {units}\n"
 
         if angel_prob is not None and devil_prob is not None:
             description += f"👼 **Angel:** {angel_prob * 100:.1f}%\n"
             description += f"😈 **Devil:** {devil_prob * 100:.1f}%\n"
 
-        if action == "ENTRY" and sl_price is not None and tp_price is not None:
+        if sl_price is not None and tp_price is not None:
             description += f"\n🛑 **SL:** {sl_price:.5f}\n"
             description += f"🚀 **TP:** {tp_price:.5f}\n"
 

@@ -91,6 +91,10 @@ Glossary:
         threading contract above.
     ctx.lock -- per-symbol asyncio.Lock guarding state transitions, so two bars
         cannot both claim a FLAT slot.
+    _enter_cooling close_price / hit_level -- fill price and which bracket
+        ("TP"/"SL") was breached on exit, captured before ctx fields are
+        cleared and relayed to the Discord close embed so the message is
+        meaningful rather than a generic "bracket resolved".
 
     ── inference plumbing ──
     InferenceOutcome -- frozen result returned by the inference thread:
@@ -1824,7 +1828,26 @@ class LiveOrchestrator:
                         # exit). partial_fill is intentionally excluded so a
                         # partial sell does not drop us into COOLING while the
                         # remaining qty is still working at the broker.
-                        await self._enter_cooling(ctx)
+                        #
+                        # Capture close details before _enter_cooling clears
+                        # ctx.sl_price / ctx.tp_price / ctx.entry_price.
+                        fill_price = float(
+                            getattr(order, "filled_avg_price", 0.0) or 0.0
+                        )
+                        hit = None
+                        if (
+                            ctx.tp_price is not None
+                            and fill_price >= ctx.tp_price
+                        ):
+                            hit = "TP"
+                        elif (
+                            ctx.sl_price is not None
+                            and fill_price <= ctx.sl_price
+                        ):
+                            hit = "SL"
+                        await self._enter_cooling(
+                            ctx, close_price=fill_price, hit_level=hit,
+                        )
                     elif order_side == "SELL" and event_type == "partial_fill":
                         logger.info(
                             "[%s] Partial SELL fill — awaiting terminal fill",
@@ -2001,7 +2024,12 @@ class LiveOrchestrator:
     # Cooling-off logic
     # -----------------------------------------------------------------------
 
-    async def _enter_cooling(self, ctx: SymbolContext) -> None:
+    async def _enter_cooling(
+        self,
+        ctx: SymbolContext,
+        close_price: Optional[float] = None,
+        hit_level: Optional[str] = None,
+    ) -> None:
         """
         Transition symbol to COOLING state and schedule reset to FLAT
         after COOLING_SECONDS.  Cancels any prior cooling timer.
@@ -2012,6 +2040,12 @@ class LiveOrchestrator:
 
         if ctx._cooling_task and not ctx._cooling_task.done():
             ctx._cooling_task.cancel()
+
+        # Capture trade details before clearing — needed for the close
+        # notification sent below.
+        captured_entry = ctx.entry_price
+        captured_sl = ctx.sl_price
+        captured_tp = ctx.tp_price
 
         ctx.state = SymbolState.COOLING
         ctx.entry_price = None
@@ -2028,6 +2062,24 @@ class LiveOrchestrator:
             f"Bracket resolved — cooling for {COOLING_SECONDS // 60}m",
             "warning",
         )
+
+        # ── Discord close embed with actual exit data ──
+        if close_price is not None:
+            sig = Signal(
+                symbol=symbol,
+                type=SignalType.BUY,
+                price=captured_entry or 0.0,
+                confidence=0.0,
+                timestamp=datetime.now(timezone.utc),
+                metadata={
+                    "close_price": close_price,
+                    "hit_level": hit_level,
+                    "sl_price": captured_sl,
+                    "tp_price": captured_tp,
+                },
+            )
+            self._notifier.send_trade_alert(sig, action="CLOSE")
+
         self._notifier.send_system_message(
             f"[{symbol}] Bracket resolved — cooling off for "
             f"{COOLING_SECONDS // 60}m before next entry."
