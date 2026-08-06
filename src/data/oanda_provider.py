@@ -56,6 +56,9 @@ Glossary:
         every part-built bar rather than discarding it.
     get_historical_bars -- pages complete mid-price candles over a date range.
         In-progress candles are skipped, so warm-up never sees a partial bar.
+    get_tradeable_instruments -- the full set of instrument names this ACCOUNT
+        may trade, for membership tests. Returns an empty set on API failure,
+        which callers must read as "unknown", never as "nothing tradeable".
 """
 
 import asyncio
@@ -293,6 +296,27 @@ class OandaMarketProvider(MarketDataProvider):
         except Exception as e:
             logger.error("OandaMarketProvider.get_active_symbols failed: %s", e)
             return []
+
+    def get_tradeable_instruments(self) -> set:
+        """
+        Return every instrument this account may trade, as OANDA names.
+
+        Unlike :meth:`get_active_symbols` this is unlimited and returns a set,
+        because callers use it as a membership test rather than a shortlist.
+
+        Returns an EMPTY set if the account cannot be queried. Callers must
+        treat empty as "unknown", never as "nothing is tradeable" — a
+        transient API failure must not be able to disable trading.
+        """
+        try:
+            req = v20_accounts.AccountInstruments(accountID=self._account_id)
+            self._client.request(req)
+            return {i["name"] for i in req.response.get("instruments", [])}
+        except Exception as e:
+            logger.error(
+                "OandaMarketProvider.get_tradeable_instruments failed: %s", e
+            )
+            return set()
 
     def get_historical_bars(
         self,

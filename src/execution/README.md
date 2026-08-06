@@ -110,6 +110,14 @@ Things worth knowing:
 - **`_reconcile_on_boot`** — asks the broker what's actually open before
   trading. A restart must adopt reality, not assume it's flat, or a position
   left by a crashed process runs with nothing watching its stop.
+- **`_drop_untradeable_symbols`** — at boot, drops configured symbols the
+  account isn't permitted to trade. `XAU_USD`/`XAG_USD` are in the trained
+  basket but not on this account, so every metals signal became a submitted
+  order, an `INSTRUMENT_NOT_TRADEABLE` rejection and a stack trace that reads
+  like a real fault. Deliberately **fail-open**: only a successful instrument
+  lookup may drop anything, because an API blip that silently muted the whole
+  basket would be far worse than the odd rejection. Dropping *everything*
+  aborts startup instead of running a bot that can't place an order.
 - **Liveness watchdog** — 60s of silence (OANDA heartbeats every ~5s) means the
   feed is dead, so it reconnects **and flattens exposure**. Correct, given
   software-enforced stops.

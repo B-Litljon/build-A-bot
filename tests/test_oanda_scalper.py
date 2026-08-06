@@ -54,6 +54,13 @@ Glossary:
         order or rescore.
     test_reconnect_delay_* -- backoff grows, stays inside [cap/2, cap], and
         never exceeds the configured maximum.
+    TestQuietTickPath -- the NON-breaching tick, i.e. almost every tick. Until
+        2026-08-06 every _on_tick test fed a breaching quote, which is how an
+        uninitialised ``breached`` shipped: the breach path assigns the name
+        before reading it, so only the quiet path raised.
+    TestUntradeableSymbolFilter -- boot-time removal of instruments the account
+        cannot trade, including the fail-OPEN behaviour on lookup failure and
+        the refusal to start when nothing is left.
 """
 
 # Suppress unawaited-coroutine RuntimeWarning when mocking asyncio.run_coroutine_threadsafe
@@ -729,3 +736,130 @@ class TestOandaScalperOrchestrator(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestQuietTickPath(unittest.TestCase):
+    """
+    The non-breaching tick -- the overwhelmingly common case, and until
+    2026-08-06 the only one no test covered.
+
+    Every existing _on_tick test fed a quote that breached a bracket, so the
+    early-return path was never exercised. Commit 6523254 rewrote the block and
+    dropped ``breached``'s initializer; the breach path still worked (it assigns
+    the name before reading it) but every quiet tick raised UnboundLocalError
+    inside a callback documented as "<50 us, no blocking I/O". It fired 1547
+    times in the 50 minutes one NZD_JPY position was open before anyone noticed,
+    because the provider catches and logs callback exceptions rather than
+    letting them kill the feed.
+    """
+
+    def _orch_with_open_long(self):
+        holder = TestOandaScalperOrchestrator()
+        orch, _, _, _, _ = holder._make_orchestrator()
+        orch._positions["EUR_USD"] = {
+            "entry": 1.08500,
+            "sl": 1.08400,
+            "tp": 1.08600,
+            "units": 1000,
+            "state": "OPEN",
+        }
+        mock_loop = MagicMock()
+        mock_loop.is_running.return_value = True
+        orch._loop = mock_loop
+        return orch
+
+    def test_quiet_tick_between_brackets_does_not_raise(self):
+        """A price inside the bracket must return cleanly, not raise."""
+        orch = self._orch_with_open_long()
+        with patch("asyncio.run_coroutine_threadsafe") as mock_run_coro:
+            orch._on_tick("EUR_USD", 1.08500, 1.08505)  # between SL and TP
+        mock_run_coro.assert_not_called()
+        self.assertEqual(orch._positions["EUR_USD"]["state"], "OPEN")
+
+    def test_quiet_tick_short_position_does_not_raise(self):
+        """Same for a short -- the mirrored branch has the same shape."""
+        orch = self._orch_with_open_long()
+        orch._positions["EUR_USD"].update(
+            {"units": -1000, "sl": 1.08600, "tp": 1.08400}
+        )
+        with patch("asyncio.run_coroutine_threadsafe") as mock_run_coro:
+            orch._on_tick("EUR_USD", 1.08500, 1.08505)
+        mock_run_coro.assert_not_called()
+        self.assertEqual(orch._positions["EUR_USD"]["state"], "OPEN")
+
+    def test_many_quiet_ticks_then_breach_still_closes(self):
+        """Quiet ticks must not poison the breach that follows them."""
+        orch = self._orch_with_open_long()
+        with patch("asyncio.run_coroutine_threadsafe") as mock_run_coro:
+            for _ in range(50):
+                orch._on_tick("EUR_USD", 1.08500, 1.08505)
+            self.assertEqual(mock_run_coro.call_count, 0)
+            orch._on_tick("EUR_USD", 1.08350, 1.08355)  # breaches SL
+            self.assertEqual(mock_run_coro.call_count, 1)
+        self.assertEqual(orch._positions["EUR_USD"]["state"], "PENDING_CLOSE")
+
+    def test_zero_unit_position_does_not_raise(self):
+        """units == 0 matches neither branch -- the purest form of the bug."""
+        orch = self._orch_with_open_long()
+        orch._positions["EUR_USD"]["units"] = 0
+        with patch("asyncio.run_coroutine_threadsafe") as mock_run_coro:
+            orch._on_tick("EUR_USD", 1.08350, 1.08355)
+        mock_run_coro.assert_not_called()
+
+
+class TestUntradeableSymbolFilter(unittest.TestCase):
+    """
+    Dropping instruments the ACCOUNT cannot trade (2026-08-06).
+
+    XAU_USD/XAG_USD are in the trained basket but not on the account, so every
+    metals signal became a submitted order, an INSTRUMENT_NOT_TRADEABLE
+    rejection and a stack trace. The filter is deliberately fail-OPEN: only a
+    successful lookup may drop anything, because a transient API failure that
+    silently muted the basket would be far worse than an occasional rejection.
+    """
+
+    def _orch(self, symbols):
+        holder = TestOandaScalperOrchestrator()
+        orch, provider, _, _, _ = holder._make_orchestrator()
+        orch._symbols = list(symbols)
+        return orch, provider
+
+    def test_untradeable_symbols_dropped(self):
+        orch, provider = self._orch(["XAU_USD", "GBP_JPY", "XAG_USD"])
+        provider.get_tradeable_instruments.return_value = {"GBP_JPY", "EUR_USD"}
+        asyncio.run(orch._drop_untradeable_symbols())
+        self.assertEqual(orch._symbols, ["GBP_JPY"])
+
+    def test_all_tradeable_is_a_noop(self):
+        orch, provider = self._orch(["GBP_JPY", "AUD_JPY"])
+        provider.get_tradeable_instruments.return_value = {"GBP_JPY", "AUD_JPY"}
+        asyncio.run(orch._drop_untradeable_symbols())
+        self.assertEqual(orch._symbols, ["GBP_JPY", "AUD_JPY"])
+
+    def test_lookup_failure_keeps_every_symbol(self):
+        """FAIL-OPEN: an empty result means 'unknown', not 'none tradeable'."""
+        orch, provider = self._orch(["XAU_USD", "GBP_JPY"])
+        provider.get_tradeable_instruments.return_value = set()
+        asyncio.run(orch._drop_untradeable_symbols())
+        self.assertEqual(orch._symbols, ["XAU_USD", "GBP_JPY"])
+
+    def test_nothing_tradeable_aborts_startup(self):
+        """A bot that cannot place a single order must not pretend to run."""
+        orch, provider = self._orch(["XAU_USD", "XAG_USD"])
+        provider.get_tradeable_instruments.return_value = {"EUR_USD"}
+        with self.assertRaises(RuntimeError):
+            asyncio.run(orch._drop_untradeable_symbols())
+
+    def test_slash_form_symbols_normalised_before_lookup(self):
+        """Configured symbols may use EUR/USD; the account lists EUR_USD."""
+        orch, provider = self._orch(["EUR/USD", "XAU/USD"])
+        provider.get_tradeable_instruments.return_value = {"EUR_USD"}
+        asyncio.run(orch._drop_untradeable_symbols())
+        self.assertEqual(orch._symbols, ["EUR/USD"])
+
+    def test_provider_without_the_method_is_tolerated(self):
+        """Older/alternate providers simply skip the filter."""
+        orch, provider = self._orch(["GBP_JPY"])
+        del provider.get_tradeable_instruments
+        asyncio.run(orch._drop_untradeable_symbols())
+        self.assertEqual(orch._symbols, ["GBP_JPY"])

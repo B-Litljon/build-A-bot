@@ -47,6 +47,12 @@ Glossary:
         first live bars are not double-counted or scored twice. The "seam" is
         that junction between replayed and live data.
     _prime_history -- fetches the warm-up bars at boot.
+    _drop_untradeable_symbols -- at boot, removes configured symbols the
+        account may not trade (XAU_USD/XAG_USD here), so a metals signal is
+        never spent on an order OANDA will reject. Fail-OPEN: only a
+        successful instrument lookup may drop anything, and dropping
+        everything aborts startup rather than running a bot that cannot
+        place an order.
     _last_scored_ts -- per symbol, the newest bar timestamp that actually went
         through signal evaluation (streamed or catch-up). Deliberately NOT
         reset on reconnect: it is the dedup that stops repeated re-primes
@@ -466,6 +472,7 @@ class OandaScalperOrchestrator:
         units = pos["units"]
 
         # Determine breach price and which bracket was hit
+        breached: bool = False
         breach_price: float = 0.0
         hit_level: str = ""
         if units > 0:  # long
@@ -647,7 +654,12 @@ class OandaScalperOrchestrator:
                     "pid": os.getpid(),
                     "started": self._started_at,
                     "granularity": getattr(self._provider, "_stream_gran", None),
-                    "symbols": list(self._bar_buffers.keys()),
+                    # _symbols, not _bar_buffers: the buffers are keyed from
+                    # the CONFIGURED basket at construction, so after
+                    # _drop_untradeable_symbols they still hold instruments
+                    # this run will never trade. Report what is actually
+                    # traded, or a dashboard shows phantom coverage.
+                    "symbols": list(self._symbols),
                     "positions": positions,
                     "pending_entries": pending,
                     "counters": {
@@ -1407,6 +1419,59 @@ class OandaScalperOrchestrator:
                 ),
             )
 
+    async def _drop_untradeable_symbols(self) -> None:
+        """
+        Remove configured symbols this account is not permitted to trade.
+
+        Motivation (2026-08-06): XAU_USD and XAG_USD are in the trained basket
+        but not on this account's instrument list. The model kept proposing
+        them, the order was submitted, and OANDA rejected it with
+        INSTRUMENT_NOT_TRADEABLE — three times in four days. Each one is a
+        signal spent on an order that could never fill, plus a stack trace in
+        the log that looks like a real fault.
+
+        Fail-open by design. If the account cannot be queried we keep every
+        symbol: eating an occasional rejection is far cheaper than a transient
+        API blip silently muting the whole basket. Only a *successful* lookup
+        that positively excludes a symbol may drop it.
+        """
+        get = getattr(self._provider, "get_tradeable_instruments", None)
+        if get is None:
+            return
+
+        tradeable = await asyncio.get_running_loop().run_in_executor(None, get)
+        if not tradeable:
+            logger.warning(
+                "Could not determine tradeable instruments — keeping all %d "
+                "configured symbol(s). Untradeable ones will be rejected at "
+                "order time.",
+                len(self._symbols),
+            )
+            return
+
+        keep = [s for s in self._symbols if _to_oanda_symbol(s) in tradeable]
+        dropped = [s for s in self._symbols if s not in keep]
+
+        if not keep:
+            raise RuntimeError(
+                "None of the configured symbols are tradeable on this "
+                f"account: {self._symbols}. Refusing to start a bot that "
+                "cannot place a single order."
+            )
+
+        if dropped:
+            logger.warning(
+                "UNTRADEABLE — dropping %s from this run; the account cannot "
+                "trade %s. Trading %d of %d configured symbols.",
+                dropped,
+                "them" if len(dropped) > 1 else "it",
+                len(keep),
+                len(self._symbols),
+            )
+            events.emit("untradeable_dropped", dropped=dropped, kept=keep)
+
+        self._symbols = keep
+
     async def _prime_history(self) -> None:
         """Prime bar buffers with historical REST data to bypass cold warm-up."""
         for symbol in self._symbols:
@@ -1664,6 +1729,10 @@ class OandaScalperOrchestrator:
         # Verify broker state before anything else — flattens orphans,
         # raises if state can't be verified.
         await self._reconcile_on_boot()
+
+        # Drop instruments the account cannot trade. Runs AFTER reconciliation
+        # so orphan checks still cover every configured symbol.
+        await self._drop_untradeable_symbols()
 
         events.emit(
             "boot",

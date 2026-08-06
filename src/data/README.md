@@ -83,7 +83,10 @@ ticks itself. Contains the hardening that keeps the live soak alive: a
 a dead socket), a `seconds_since_last_message` liveness property the
 orchestrator's watchdog polls, and `force_disconnect()` to force a reconnect.
 Also exposes a raw `tick_callback` the scalper uses to measure live spreads —
-that hook runs inline on the stream thread and must not block.
+that hook runs inline on the stream thread and must not block. And
+`get_tradeable_instruments()`, the account's full instrument set, which the
+scalper uses at boot to drop symbols it would only get rejected on; it returns
+an empty set on failure, meaning "unknown", never "nothing tradeable".
 
 > ⚠️ `volume` from this provider is **tick count, not traded size** — OANDA
 > doesn't report real volume. Training data uses the same proxy, so the two
