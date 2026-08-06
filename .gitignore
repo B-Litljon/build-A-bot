@@ -36,5 +36,14 @@ backtest_output.log
 
 soak.off
 
+# Dashboard build outputs
+dashboard/api/target/
+dashboard/web/node_modules/
+dashboard/web/dist/
+
+# Structured telemetry (regenerable; the dashboard's input)
+logs/events-*.jsonl
+logs/status.json
+
 # Offline analysis artifacts (rescued/derived data; regenerable)
 analysis_cache/

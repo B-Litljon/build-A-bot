@@ -57,6 +57,7 @@ if str(_SRC_DIR) not in sys.path:
 # ---------------------------------------------------------------------------
 # Now safe to import from src/ using bare module names
 # ---------------------------------------------------------------------------
+from core import events  # noqa: E402
 from data.oanda_provider import OandaMarketProvider  # noqa: E402
 from execution.oanda_order_manager import OandaOrderManager  # noqa: E402
 from execution.oanda_scalper_orchestrator import (  # noqa: E402
@@ -178,6 +179,10 @@ def _configure_logging(daemon: bool) -> None:
 async def _main() -> None:
     args = _parse_args()
     _configure_logging(args.daemon)
+
+    # Structured telemetry sink (logs/events-*.jsonl + logs/status.json).
+    # Best-effort by construction; EVENTS_ENABLED=0 turns it off entirely.
+    events.configure()
 
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
     if not symbols:

@@ -40,6 +40,8 @@ See the root [GLOSSARY.md](../GLOSSARY.md) for domain terms.
 | `test_oanda_scalper.py` | 31 | The live bot's control flow — mostly failure paths |
 | `test_feature_stats.py` | 12 | The stats artifact and the PSI maths |
 | `test_stream_liveness.py` | 9 | What happens when the price feed goes silent |
+| `test_entry_guards.py` | 15 | Post-exit cooldown + the correlated-exposure cap |
+| `test_events.py` | 11 | The telemetry sink: never raises, never blocks, never on the tick path |
 | `test_cost_feature.py` | 9 | The per-instrument cost feature and veto alphas |
 | `test_trading_mcp.py` | 9 | The MCP two-step confirm-token safety flow |
 | `execution/test_live_orchestrator.py` | 12 | State machine + **thread-ownership regression** + persistence ownership |
@@ -98,9 +100,6 @@ running strategy's brain for an unvalidated candidate.
 
 **`test_trading_mcp.py`** — pins that a wrong, missing, or reused confirm token
 cannot act, i.e. an AI assistant can't start or stop the live bot by accident.
-
-### `__init__.py` / `execution/__init__.py`
-Empty package markers.
 
 **`test_investor_benchmark_gate.py`** — covers the investor's lift-over-benchmark
 gate: the sector cap it simulates, the month-pairing that turns model scores into

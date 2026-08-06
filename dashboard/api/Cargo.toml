@@ -1,0 +1,26 @@
+[package]
+name = "soak-dashboard"
+version = "0.1.0"
+edition = "2021"
+description = "Read-only observability API for the V5 OANDA soak"
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "signal", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tower-http = { version = "0.5", features = ["fs", "trace", "compression-gzip"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+# Timestamps stay strings end to end: the bot writes ISO-8601, the browser
+# parses ISO-8601. Add `time` or `chrono` only when something here has to do
+# date ARITHMETIC (e.g. bucketing an equity curve) — note `time` 0.3.54+
+# requires rustc >= 1.88, above this box's 1.86.
+
+# Brandon adds when he starts oanda.rs:
+# reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+# ts-rs = "10"          # export TS types from these structs
+
+[dev-dependencies]
+tempfile = "3"

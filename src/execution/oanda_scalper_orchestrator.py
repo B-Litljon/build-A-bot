@@ -99,6 +99,27 @@ Glossary:
         _close_max_attempts (5, OANDA_CLOSE_MAX_ATTEMPTS) because a failed
         close leaves a live position with no protection.
 
+    ── entry guards (added 2026-07-30 after the first multi-fill day) ──
+    _reentry_cooldown -- OANDA_REENTRY_COOLDOWN_SECONDS: how long after an
+        exit a symbol may not be re-entered. -1 (default) = one bar period,
+        0 disables. Blocks OPENING only; flipping an already-open position is
+        untouched.
+    _last_exit_ts -- symbol -> time.monotonic() of its last close.
+    _mark_exit / _cooldown_remaining -- start the cooldown / seconds left.
+    _max_per_currency -- OANDA_MAX_PER_CURRENCY, default 2: how many open
+        positions may share the SAME signed currency leg. Long GBP_JPY +
+        long AUD_JPY are two short-JPY positions; a third would breach a cap
+        of 2. 0 or negative disables.
+    _currency_legs -- splits SYMBOL + signed units into {currency: ±1}, the
+        unit the cap counts in. Unparseable symbol -> {} = uncapped.
+    _exposure_conflict -- the cap check; returns a human-readable reason or
+        None. Must be called holding _positions_lock.
+    _pending_entries -- symbol -> signed units for an entry that passed the
+        cap but whose fill has not returned. Counted as held, so two entries
+        on the same bar cannot both pass. Released on every path out.
+    _cooldown_rejections / _exposure_rejections -- how often each guard has
+        blocked an entry, for the soak log.
+
     ── volatility tracking ──
     _wilder_atr / _regime_natr / _regime_prev_close -- a running volatility
         estimate advanced once per sealed bar in constant time, rather than
@@ -161,6 +182,7 @@ import numpy as np
 import polars as pl
 import talib
 
+from core import events
 from core.notification_manager import NotificationManager
 from data.oanda_provider import OandaMarketProvider, _to_oanda_symbol
 from execution.oanda_order_manager import OandaOrderManager, OrderCloseError
@@ -275,6 +297,39 @@ class OandaScalperOrchestrator:
         # Position state: symbol -> {entry, sl, tp, units, state}
         self._positions: Dict[str, dict] = {}
         self._positions_lock = threading.Lock()
+
+        # ── post-exit cooldown ──
+        # On 2026-07-30 NZD_JPY was stopped out at 13:53 UTC and re-entered
+        # LONG at 14:00 on the next bar, into the same falling move, for a
+        # second loss. A fresh stop is evidence the read was wrong; the next
+        # bar is too soon to re-litigate it. -1 = one bar period (resolved
+        # from the provider's granularity), 0 disables.
+        self._reentry_cooldown = float(
+            os.getenv("OANDA_REENTRY_COOLDOWN_SECONDS", "-1")
+        )
+        # symbol -> time.monotonic() when the position was closed. Monotonic
+        # so an NTP step cannot retroactively expire or extend a cooldown.
+        self._last_exit_ts: Dict[str, float] = {}
+
+        # ── correlated-exposure cap ──
+        # Also 2026-07-30: three simultaneous longs on GBP_JPY, AUD_JPY and
+        # NZD_JPY are one short-JPY bet at 3x size, and the yen leg moved
+        # against all three at once. Counts SIGNED currency legs across open
+        # and in-flight positions; 0 or negative disables.
+        self._max_per_currency = int(os.getenv("OANDA_MAX_PER_CURRENCY", "2"))
+        # symbol -> signed target units for an entry that has passed the cap
+        # check but whose fill has not returned yet. Guarded by
+        # _positions_lock. Without this, two entries evaluated on the same
+        # bar both see the pre-trade world and both pass a cap of 2.
+        self._pending_entries: Dict[str, int] = {}
+
+        # Entry-guard telemetry (mirrors the chop-gate counters).
+        self._cooldown_rejections: int = 0
+        self._exposure_rejections: int = 0
+
+        # Process start, reported in the status snapshot so a dashboard can
+        # show uptime without shelling out to ps.
+        self._started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
         # asyncio loop reference (set in run())
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -560,6 +615,152 @@ class OandaScalperOrchestrator:
                 "med_baseline_natr=%.5f alpha_emp=%.4f",
                 norm_sym, len(spreads), med_spread, p25, p75, med_base, alpha,
             )
+            events.emit(
+                "calib",
+                sym=norm_sym,
+                n=len(spreads),
+                alpha_emp=round(alpha, 4),
+                med_spread_pct=round(med_spread, 5),
+                med_baseline_natr=round(med_base, 5),
+            )
+
+    # ── entry guards (cooldown + correlated exposure) ──────────────────
+
+    # ── telemetry ──────────────────────────────────────────────────────
+
+    def _emit_status(self) -> None:
+        """
+        Publish the 'right now' snapshot for the dashboard.
+
+        Called once per bar and on every entry/exit. Serialises state that
+        already exists — no new bookkeeping — so this stays a pure read of the
+        orchestrator plus a queue put.
+        """
+        try:
+            with self._positions_lock:
+                positions = {
+                    sym: dict(pos) for sym, pos in self._positions.items()
+                }
+                pending = dict(self._pending_entries)
+            events.write_status(
+                {
+                    "pid": os.getpid(),
+                    "started": self._started_at,
+                    "granularity": getattr(self._provider, "_stream_gran", None),
+                    "symbols": list(self._bar_buffers.keys()),
+                    "positions": positions,
+                    "pending_entries": pending,
+                    "counters": {
+                        "devil_approved": self._devil_approved_total,
+                        "spread_veto": self._spread_gate_rejections,
+                        "regime_veto": self._regime_gate_rejections,
+                        "time_veto": self._time_gate_rejections,
+                        "cooldown_blocks": self._cooldown_rejections,
+                        "exposure_blocks": self._exposure_rejections,
+                    },
+                    "last_bar": {
+                        sym: str(ts) if ts else None
+                        for sym, ts in self._last_scored_ts.items()
+                    },
+                    "config": {
+                        "units": self._units_per_trade,
+                        "cooldown_s": self._reentry_cooldown,
+                        "max_per_ccy": self._max_per_currency,
+                        "angel_thr": getattr(self._strategy, "angel_threshold", None),
+                        "devil_thr": getattr(self._strategy, "devil_threshold", None),
+                    },
+                }
+            )
+        except Exception:
+            # Telemetry must never reach the trading path.
+            pass
+
+    def _release_pending(self, symbol: str) -> None:
+        """Drop ``symbol``'s in-flight exposure reservation. Takes the lock."""
+        with self._positions_lock:
+            self._pending_entries.pop(symbol, None)
+
+    def _mark_exit(self, symbol: str) -> None:
+        """Start ``symbol``'s re-entry cooldown. Call on every real exit."""
+        self._last_exit_ts[symbol] = time.monotonic()
+
+    def _cooldown_remaining(self, symbol: str) -> float:
+        """
+        Seconds left before ``symbol`` may be re-entered; 0.0 if clear.
+
+        The default (-1) resolves to one bar period, so an instrument that
+        just exited sits out the next bar rather than re-entering on it.
+        """
+        window = self._reentry_cooldown
+        if window < 0:
+            window = float(getattr(self._provider, "_stream_gran", 1)) * 60.0
+        if window <= 0:
+            return 0.0
+        last = self._last_exit_ts.get(symbol)
+        if last is None:
+            return 0.0
+        return max(0.0, window - (time.monotonic() - last))
+
+    @staticmethod
+    def _currency_legs(symbol: str, units: int) -> Dict[str, int]:
+        """
+        Decompose a signed position into its two signed currency legs.
+
+        Long GBP_JPY is "+GBP, -JPY"; short is the mirror. XAU_USD decomposes
+        the same way (XAU against USD), which is what makes a metals position
+        and a fiat cross comparable. Returns {} for an unparseable symbol so a
+        naming surprise degrades to "uncapped", never to a crash on the
+        entry path.
+        """
+        parts = symbol.split("_")
+        if len(parts) != 2 or not all(parts):
+            return {}
+        base, quote = parts
+        sign = 1 if units > 0 else -1
+        return {base: sign, quote: -sign}
+
+    def _exposure_conflict(self, symbol: str, target_units: int) -> Optional[str]:
+        """
+        Reason string if opening ``target_units`` would breach the cap, else None.
+
+        MUST be called with ``_positions_lock`` held: it reads ``_positions``
+        and ``_pending_entries`` together, and the caller reserves its own
+        slot in ``_pending_entries`` under the same acquisition.
+        """
+        if self._max_per_currency <= 0:
+            return None
+        want = self._currency_legs(symbol, target_units)
+        if not want:
+            return None
+
+        # Existing signed legs, counting in-flight entries as already held.
+        # Keyed by (currency, sign) so "two shorts of JPY" and "one long,
+        # one short" are counted as the different things they are.
+        held: Dict[tuple, int] = {}
+        others: Dict[tuple, List[str]] = {}
+        existing_units = {
+            sym: pos.get("units", 0)
+            for sym, pos in self._positions.items()
+            if sym != symbol and pos.get("units", 0)
+        }
+        existing_units.update(
+            {sym: u for sym, u in self._pending_entries.items() if sym != symbol}
+        )
+        for sym, units in existing_units.items():
+            for ccy, sign in self._currency_legs(sym, units).items():
+                held[(ccy, sign)] = held.get((ccy, sign), 0) + 1
+                others.setdefault((ccy, sign), []).append(sym)
+
+        for ccy, sign in want.items():
+            count = held.get((ccy, sign), 0)
+            if count + 1 > self._max_per_currency:
+                side = "long" if sign > 0 else "short"
+                return (
+                    f"{side} {ccy} exposure would reach {count + 1} positions "
+                    f"(cap {self._max_per_currency}); already held via "
+                    f"{', '.join(others.get((ccy, sign), []))}"
+                )
+        return None
 
     async def _watchdog_close(self, symbol: str) -> None:
         """
@@ -604,9 +805,22 @@ class OandaScalperOrchestrator:
             # Success (close submitted, or broker already flat)
             with self._positions_lock:
                 self._positions.pop(symbol, None)
+            self._mark_exit(symbol)
             logger.info(
                 "[%s] Watchdog close completed (attempt %d)", symbol, attempt
             )
+            events.emit(
+                "exit",
+                sym=symbol,
+                units=units,
+                dir=direction,
+                entry=pos_snapshot.get("entry"),
+                sl=pos_snapshot.get("sl"),
+                tp=pos_snapshot.get("tp"),
+                reason="watchdog",
+                attempt=attempt,
+            )
+            self._emit_status()
             if pos_snapshot:
                 self._notify(
                     self._notifier.send_oanda_trade_alert,
@@ -710,6 +924,7 @@ class OandaScalperOrchestrator:
         self._last_scored_ts[symbol] = bar["timestamp"]
 
         await self._evaluate_and_trade(symbol)
+        self._emit_status()
 
     async def _backfill_seam_bar(self, symbol: str, ts: "datetime") -> None:
         """
@@ -800,6 +1015,10 @@ class OandaScalperOrchestrator:
                 "(attempt %d) — scoring it now",
                 symbol, ts, attempt,
             )
+            events.emit(
+                "stream", kind="seam_backfill", sym=symbol,
+                bar_ts=str(ts), attempt=attempt,
+            )
             # Mark before evaluating: a failure here must not be retried into
             # a possible duplicate order on the next reconnect.
             self._last_scored_ts[symbol] = ts
@@ -856,6 +1075,31 @@ class OandaScalperOrchestrator:
                 )
                 return
 
+        # ── guard: post-exit cooldown ──
+        # Only applies to OPENING a position. If one is already open this is
+        # a flip, which is the model changing its mind about a live trade
+        # rather than re-entering a closed one; the direction guards below
+        # own that case.
+        if existing is None:
+            remaining = self._cooldown_remaining(symbol)
+            if remaining > 0:
+                self._cooldown_rejections += 1
+                logger.info(
+                    "[%s] Entry blocked by post-exit cooldown — %.0fs left "
+                    "(%d blocked so far)",
+                    symbol,
+                    remaining,
+                    self._cooldown_rejections,
+                )
+                events.emit(
+                    "guard_block",
+                    sym=symbol,
+                    guard="cooldown",
+                    remaining_s=round(remaining, 1),
+                    total=self._cooldown_rejections,
+                )
+                return
+
         # ── calculate SL/TP bracket ──
         sl_price: Optional[float] = None
         tp_price: Optional[float] = None
@@ -901,6 +1145,15 @@ class OandaScalperOrchestrator:
                 self._devil_approved_total,
                 ratio,
             )
+            events.emit(
+                "gate_veto",
+                sym=symbol,
+                gate=gate,
+                spread=self._spread_gate_rejections,
+                regime=self._regime_gate_rejections,
+                time=self._time_gate_rejections,
+                devil_approved=self._devil_approved_total,
+            )
             return
 
         # ── derive signed target units ──
@@ -917,8 +1170,34 @@ class OandaScalperOrchestrator:
         # so the tick watchdog cannot fire on its stale SL/TP mid-submit.
         reversing = False
         with self._positions_lock:
+            # Correlated-exposure cap, checked and RESERVED under one lock
+            # acquisition so two same-bar entries cannot both pass it.
+            conflict = self._exposure_conflict(symbol, target_units)
+            if conflict is not None:
+                self._exposure_rejections += 1
+                logger.warning(
+                    "[%s] Entry blocked by exposure cap: %s (%d blocked so far)",
+                    symbol,
+                    conflict,
+                    self._exposure_rejections,
+                )
+                # emit() is a non-blocking queue put, so it is safe to call
+                # while holding the positions lock.
+                events.emit(
+                    "guard_block",
+                    sym=symbol,
+                    guard="exposure",
+                    detail=conflict,
+                    total=self._exposure_rejections,
+                )
+                return
+            self._pending_entries[symbol] = target_units
+
             existing = self._positions.get(symbol)
             if existing:
+                # Each bail-out below releases the reservation inline: the
+                # lock is held here and is NOT reentrant, so it cannot be
+                # released through a helper that takes it.
                 if existing.get("state") != "OPEN":
                     logger.info(
                         "[%s] Position state changed to %s before submit — "
@@ -926,12 +1205,15 @@ class OandaScalperOrchestrator:
                         symbol,
                         existing.get("state"),
                     )
+                    self._pending_entries.pop(symbol, None)
                     return
                 if existing["units"] > 0 and target_units > 0:
                     logger.info("[%s] Already long — skipping re-entry", symbol)
+                    self._pending_entries.pop(symbol, None)
                     return
                 if existing["units"] < 0 and target_units < 0:
                     logger.info("[%s] Already short — skipping re-entry", symbol)
+                    self._pending_entries.pop(symbol, None)
                     return
                 existing["state"] = "REVERSING"
                 reversing = True
@@ -946,6 +1228,9 @@ class OandaScalperOrchestrator:
                     current["state"] = "OPEN"
 
         # ── submit order (blocking HTTP → executor) ──
+        # From here the exposure reservation is live and MUST be released on
+        # every path out — including the ones that record a position, since
+        # _positions then carries the exposure itself.
         try:
             result = await asyncio.get_running_loop().run_in_executor(
                 None,
@@ -961,6 +1246,7 @@ class OandaScalperOrchestrator:
                 exc_info=True,
             )
             _restore_open()
+            self._release_pending(symbol)
             return
 
         filled = result.get("filled", 0)
@@ -970,6 +1256,7 @@ class OandaScalperOrchestrator:
                 symbol,
             )
             _restore_open()
+            self._release_pending(symbol)
             return
 
         # ── record position state ──
@@ -988,7 +1275,11 @@ class OandaScalperOrchestrator:
             # would block future entries and watchdog alike).
             with self._positions_lock:
                 self._positions.pop(symbol, None)
+                self._pending_entries.pop(symbol, None)
             return
+        # Record the position and hand the exposure over to _positions in ONE
+        # lock acquisition, so the symbol is never briefly invisible to a
+        # concurrent cap check.
         with self._positions_lock:
             self._positions[symbol] = {
                 "entry": avg_price,
@@ -997,6 +1288,7 @@ class OandaScalperOrchestrator:
                 "units": actual_units,
                 "state": "OPEN",
             }
+            self._pending_entries.pop(symbol, None)
 
         logger.info(
             "[%s] Position opened | units=%d entry=%.5f sl=%.5f tp=%.5f",
@@ -1007,8 +1299,21 @@ class OandaScalperOrchestrator:
             tp_price,
         )
 
-        # Discord trade alert (no-op if webhook unset; posted off-loop)
         meta = signal.metadata or {}
+        events.emit(
+            "entry",
+            sym=symbol,
+            dir=signal.direction,
+            units=actual_units,
+            entry=avg_price,
+            sl=sl_price,
+            tp=tp_price,
+            angel=meta.get("angel_prob"),
+            devil=meta.get("devil_prob"),
+        )
+        self._emit_status()
+
+        # Discord trade alert (no-op if webhook unset; posted off-loop)
         self._notify(
             self._notifier.send_oanda_trade_alert,
             symbol=symbol,
@@ -1216,6 +1521,10 @@ class OandaScalperOrchestrator:
                     ts,
                     age,
                 )
+                events.emit(
+                    "stream", kind="seam_catchup", sym=norm_sym,
+                    bar_ts=str(ts), age_s=round(age, 1),
+                )
                 # Mark BEFORE evaluating: a failed evaluation must not retry
                 # on the next reconnect — duplicate-order risk outranks one
                 # lost signal.
@@ -1269,6 +1578,9 @@ class OandaScalperOrchestrator:
                 "re-priming history on resume",
                 delay,
                 attempt,
+            )
+            events.emit(
+                "stream", kind="disconnect", delay_s=round(delay, 1), attempt=attempt
             )
             await asyncio.sleep(delay)
 
@@ -1352,6 +1664,20 @@ class OandaScalperOrchestrator:
         # Verify broker state before anything else — flattens orphans,
         # raises if state can't be verified.
         await self._reconcile_on_boot()
+
+        events.emit(
+            "boot",
+            pid=os.getpid(),
+            symbols=self._symbols,
+            granularity=getattr(self._provider, "_stream_gran", None),
+            units=self._units_per_trade,
+            warmup=self._warmup,
+            cooldown_s=self._reentry_cooldown,
+            max_per_ccy=self._max_per_currency,
+            angel_thr=getattr(self._strategy, "angel_threshold", None),
+            devil_thr=getattr(self._strategy, "devil_threshold", None),
+        )
+        self._emit_status()
 
         self._provider.subscribe(
             self._symbols,
@@ -1441,7 +1767,12 @@ class OandaScalperOrchestrator:
                     result,
                 )
             else:
+                # Also reached by the liveness watchdog mid-run, where the
+                # process keeps trading: a flatten is a real exit and starts
+                # the cooldown like any other.
+                self._mark_exit(sym)
                 logger.info("[%s] Flattened on exit", sym)
+                events.emit("exit", sym=sym, reason="flatten")
 
         if failed:
             # Synchronous on purpose: we are shutting down and the loop may

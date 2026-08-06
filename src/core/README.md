@@ -114,6 +114,33 @@ override is a train/analysis-time knob, not a live-tuning knob.
   directly (retrainer writes the value into `threshold.json` /
   `metadata.json`).
 
+### `events.py` — structured telemetry
+The machine-readable half of the bot's output: `emit()` appends one JSON object
+per line to `logs/events-YYYY-MM-DD.jsonl`, `write_status()` replaces
+`logs/status.json` atomically. Consumers (the dashboard API) read facts instead
+of regex-scraping the human log, which also puts several things on the record
+that the log never carried: per-bar angel/devil probabilities, entry-guard
+blocks, bracket levels at entry.
+
+Three properties are load-bearing, because this runs **inside the live trading
+process**: it never raises (every entry point swallows its own exceptions), it
+never blocks (a bounded queue plus a daemon writer thread; a full queue drops
+events rather than stalling a bar), and it is never called from the tick path.
+`tests/test_events.py` pins all three, including a source-level check that no
+`events.*` call appears in `_on_tick` and that no call site does arithmetic or
+indexing in its arguments — those expressions run *before* `emit`'s safety net.
+
+Telemetry is **opt-in**: nothing is written until `configure()` is called, so
+importing a strategy in a test or a backtest cannot append to the live bot's
+logs. `run_oanda.py` calls it at startup; `EVENTS_ENABLED=0` is the off switch.
+
+- **Imports from repo:** none (stdlib only).
+- **Imported by:** `execution/oanda_scalper_orchestrator.py`,
+  `strategies/concrete_strategies/ml_strategy.py`, `run_oanda.py`,
+  `tests/test_events.py`.
+- **Data artifacts:** writes `logs/events-*.jsonl` and `logs/status.json`
+  (both gitignored, both regenerable). Read by `dashboard/`.
+
 ### `order_management.py` — ⚠️ dead
 `OrderParams`, a percentage-multiplier risk config its own docstring describes
 as backtest-only and explicitly warns against wiring into live execution. It

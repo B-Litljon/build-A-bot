@@ -43,7 +43,7 @@ tests) or dormant experiments kept for reference.
 |---|---|---|
 | [`src/`](src/README.md) | All library code. See its README for the package map. | training + live |
 | [`scripts/`](scripts/README.md) | Hand-run tools: the whole V4 investor, model diagnostics, calibration, paper launchers. | manual + monthly cron |
-| [`tests/`](tests/README.md) | 114 tests. No network, no broker, no real models. | CI / manual |
+| [`tests/`](tests/README.md) | 163 tests. No network, no broker, no real models. | CI / manual |
 | `models/` | Trained model artifacts. Subdirectories are separate models: `forex/`, `forex_m15/`, `forex_swing/`, plus legacy root-level `angel_latest.pkl` and `dt_*` (day-trade experiment) and `v4_investor_lgbm.txt`. | read live |
 | `data/` | Bars, ledgers, and processed datasets (`raw/`, `processed/`, `cache/`). Mostly gitignored. | training + analysis |
 | `config/` | Configuration not in code — currently just a baked spread-cost table. | training + live |
@@ -51,6 +51,7 @@ tests) or dormant experiments kept for reference.
 | `docs/` | Three older design documents (architecture, day-trade model, an RSI/Bollinger strategy). | reference |
 | `llm_reports/` | Written reports of work done, filed by category (`audits/`, `handoffs/`, `refactors/`, `recons/`, `stops/`). See its README for the convention. | reference |
 | `m2m_prompts/` | The other half of that ledger: the briefs that *requested* the work. | reference |
+| [`dashboard/`](dashboard/README.md) | Read-only web view of the soak: Rust (axum) API + TypeScript front-end. Reads `logs/events-*.jsonl`, `logs/status.json`, and OANDA REST. Cannot affect trading. | manual |
 | `viz/` | Empty. | — |
 | `src/autopilot/`, `src/research/` | **No source files on this branch** — only stale `__pycache__`. | — |
 
@@ -240,6 +241,63 @@ skips bars judged too violent to trade, regardless of what the models think.
 training (`retrainer._compute_chop_veto_mask`), so the model only ever learns
 from bars the live bot would actually take. Changing a gate on one side without
 the other is a silent correctness bug.
+
+## Telemetry
+
+The machine-readable half of the bot's output, added 2026-07-31 so the
+dashboard reads facts rather than regex-scraping a log written for humans.
+*(`src/core/events.py`, consumed by `dashboard/`)*
+
+**event stream** — `logs/events-YYYY-MM-DD.jsonl`, one JSON object per line,
+append-only. Every line carries `ts` (UTC ISO-8601) and `ev` (the kind); see
+`dashboard/README.md` for the per-kind fields.
+
+**bar event** — one record per *evaluation*, carrying that bar's angel and
+devil probabilities and the outcome. The heartbeat summarises 30 bars; this is
+the bar itself, and it is the first per-bar probability record this project has
+kept.
+
+**status snapshot** — `logs/status.json`, the bot's "right now": positions,
+counters, config, last bar per symbol. Replaced atomically (temp + rename) each
+bar, so a reader never sees a partial file.
+
+**opt-in telemetry** — nothing is written until `events.configure()` is called.
+Importing a strategy in a test or backtest must never append to the live bot's
+logs. `EVENTS_ENABLED=0` disables it outright.
+
+**best-effort** — the sink never raises, never blocks (bounded queue + daemon
+writer; a full queue DROPS events), and is never called from the tick path.
+Losing telemetry always beats stalling a bar.
+
+## The entry guards
+
+Distinct from the gates above: the gates ask "is this trade worth its cost?",
+these ask "should we be taking *this* trade *now*, given what we just did and
+what we already hold?" They live in the orchestrator, not the RiskManager, and
+have no training-side mirror — they constrain sequencing and concentration,
+not the merit of a setup. *(`src/execution/oanda_scalper_orchestrator.py`,
+both added 2026-07-30)*
+
+**post-exit cooldown** — a symbol cannot be re-entered for a set window after
+its position closes (`OANDA_REENTRY_COOLDOWN_SECONDS`, default one bar period;
+0 disables). A fresh stop is evidence the read was wrong, and the next bar is
+too soon to re-litigate it. Blocks *opening* only — reversing a position that
+is still open is a different act and stays allowed.
+
+**currency leg** — one side of an instrument, signed by direction. Long
+GBP_JPY is `+GBP, −JPY`; short is the mirror. XAU_USD decomposes the same way,
+which is what makes a metals position and a fiat cross comparable.
+
+**correlated-exposure cap** — the maximum number of open positions sharing the
+same signed currency leg (`OANDA_MAX_PER_CURRENCY`, default 2; 0 disables).
+Long GBP_JPY + long AUD_JPY + long NZD_JPY is not three trades, it is one
+short-yen bet at triple size — which is exactly how it behaved on 2026-07-30,
+when all three lost together.
+
+**reservation (`_pending_entries`)** — an entry that has passed the cap but
+whose fill has not returned yet, counted as though already held. Without it,
+two signals evaluated on the same bar both see the pre-trade world and both
+pass a cap they jointly breach.
 
 ## Training
 

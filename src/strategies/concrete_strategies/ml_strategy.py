@@ -105,6 +105,7 @@ import polars as pl
 warnings.filterwarnings("ignore", message=".*join_asof.*")
 
 from strategies.base import BaseStrategy, Signal
+from core import events
 from core.notification_manager import NotificationManager
 from core.thresholds import ANGEL_THRESHOLD as DEFAULT_ANGEL_THRESHOLD
 
@@ -703,11 +704,38 @@ class MLStrategy(BaseStrategy):
                     self.angel_threshold,
                     cost_note,
                 )
+                events.emit(
+                    "heartbeat",
+                    sym=heartbeat_key,
+                    median=round(float(np.median(probs)), 4),
+                    p75=round(float(np.percentile(probs, 75)), 4),
+                    max=round(float(np.max(probs)), 4),
+                    proposed=proposed,
+                    n_bars=len(probs),
+                    threshold=self.angel_threshold,
+                )
                 self._heartbeat_counter[heartbeat_key] = 0
+
+            # Per-bar record. The heartbeat above summarises 30 bars; this is
+            # the bar itself, which is what makes "why isn't it trading?"
+            # answerable as a series rather than a rolling median.
+            bar_ts = (
+                str(df["timestamp"].tail(1)[0]) if "timestamp" in df.columns else None
+            )
 
             if angel_prob < self.angel_threshold:
                 logger.debug(
                     f"[{symbol}] Angel rejected | Prob: {angel_prob:.4f} < {self.angel_threshold}"
+                )
+                events.emit(
+                    "bar",
+                    sym=heartbeat_key,
+                    bar_ts=bar_ts,
+                    close=current_price,
+                    angel=round(float(angel_prob), 4),
+                    devil=None,
+                    outcome="angel_reject",
+                    proposed=False,
                 )
                 return None
 
@@ -727,6 +755,16 @@ class MLStrategy(BaseStrategy):
                 logger.debug(
                     f"[{symbol}] Devil veto | Angel: {angel_prob:.2f}, Devil: {devil_prob:.2f} < {self.devil_threshold}"
                 )
+                events.emit(
+                    "bar",
+                    sym=heartbeat_key,
+                    bar_ts=bar_ts,
+                    close=current_price,
+                    angel=round(float(angel_prob), 4),
+                    devil=round(float(devil_prob), 4),
+                    outcome="devil_veto",
+                    proposed=False,
+                )
                 return None
 
             # Both Angel and Devil agree — emit raw ATR volatility.
@@ -741,6 +779,18 @@ class MLStrategy(BaseStrategy):
                 f"Angel Prob: {angel_prob:.2f} | "
                 f"Devil Prob: {devil_prob:.2f} | "
                 f"raw_ATR={atr_abs:.4f}"
+            )
+
+            events.emit(
+                "bar",
+                sym=heartbeat_key,
+                bar_ts=bar_ts,
+                close=current_price,
+                angel=round(float(angel_prob), 4),
+                devil=round(float(devil_prob), 4),
+                outcome="agreement",
+                proposed=True,
+                atr=round(atr_abs, 6),
             )
 
             return Signal(

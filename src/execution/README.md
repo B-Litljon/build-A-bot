@@ -68,7 +68,7 @@ Note the forex profile overrides the bracket multipliers to **1.0× / 2.0×**
 - **Data artifacts:** none directly; reads per-instrument costs passed in from
   the model dir's `spread_alphas.json`.
 
-### `oanda_scalper_orchestrator.py` (1429 lines) — ⚠️ the live bot
+### `oanda_scalper_orchestrator.py` (1621 lines) — ⚠️ the live bot
 `OandaScalperOrchestrator`. Two clocks run at once, and most of the design
 follows from that:
 
@@ -97,6 +97,16 @@ Things worth knowing:
   120s of healthy streaming (`OANDA_RECONNECT_*`). The cap sits below the
   liveness watchdog's 60s flatten threshold, so backing off never leaves a
   position unwatched longer than the stall response already permits.
+- **Entry guards** (added 2026-07-30, both born from one morning's trades) —
+  a **post-exit cooldown** (`OANDA_REENTRY_COOLDOWN_SECONDS`, default one bar
+  period) keeps a symbol from being re-entered on the bar after its own stop,
+  and a **correlated-exposure cap** (`OANDA_MAX_PER_CURRENCY`, default 2)
+  limits how many open positions may share the same *signed currency leg* —
+  long GBP_JPY and long AUD_JPY are two short-JPY bets, and on 2026-07-30 a
+  third one joined them and all three lost together. In-flight entries are
+  reserved in `_pending_entries` so two signals on the same bar cannot both
+  pass the cap before either fills. The cooldown does not block *flipping* an
+  already-open position; set either knob to 0 to disable it.
 - **`_reconcile_on_boot`** — asks the broker what's actually open before
   trading. A restart must adopt reality, not assume it's flat, or a position
   left by a crashed process runs with nothing watching its stop.
@@ -114,7 +124,8 @@ Things worth knowing:
   `execution.oanda_order_manager`, `execution.risk_manager`,
   `strategies.concrete_strategies.ml_strategy`.
 - **Imported by:** `run_oanda.py`, `scripts/bake_spread_alphas.py`,
-  `tests/test_oanda_scalper.py`, `tests/test_stream_liveness.py`.
+  `tests/test_oanda_scalper.py`, `tests/test_stream_liveness.py`,
+  `tests/test_entry_guards.py`.
 - **Data artifacts:** none written directly; logs to `logs/soak_*.log`.
 
 ### `oanda_order_manager.py`
