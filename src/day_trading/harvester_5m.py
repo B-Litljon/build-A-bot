@@ -1,6 +1,6 @@
 """
 src/day_trading/harvester_5m.py
-Day Trade Dataset Harvester — Universal Scalper V4.0
+Day Trade Dataset Harvester — Intraday Trend Engine V4.0
 
 Fetches two complementary datasets for the day trading model:
 
@@ -37,7 +37,7 @@ Glossary:
     TIMEFRAME_5MIN / TIMEFRAME_DAILY -- the two bar sizes fetched.
     DATA_FEED -- IEX (free tier), so volume figures are partial.
     _FILE_PREFIX -- "dt_", namespacing every artifact so this experiment can
-        never collide with the main scalper's data.
+        never collide with the forex bot's data.
     _RAW_DIR -- data/raw/, output location.
 
 Writes: data/raw/dt_<SYMBOL>_5min.parquet and data/raw/dt_<SYMBOL>_daily.parquet
@@ -223,7 +223,7 @@ def harvest(
     start_daily = end_dt - timedelta(days=days_back + daily_warmup)
 
     logger.info("=" * 70)
-    logger.info("DAY TRADE HARVESTER  —  Universal Scalper V4.0")
+    logger.info("DAY TRADE HARVESTER  —  Intraday Trend Engine V4.0")
     logger.info("=" * 70)
     logger.info("Universe      : %s", ", ".join(symbols))
     logger.info("5m  window    : %s  →  %s", start_5min.date(), end_dt.date())

@@ -184,10 +184,10 @@ class TestEvents(unittest.TestCase):
     def test_entry_still_records_when_telemetry_raises(self):
         """With emit() raising on every call, a position is still opened."""
         import asyncio
-        from src.execution.oanda_scalper_orchestrator import (
-            OandaScalperOrchestrator,
+        from src.execution.oanda_forex_orchestrator import (
+            OandaForexOrchestrator,
         )
-        from src.execution import oanda_scalper_orchestrator as orch_mod
+        from src.execution import oanda_forex_orchestrator as orch_mod
 
         provider = MagicMock()
         provider._stream_gran = 15
@@ -196,7 +196,7 @@ class TestEvents(unittest.TestCase):
         order_manager = MagicMock()
         risk_manager = MagicMock()
 
-        orch = OandaScalperOrchestrator(
+        orch = OandaForexOrchestrator(
             symbols=["GBP_JPY"],
             provider=provider,
             strategy=strategy,
@@ -257,7 +257,7 @@ class TestEvents(unittest.TestCase):
         import ast
 
         targets = [
-            project_root / "src/execution/oanda_scalper_orchestrator.py",
+            project_root / "src/execution/oanda_forex_orchestrator.py",
             project_root / "src/strategies/concrete_strategies/ml_strategy.py",
         ]
         checked = 0
@@ -297,12 +297,12 @@ class TestEvents(unittest.TestCase):
         up as a test failure anywhere else — it would show up as a stalled
         price feed in production.
         """
-        from src.execution.oanda_scalper_orchestrator import (
-            OandaScalperOrchestrator,
+        from src.execution.oanda_forex_orchestrator import (
+            OandaForexOrchestrator,
         )
 
         for name in ("_on_tick", "_get_spread", "_sample_spread_calibration"):
-            src = inspect.getsource(getattr(OandaScalperOrchestrator, name))
+            src = inspect.getsource(getattr(OandaForexOrchestrator, name))
             self.assertNotIn(
                 "events.emit", src,
                 f"{name} runs on (or near) the tick path and must not emit",

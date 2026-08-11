@@ -1,7 +1,7 @@
 """
 FIFO-compliant order/position state manager for OANDA v20.
 
-Foundation class for the V5 forex scalper execution path. Tracks the
+Foundation class for the V5 forex bot execution path. Tracks the
 *net* position per instrument (signed units + broker-reported average
 entry price) — never per-trade lots — to comply with U.S. NFA FIFO and
 no-hedging rules enforced by OANDA.

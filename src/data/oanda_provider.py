@@ -10,7 +10,7 @@ Required environment variables:
     OANDA_API_KEY       - Bearer token from hub.oanda.com
     OANDA_ACCOUNT_ID    - Account ID (numeric string)
 
-This is the data feed for the live forex scalper. OANDA streams individual
+This is the data feed for the live forex bot. OANDA streams individual
 price quotes rather than finished bars, so this module builds the bars itself
 from ticks. See GLOSSARY.md (bid/ask, mid price, sealed bar, heartbeat).
 
@@ -44,7 +44,7 @@ Glossary:
         threads safely into the event loop when one is running.
     _tick_callback -- optional raw-quote hook called on every tick with
         (symbol, bid, ask). Must return in under 50 microseconds and do no
-        blocking I/O; it runs inline on the stream thread. The scalper uses it
+        blocking I/O; it runs inline on the stream thread. The forex bot uses it
         to track live spreads.
     _last_stream_msg / seconds_since_last_message -- when any message last
         arrived, heartbeats included. The orchestrator's watchdog reads this to

@@ -50,7 +50,7 @@ Cooling-off period: 5 minutes after any bracket closes
 Schema failure policy: catch → Discord alert → drop bar → symbol stays FLAT
 
 STATUS: this is the ALPACA (equities + crypto) orchestrator. It is NOT the
-currently-live bot -- the live one is oanda_scalper_orchestrator.py. Kept
+currently-live bot -- the live one is oanda_forex_orchestrator.py. Kept
 working and tested; `src/execution/__init__.py` deliberately does not export it.
 
 THREADING CONTRACT (the thing most likely to bite you here): the asyncio event

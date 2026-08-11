@@ -5,7 +5,7 @@
 **Generated:** 2026-07-04 (supersedes the 2026-03-16 "Universal Scalper V3.4" edition)
 **System:** Two live trading bots sharing one ML factory
 **Live surfaces:**
-- **V5 OANDA Forex Scalper** — async intraday Angel/Devil meta-labeling bot on OANDA v20 (LightGBM), software SL/TP watchdog + dynamic chop filter. *Currently soaking on the practice account (M15 candidate).*
+- **V5 OANDA Forex Bot** — async intraday Angel/Devil meta-labeling bot on OANDA v20 (LightGBM), software SL/TP watchdog + dynamic chop filter. *Currently soaking on the practice account (M15 candidate).*
 - **V4 Equities Investor** — monthly LightGBM cross-sectional stock ranker on Alpaca paper, diversified top-8 sector-capped basket. *Live on paper, monthly cron.*
 
 > **What changed since V3.4:** The project pivoted off the Alpaca equities/crypto scalper (`live_orchestrator.py`) onto **OANDA forex** for the intraday bot, swapped Angel/Devil from RandomForest to **LightGBM** (2026-05-23), refactored feature computation into a **pluggable ML factory** (`src/ml/`), and stood up a second independent product — the **monthly equities investor**. The old V3.4 Alpaca scalper stack still lives in the tree but is no longer the live system — see [§10 The Boneyard](#10-the-boneyard-legacy--dormant-code).
@@ -15,7 +15,7 @@
 ## Table of Contents
 
 0. [Orientation — Two Bots, One Garage](#0-orientation--two-bots-one-garage)
-1. [The Engine (V5 OANDA Forex Scalper)](#1-the-engine-v5-oanda-forex-scalper)
+1. [The Engine (V5 OANDA Forex Bot)](#1-the-engine-v5-oanda-forex-bot)
 2. [The Drivetrain (OANDA Data & Bar Aggregation)](#2-the-drivetrain-oanda-data--bar-aggregation)
 3. [The ECU (The ML Factory — Features, Strategy, Models)](#3-the-ecu-the-ml-factory--features-strategy-models)
 4. [The Transmission (Order Execution & Risk / Chop Filter)](#4-the-transmission-order-execution--risk--chop-filter)
@@ -34,7 +34,7 @@
 
 Build-A-Bot is now **two independent trading systems** that share a common ML factory and a few utilities but run in totally separate processes, brokers, and cadences.
 
-| | **V5 Forex Scalper** | **V4 Equities Investor** |
+| | **V5 Forex Bot** | **V4 Equities Investor** |
 |---|---|---|
 | **Broker** | OANDA v20 (practice/live) | Alpaca (paper) |
 | **Asset** | FX majors/crosses + metals (XAU/XAG) | US large-cap equities (96-name universe) |
@@ -46,11 +46,11 @@ Build-A-Bot is now **two independent trading systems** that share a common ML fa
 
 They are architecturally isolated: different broker SDKs, different model files, no shared event loop, no shared rate limits. **Running both in parallel is safe.** The only shared runtime surface is the Discord webhook (`NotificationManager`) — their alerts interleave in one channel by design.
 
-**Shared spine:** `src/ml/` (feature factory + trainers), `src/core/retrainer.py` (The Cure — the forex/equities scalper retrainer), `src/core/notification_manager.py`, `src/execution/risk_manager.py`, `src/data/factory.py`.
+**Shared spine:** `src/ml/` (feature factory + trainers), `src/core/retrainer.py` (The Cure — the forex/equities retrainer), `src/core/notification_manager.py`, `src/execution/risk_manager.py`, `src/data/factory.py`.
 
 ---
 
-## 1. The Engine (V5 OANDA Forex Scalper)
+## 1. The Engine (V5 OANDA Forex Bot)
 
 The live intraday bot. A lean async loop wiring `OandaMarketProvider → MLStrategy → OandaOrderManager` with an embedded software SL/TP watchdog and a dynamic chop filter.
 
@@ -74,7 +74,7 @@ OANDA_MODEL_DIR=models/forex_m15 python3 run_oanda.py --granularity 15
 bash run_soak.sh "" 15                      # daemonized M15 soak (see §9)
 ```
 
-### `src/execution/oanda_scalper_orchestrator.py` → `OandaScalperOrchestrator`
+### `src/execution/oanda_forex_orchestrator.py` → `OandaForexOrchestrator`
 
 The async daemon. One event loop owns the bar path (ML inference), the tick dispatch (watchdog), and graceful shutdown.
 
@@ -142,7 +142,7 @@ The brain. Since V3.4 this was refactored from a monolithic `FeatureEngineer` in
 | `feature_pipeline.py` → `FeaturePipeline` | Composes an ordered list of feature generators into one DataFrame pass. **Single source of truth** shared by training and inference (zero skew). |
 | `features/v3_features.py` | `V3BaseFeatures` (RSI/PPO/BBands/NATR + derived + microstructure), `V3SessionFeatures` (time-of-day / session), `V3HTFFeatures` (higher-timeframe resample with lookahead-safe `join_asof`). |
 | `targets/v3_targets.py` → `V3DirectionalTarget` | Forward-looking directional label generator. |
-| `trainers/v3_rf_trainer.py` → `V3RandomForestTrainer` | Reference sklearn RandomForest trainer for the SDK/factory path. *(The production scalper retrainer builds LightGBM directly — see §5.)* |
+| `trainers/v3_rf_trainer.py` → `V3RandomForestTrainer` | Reference sklearn RandomForest trainer for the SDK/factory path. *(The production retrainer builds LightGBM directly — see §5.)* |
 | `regimes/hmm_regime.py` | Optional HMM regime features (experiment; loaded only if the model's schema references HMM columns). |
 
 ### `src/strategies/concrete_strategies/ml_strategy.py` → `MLStrategy`
@@ -178,14 +178,14 @@ Net-position order manager for OANDA v20.
 
 Broker-agnostic bracket calculator **and** the dynamic chop filter. `calculate_bracket(entry, raw_sl_distance, symbol, spread, spread_fresh, regime_series, timestamp)` returns `(sl_dist, tp_dist)` or `None` (vetoed).
 
-**`RiskProfile.for_asset_class("forex")`** — the profile the scalper runs with:
+**`RiskProfile.for_asset_class("forex")`** — the profile the forex bot runs with:
 
 | Field | Forex value | Meaning |
 |---|---|---|
-| `sl_atr_multiplier` / `tp_atr_multiplier` | 1.0 / 2.0 | Bracket sizing off signal ATR. |
+| `sl_atr_multiplier` / `tp_atr_multiplier` | 2.0 / 4.0 | Bracket sizing off signal ATR. Doubled 2026-08-08 to dilute the spread toll; the 2:1 payoff is unchanged. |
 | `min_sl_pips` | 2.0 | Absolute FX stop floor (`RISK_FOREX_MIN_SL_PIPS`). |
 | `min_sl_pct_metals` | 0.0001 | Metals (XAU/XAG…) stop floor as % of price. |
-| `spread_k_base` | 1.5 | **Gate A** (cost): `sl_dist ≥ k_eff × spread`. |
+| `spread_k_base` | 3.0 | **Gate A** (cost): `sl_dist ≥ k_eff × spread`. Equivalently a toll cap — the spread may eat at most `1/k` (33%) of the stop. Was 1.5 (67%) until 2026-08-08. |
 | `spread_k_coupling` / `_mode` | 0.0 / `tighten` | Optional vol-coupling of `k_eff` (`coupled_keff`). 0.0 = flat k. |
 | `regime_pctile` / `regime_window` / `regime_min_samples` | 20.0 / 260 / 60 | **Gate B** (regime): veto the bottom P% of the rolling volatility distribution; bypassed until `min_samples` bars exist. |
 | `spread_atr_alpha` | 0.15 | Proxy spread (= α × baseline ATR) for training/stale-fallback; **the target of soak calibration**. |
@@ -209,7 +209,7 @@ On a veto the orchestrator increments the matching per-gate counter and logs the
 
 ### `src/core/retrainer.py` — "The Cure V2"
 
-The scalper retrainer. Fetches fresh data, engineers ATR-dynamic labels, runs a **3-fold walk-forward validation gate**, and only promotes models that prove profitable across chronological regimes. **Builds LightGBM boosters** (`import lightgbm as lgb`; translated from RandomForest on 2026-05-23).
+The forex bot's retrainer. Fetches fresh data, engineers ATR-dynamic labels, runs a **3-fold walk-forward validation gate**, and only promotes models that prove profitable across chronological regimes. **Builds LightGBM boosters** (`import lightgbm as lgb`; translated from RandomForest on 2026-05-23).
 
 **Asset-class routing** — `get_asset_config(DATA_SOURCE)`:
 
@@ -233,7 +233,7 @@ The scalper retrainer. Fetches fresh data, engineers ATR-dynamic labels, runs a 
 
 ## 6. The Long-Haul Truck (V4 Equities Investor)
 
-A completely separate product: a **monthly** cross-sectional stock ranker on Alpaca paper. Where the scalper snipes intraday moves, the investor holds a diversified basket for a month.
+A completely separate product: a **monthly** cross-sectional stock ranker on Alpaca paper. Where the forex bot trades intraday moves, the investor holds a diversified basket for a month.
 
 ### `scripts/portfolio_orchestrator.py` — The rebalancer
 
@@ -292,7 +292,7 @@ Model artifact `models/v4_investor_lgbm.txt` + `.metadata.json` are **gitignored
 
 ### `src/core/notification_manager.py` → `NotificationManager`
 
-Discord webhook (silent no-op when `DISCORD_WEBHOOK_URL` unset). Synchronous `requests.post`; on the scalper loop it's always fired via `_notify()` → executor so posts never stall bar processing.
+Discord webhook (silent no-op when `DISCORD_WEBHOOK_URL` unset). Synchronous `requests.post`; on the forex bot loop it's always fired via `_notify()` → executor so posts never stall bar processing.
 
 | Method | Use |
 |---|---|
@@ -312,7 +312,7 @@ Discord webhook (silent no-op when `DISCORD_WEBHOOK_URL` unset). Synchronous `re
 
 | File | System | Status | Usage |
 |---|---|---|---|
-| `run_oanda.py` | V5 Forex Scalper | **Live** | `python3 run_oanda.py [--granularity N] [--daemon]` |
+| `run_oanda.py` | V5 Forex Bot | **Live** | `python3 run_oanda.py [--granularity N] [--daemon]` |
 | `run_soak.sh` | V5 soak wrapper | **Live** | `bash run_soak.sh [SYMBOLS] [GRANULARITY]` — daemonizes on the practice account, logs `logs/soak_<ts>.log`, PID in `/tmp/soak.pid`, flattens on SIGTERM. Collects `SPREAD_CALIB`. |
 | `scripts/portfolio_orchestrator.py` | V4 Investor | **Live (paper)** | `[--dry-run] [--skip-refresh]` |
 | `run_investor_rebalance.sh` | V4 wrapper | **Live (paper)** | Sources `.env`, sets `PYTHONPATH`, absolute venv python, logs `logs/investor_rebalance_<ts>.log`. |
@@ -326,7 +326,7 @@ Discord webhook (silent no-op when `DISCORD_WEBHOOK_URL` unset). Synchronous `re
 ```
 16:30 PT on the 1st of each month → live paper rebalance. Absolute path is mandatory (cron has no working directory). See `INVESTOR_SCHEDULE.md`.
 
-The forex scalper is **not** cron'd — it's a long-running daemon launched by hand via `run_soak.sh` (or a promoted live launch).
+The forex bot is **not** cron'd — it's a long-running daemon launched by hand via `run_soak.sh` (or a promoted live launch).
 
 ### Retrain / soak knobs (env)
 `OANDA_MODEL_DIR` (run side) ↔ `RETRAIN_MODEL_DIR` (train side) isolate side models. `RISK_*` tune the chop filter. `FUNDAMENTAL_SOURCES` / `DATA_SOURCE` route data. `OANDA_UNITS`, `OANDA_ENV`, `SOAK_GRANULARITY`.
@@ -342,7 +342,7 @@ Still in the tree, **not** the live system. Kept for reference / potential reuse
 | `src/execution/live_orchestrator.py` | V3.4 Alpaca dual-stream equities/crypto scalper (SymbolState, HTFCache, universal watchdog, Rich dashboard). | **Superseded** by the OANDA orchestrator as the live intraday bot. |
 | `run_live.py`, `main.py`, `src/main.py` | V3.4 / Gen-1/2 Alpaca launchers. | Deprecated. |
 | `src/core/trading_bot.py`, `order_management.py` | Gen-1 `TradingBot` / `OrderManager`. | Legacy. `OrderParams` still referenced only by old comments. |
-| `src/day_trading/` (+ `models/dt_*.pkl`) | "Universal Scalper V4.0" 5-minute day-trade experiment (separate Angel/Devil). | Dormant experiment. |
+| `src/day_trading/` (+ `models/dt_*.pkl`) | "Intraday Trend Engine V4.0" 5-minute day-trade experiment (separate Angel/Devil). | Dormant experiment. |
 | `run_pipeline.sh` + `src/replay_test.py`, `evaluate_performance.py`, `data/harvester.py`, `core/resolver.py`, `feedback_loop.py`, `analysis/reinforcement_voter.py` | The Alpaca OOS replay → drift → retrain pipeline. | Mixed: `feedback_loop`/`retrainer` concepts live on; the Alpaca replay harness itself is dormant. |
 | `src/utils/bar_aggregator.py` → `LiveBarAggregator` | Clock-aware aggregator for the Alpaca stack. | Legacy (OANDA provider seals its own bars). |
 | `backtest_60.py`, `chop_ab_test.py`, `run_chop_ab.sh` | Ad-hoc analysis scripts. | Occasional/manual. |
@@ -356,7 +356,7 @@ Still in the tree, **not** the live system. Kept for reference / potential reuse
 ### Root
 | File | Category |
 |---|---|
-| `run_oanda.py` | **V5 forex scalper launcher** |
+| `run_oanda.py` | **V5 forex bot launcher** |
 | `run_soak.sh` | V5 practice soak wrapper |
 | `run_investor_rebalance.sh` | **V4 investor launcher** |
 | `trading_mcp.py` | Trading MCP server |
@@ -377,7 +377,7 @@ Still in the tree, **not** the live system. Kept for reference / potential reuse
 ### `src/execution/`
 | File | Category |
 |---|---|
-| `oanda_scalper_orchestrator.py` | **V5 live daemon** |
+| `oanda_forex_orchestrator.py` | **V5 live daemon** |
 | `oanda_order_manager.py` | OANDA net-position order manager |
 | `risk_manager.py` | Bracket calculator + dynamic chop filter (Gates A/B/C) |
 | `factory_orchestrator.py` | Broker-agnostic SDK orchestrator (factory path) |
@@ -398,7 +398,7 @@ Still in the tree, **not** the live system. Kept for reference / potential reuse
 ### `src/core/`
 | File | Category |
 |---|---|
-| `retrainer.py` | **The Cure V2** — LightGBM scalper retrainer + gate |
+| `retrainer.py` | **The Cure V2** — LightGBM forex/equities retrainer + gate |
 | `notification_manager.py` | Discord notifications |
 | `signal.py` | `Signal` / `SignalType` |
 | `feedback_loop.py`, `resolver.py`, `ws_stream_simulator.py` | Legacy OOS pipeline pieces |
@@ -425,7 +425,7 @@ Still in the tree, **not** the live system. Kept for reference / potential reuse
 ### `models/`
 | Path | Category |
 |---|---|
-| `forex/` | **Promoted V5 scalper** — `angel_latest.pkl`, `devil_latest.pkl`, `metadata.json`, `threshold.json` |
+| `forex/` | **Promoted V5 forex bot** — `angel_latest.pkl`, `devil_latest.pkl`, `metadata.json`, `threshold.json` |
 | `forex_m15/` | M15 candidate (gitignored, staged) |
 | `v4_investor_lgbm.txt` (+ `.metadata.json`) | **V4 investor ranker** (gitignored) |
 | `forex_swing/`, `dt_*.pkl` | Dormant experiments |
@@ -438,7 +438,7 @@ Still in the tree, **not** the live system. Kept for reference / potential reuse
 
 | System | State |
 |---|---|
-| **V5 Forex Scalper** | **Soaking** on the practice account since 2026-07-02 — M15 candidate promoted via `OANDA_MODEL_DIR=models/forex_m15`, full trained basket, `--granularity 15`, daemon (PID in `/tmp/soak.pid`, log `logs/soak_2026-07-02_0215.log`). Heartbeats are sparse (~hours); may hold positions overnight/weekends. **Verify alive** (`ps`, PID, log mtime) before claiming it's running. |
+| **V5 Forex Bot** | **Soaking** on the practice account since 2026-07-02 — M15 candidate promoted via `OANDA_MODEL_DIR=models/forex_m15`, full trained basket, `--granularity 15`, daemon (PID in `/tmp/soak.pid`, log `logs/soak_2026-07-02_0215.log`). Heartbeats are sparse (~hours); may hold positions overnight/weekends. **Verify alive** (`ps`, PID, log mtime) before claiming it's running. |
 | **V4 Investor** | **Live on paper.** Diversified top-8 sector-capped basket committed `1b6f72e`; monthly cron installed (`30 16 1 * *`). Rebalance orders queue when markets are closed and fill at the next open. |
 | **Git** | Local `main` is ahead of `origin/main` (unpushed by operator choice). Stale remote branches pruned 2026-07-04; `main` is the only remote branch. |
 

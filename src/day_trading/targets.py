@@ -1,6 +1,6 @@
 """
 src/day_trading/targets.py
-Target Labeling — Universal Scalper V4.0
+Target Labeling — Intraday Trend Engine V4.0
 
 Implements the End-of-Day (EOD) Angel/Devil meta-labeling targets.
 

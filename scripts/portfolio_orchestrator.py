@@ -37,7 +37,7 @@ Cron (monthly, first day of month, 16:30 ET — after close):
 
 Step 4 (final) of the V4 Investor, and the only part that places real orders.
 Runs once a month from cron: refresh data, rebuild features, rank, then move
-the account to the target basket. Unlike the scalper this holds positions for
+the account to the target basket. Unlike the forex bot this holds positions for
 weeks and never watches a tick.
 
 Glossary:

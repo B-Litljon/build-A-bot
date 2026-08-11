@@ -18,7 +18,7 @@ See the root [GLOSSARY.md](../GLOSSARY.md) for domain terms.
 
 ## 1. The V4 Investor — monthly stock ranker
 
-A separate product from the forex scalper, sharing almost nothing but the repo.
+A separate product from the forex bot, sharing almost nothing but the repo.
 Pipeline:
 
 ```
@@ -159,7 +159,7 @@ placeholder assumption (0.15) with measured reality.
 > size, so alphas measured on 15-minute bars are **not valid** for 1-minute
 > bars. It's recorded in the output and the retrainer warns loudly on mismatch.
 
-- **Imports from repo:** `execution.oanda_scalper_orchestrator`.
+- **Imports from repo:** `execution.oanda_forex_orchestrator`.
 - **Reads:** a soak log. **Writes:** a spread-table JSON (e.g.
   `config/spread_alphas_m15.json`), consumed via `RETRAIN_SPREAD_TABLE`.
 

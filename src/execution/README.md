@@ -9,7 +9,7 @@ which is the main thing to get straight before reading any of it:
 
 | File | Market | Status |
 |---|---|---|
-| `oanda_scalper_orchestrator.py` | OANDA forex | ⚠️ **currently running live** (M15 practice soak) |
+| `oanda_forex_orchestrator.py` | OANDA forex | ⚠️ **currently running live** (M15 practice soak) |
 | `live_orchestrator.py` | Alpaca equities + crypto | Working, tested, not the live bot |
 | `factory_orchestrator.py` | Alpaca (Factory path) | Smallest/clearest; good place to start reading |
 
@@ -61,15 +61,15 @@ Note the forex profile overrides the bracket multipliers to **1.0× / 2.0×**
 
 - **Imports from repo:** none (numpy only — deliberately dependency-light).
 - **Imported by:** `src/core/retrainer.py`, `factory_orchestrator.py`,
-  `oanda_scalper_orchestrator.py`, `__init__.py`, `run_factory.py`,
+  `oanda_forex_orchestrator.py`, `__init__.py`, `run_factory.py`,
   `run_oanda.py`, `chop_ab_test.py`, `scripts/generate_feature_stats.py`,
   `scripts/run_paper_live.py`, `scripts/smoke_test.py`,
   `tests/test_risk_manager.py`, `tests/test_cost_feature.py`.
 - **Data artifacts:** none directly; reads per-instrument costs passed in from
   the model dir's `spread_alphas.json`.
 
-### `oanda_scalper_orchestrator.py` (1621 lines) — ⚠️ the live bot
-`OandaScalperOrchestrator`. Two clocks run at once, and most of the design
+### `oanda_forex_orchestrator.py` (1621 lines) — ⚠️ the live bot
+`OandaForexOrchestrator`. Two clocks run at once, and most of the design
 follows from that:
 
 - **Slow path** — a bar seals, features are computed, the model is asked, a
@@ -132,7 +132,7 @@ Things worth knowing:
   `execution.oanda_order_manager`, `execution.risk_manager`,
   `strategies.concrete_strategies.ml_strategy`.
 - **Imported by:** `run_oanda.py`, `scripts/bake_spread_alphas.py`,
-  `tests/test_oanda_scalper.py`, `tests/test_stream_liveness.py`,
+  `tests/test_oanda_forex.py`, `tests/test_stream_liveness.py`,
   `tests/test_entry_guards.py`.
 - **Data artifacts:** none written directly; logs to `logs/soak_*.log`.
 
@@ -149,8 +149,8 @@ than "buy N", which is what makes a retry after an ambiguous network failure
 safe.
 
 - **Imports from repo:** none (oandapyV20 only).
-- **Imported by:** `oanda_scalper_orchestrator.py`, `run_oanda.py`,
-  `tests/test_oanda_entry.py`, `tests/test_oanda_scalper.py`,
+- **Imported by:** `oanda_forex_orchestrator.py`, `run_oanda.py`,
+  `tests/test_oanda_entry.py`, `tests/test_oanda_forex.py`,
   `tests/test_execution_safety.py`.
 
 ### `live_orchestrator.py` (2475 lines) — Alpaca dual-stream
@@ -204,6 +204,6 @@ The live paths use market orders only.
 
 ### `__init__.py`
 Exports only `FactoryOrchestrator` and `RiskManager`. Both `LiveOrchestrator`
-and `OandaScalperOrchestrator` are **intentionally excluded** so importing this
+and `OandaForexOrchestrator` are **intentionally excluded** so importing this
 package doesn't pull in the heavy orchestrators; entry-point scripts import them
 by path.

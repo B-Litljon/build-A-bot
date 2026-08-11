@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 """
-Tests for OandaScalperOrchestrator -- the live forex bot's control flow.
+Tests for OandaForexOrchestrator -- the live forex bot's control flow.
 
 The largest test file here, and it concentrates on the failure paths rather than
 the happy path, because with software-enforced stops the dangerous states are
@@ -73,7 +73,7 @@ sys.path.insert(0, str(project_root))
 
 import polars as pl
 
-from src.execution.oanda_scalper_orchestrator import OandaScalperOrchestrator
+from src.execution.oanda_forex_orchestrator import OandaForexOrchestrator
 from src.execution.oanda_order_manager import OrderCloseError
 
 
@@ -89,8 +89,8 @@ class FakeSignal:
         self.metadata = {}
 
 
-class TestOandaScalperOrchestrator(unittest.TestCase):
-    """Mocked unit tests for the V5 scalper orchestrator."""
+class TestOandaForexOrchestrator(unittest.TestCase):
+    """Mocked unit tests for the V5 forex bot orchestrator."""
 
     def _make_orchestrator(self, **overrides):
         """Build an orchestrator with all dependencies mocked."""
@@ -103,7 +103,7 @@ class TestOandaScalperOrchestrator(unittest.TestCase):
         order_manager = MagicMock()
         risk_manager = MagicMock()
 
-        orch = OandaScalperOrchestrator(
+        orch = OandaForexOrchestrator(
             symbols=["EUR/USD"],
             provider=provider,
             strategy=strategy,
@@ -754,7 +754,7 @@ class TestQuietTickPath(unittest.TestCase):
     """
 
     def _orch_with_open_long(self):
-        holder = TestOandaScalperOrchestrator()
+        holder = TestOandaForexOrchestrator()
         orch, _, _, _, _ = holder._make_orchestrator()
         orch._positions["EUR_USD"] = {
             "entry": 1.08500,
@@ -819,7 +819,7 @@ class TestUntradeableSymbolFilter(unittest.TestCase):
     """
 
     def _orch(self, symbols):
-        holder = TestOandaScalperOrchestrator()
+        holder = TestOandaForexOrchestrator()
         orch, provider, _, _, _ = holder._make_orchestrator()
         orch._symbols = list(symbols)
         return orch, provider

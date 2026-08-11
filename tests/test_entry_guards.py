@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 """
-Tests for the scalper's two entry guards -- post-exit cooldown and the
+Tests for the forex bot's two entry guards -- post-exit cooldown and the
 correlated-exposure cap.
 
 Both exist because of one morning: on 2026-07-30 the bot opened long GBP_JPY,
@@ -49,7 +49,7 @@ project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root / "src"))
 sys.path.insert(0, str(project_root))
 
-from src.execution.oanda_scalper_orchestrator import OandaScalperOrchestrator
+from src.execution.oanda_forex_orchestrator import OandaForexOrchestrator
 
 
 class FakeSignal:
@@ -77,7 +77,7 @@ def _bar(symbol, i):
 
 
 class TestEntryGuards(unittest.TestCase):
-    """Cooldown + correlated-exposure cap on the OANDA scalper path."""
+    """Cooldown + correlated-exposure cap on the OANDA forex bot path."""
 
     def _make_orchestrator(self, symbols=None, **overrides):
         provider = MagicMock()
@@ -87,7 +87,7 @@ class TestEntryGuards(unittest.TestCase):
         order_manager = MagicMock()
         risk_manager = MagicMock()
 
-        orch = OandaScalperOrchestrator(
+        orch = OandaForexOrchestrator(
             symbols=symbols or ["GBP_JPY", "AUD_JPY", "NZD_JPY"],
             provider=provider,
             strategy=strategy,

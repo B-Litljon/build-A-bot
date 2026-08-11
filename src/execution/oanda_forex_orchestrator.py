@@ -1,5 +1,5 @@
 """
-OANDA Scalper Orchestrator — V5 Forex Pivot.
+OANDA Forex Orchestrator — V5 Forex Pivot.
 
 Lean async loop wiring OandaMarketProvider → MLStrategy → OandaOrderManager
 with an embedded software SL/TP watchdog.
@@ -198,9 +198,9 @@ from strategies.concrete_strategies.ml_strategy import MLStrategy
 logger = logging.getLogger(__name__)
 
 
-class OandaScalperOrchestrator:
+class OandaForexOrchestrator:
     """
-    Async scalper orchestrator for OANDA v20 forex.
+    Async orchestrator for OANDA v20 forex.
 
     Parameters
     ----------
@@ -1768,7 +1768,7 @@ class OandaScalperOrchestrator:
         self._liveness_task = asyncio.create_task(self._liveness_watchdog())
 
         logger.info(
-            "OandaScalperOrchestrator started | symbols=%s warmup=%d",
+            "OandaForexOrchestrator started | symbols=%s warmup=%d",
             self._symbols,
             self._warmup,
         )
@@ -1778,7 +1778,7 @@ class OandaScalperOrchestrator:
 
     async def shutdown(self) -> None:
         """Graceful shutdown: stop stream, flatten if configured."""
-        logger.info("OandaScalperOrchestrator shutting down...")
+        logger.info("OandaForexOrchestrator shutting down...")
 
         # Final spread-calibration dump (durable even if flatten hangs below).
         self._log_spread_calibration()
@@ -1805,7 +1805,7 @@ class OandaScalperOrchestrator:
         if self._flatten_on_exit:
             await self._flatten_all()
 
-        logger.info("OandaScalperOrchestrator shutdown complete.")
+        logger.info("OandaForexOrchestrator shutdown complete.")
 
     async def _flatten_all(self) -> None:
         """Close all open positions on exit."""

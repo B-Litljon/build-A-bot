@@ -28,7 +28,7 @@ Output:
     models/v4_investor_lgbm.txt   (LightGBM native text format)
 
 Step 3 of the V4 Investor, with its own promotion gate -- structurally the same
-idea as the scalper's retrainer, but scored on RANKING quality rather than
+idea as the forex bot's retrainer, but scored on RANKING quality rather than
 profit factor.
 
 Glossary:

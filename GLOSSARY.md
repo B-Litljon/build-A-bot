@@ -25,7 +25,7 @@ that no longer exist: `src/core/trading_bot.py`, `main.py`, `src/main.py`.)
 
 Two live products share this repo, plus a lot of scaffolding around them:
 
-- **V5 OANDA forex scalper** — the intraday bot. Trades currency pairs and
+- **V5 OANDA forex bot** — the intraday bot. Trades currency pairs and
   metals on OANDA, decides on each sealed bar, enforces its own stops in
   software. *Currently running* as a practice-account soak
   (`run_oanda.py --daemon --env practice --granularity 15`, kept alive by
@@ -152,7 +152,7 @@ first live decision. 260 bars is the usual figure (a 50-period average on
 
 **history seam** — the junction where replayed warm-up history meets the live
 stream. They overlap in time, so the orchestrator tracks where history ended to
-avoid double-counting. *(`oanda_scalper_orchestrator.py`)*
+avoid double-counting. *(`oanda_forex_orchestrator.py`)*
 
 **window floor** — rounding a timestamp down to its clock window (12:34 → 12:30
 for 5-minute bars), so bars align to the wall clock rather than to whenever data
@@ -275,7 +275,7 @@ Distinct from the gates above: the gates ask "is this trade worth its cost?",
 these ask "should we be taking *this* trade *now*, given what we just did and
 what we already hold?" They live in the orchestrator, not the RiskManager, and
 have no training-side mirror — they constrain sequencing and concentration,
-not the merit of a setup. *(`src/execution/oanda_scalper_orchestrator.py`,
+not the merit of a setup. *(`src/execution/oanda_forex_orchestrator.py`,
 both added 2026-07-30)*
 
 **post-exit cooldown** — a symbol cannot be re-entered for a set window after
@@ -498,6 +498,6 @@ Under `data/`:
 ## Discord personas
 
 Alerts are tagged by sender so the source is obvious at a glance:
-**Build-A-Bot Executive** (Alpaca path), **Build-A-Bot V5 Scalper** (OANDA
+**Build-A-Bot Executive** (Alpaca path), **Build-A-Bot V5 Forex** (OANDA
 path), **The Accountant** (retraining verdicts and drift alerts).
 *(`src/core/notification_manager.py`)*

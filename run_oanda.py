@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-run_oanda.py — V5 OANDA Forex Scalper Launcher
+run_oanda.py — V5 OANDA Forex Bot Launcher
 ===============================================
 
-Root-level entry point for the V5 Angel/Devil meta-labeling scalper on
+Root-level entry point for the V5 Angel/Devil meta-labeling forex bot on
 OANDA v20 forex.  Controls sys.path injection, then constructs and runs
-the :class:`OandaScalperOrchestrator`.
+the :class:`OandaForexOrchestrator`.
 
 Usage:
     python3 run_oanda.py                      # default EUR/USD
@@ -60,8 +60,8 @@ if str(_SRC_DIR) not in sys.path:
 from core import events  # noqa: E402
 from data.oanda_provider import OandaMarketProvider  # noqa: E402
 from execution.oanda_order_manager import OandaOrderManager  # noqa: E402
-from execution.oanda_scalper_orchestrator import (  # noqa: E402
-    OandaScalperOrchestrator,
+from execution.oanda_forex_orchestrator import (  # noqa: E402
+    OandaForexOrchestrator,
 )
 from execution.risk_manager import RiskManager, RiskProfile  # noqa: E402
 from strategies.concrete_strategies.ml_strategy import MLStrategy  # noqa: E402
@@ -121,7 +121,7 @@ def _trained_timeframe() -> int | None:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="run_oanda.py",
-        description="V5 OANDA Forex Scalper — Angel/Devil Meta-Labeling",
+        description="V5 OANDA Forex Bot — Angel/Devil Meta-Labeling",
     )
     parser.add_argument(
         "--symbols",
@@ -253,7 +253,7 @@ async def _main() -> None:
     )
     risk_manager = RiskManager(profile=risk_profile, alpha_overrides=alpha_overrides)
 
-    orchestrator = OandaScalperOrchestrator(
+    orchestrator = OandaForexOrchestrator(
         symbols=symbols,
         provider=provider,
         strategy=strategy,
@@ -263,7 +263,7 @@ async def _main() -> None:
         flatten_on_exit=not args.no_flatten,
     )
 
-    logger.info("--- V5 OANDA Scalper Booting | env=%s symbols=%s ---", args.env, symbols)
+    logger.info("--- V5 OANDA Forex Bot Booting | env=%s symbols=%s ---", args.env, symbols)
     await orchestrator.run()
 
 

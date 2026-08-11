@@ -37,7 +37,7 @@ See the root [GLOSSARY.md](../GLOSSARY.md) for domain terms.
 |---|---:|---|
 | `test_composite_fundamentals.py` | 18 | Provider chaining: first non-empty wins; a raising source is a miss, not an error |
 | `test_risk_manager.py` | 16 | The bracket floors and all three chop gates |
-| `test_oanda_scalper.py` | 31 | The live bot's control flow — mostly failure paths |
+| `test_oanda_forex.py` | 31 | The live bot's control flow — mostly failure paths |
 | `test_feature_stats.py` | 12 | The stats artifact and the PSI maths |
 | `test_stream_liveness.py` | 9 | What happens when the price feed goes silent |
 | `test_entry_guards.py` | 15 | Post-exit cooldown + the correlated-exposure cap |
@@ -60,7 +60,7 @@ trades the system was built to refuse. Note `test_cold_start_bypasses_regime_gat
 with too little history the regime gate must stand down rather than veto
 everything, or a just-restarted bot freezes.
 
-**`test_oanda_scalper.py`** — the failure-path collection.
+**`test_oanda_forex.py`** — the failure-path collection.
 `test_rapid_breach_ticks_close_once` (quotes arrive far faster than a close
 completes, so a burst must produce *one* close),
 `test_close_not_called_synchronously_in_tick` (the tick callback runs on the

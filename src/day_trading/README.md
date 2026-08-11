@@ -1,4 +1,4 @@
-# `src/day_trading` — "Universal Scalper V4.0"
+# `src/day_trading` — "Intraday Trend Engine V4.0"
 
 A **self-contained, dormant experiment**: a separate Angel/Devil model that
 trades 5-minute bars and closes everything by the end of the day. It is *not*
@@ -11,7 +11,7 @@ mechanism that lets it coexist with the live system without any chance of
 overwriting a production model or dataset. Listed under "The Boneyard" in
 [`table-o-content.md`](../../table-o-content.md).
 
-## What makes it different from the main scalper
+## What makes it different from the forex bot
 
 Two ideas drive nearly every design choice here:
 

@@ -10,7 +10,7 @@ Concrete implementations:
   - CompositeFundamentalProvider (src/data/providers/composite_fundamentals.py)
 
 Company financials, used by the monthly equities investor to rank stocks.
-The forex scalper never touches this.
+The forex bot never touches this.
 
 Glossary:
     FundamentalProvider -- the contract for any source of company financials.

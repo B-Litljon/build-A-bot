@@ -78,7 +78,7 @@ primitives, because that path uses the *other* `Signal` class).
 - **Imports from repo:** `core.signal` — lazily, inside the method, so the
   offline pipeline can import this module without pulling in live-trading code.
 - **Imported by:** `src/execution/live_orchestrator.py`,
-  `src/execution/oanda_scalper_orchestrator.py`,
+  `src/execution/oanda_forex_orchestrator.py`,
   `src/strategies/concrete_strategies/ml_strategy.py`,
   `src/core/feedback_loop.py`.
 - **Data artifacts:** none (HTTP only).
@@ -135,7 +135,7 @@ importing a strategy in a test or a backtest cannot append to the live bot's
 logs. `run_oanda.py` calls it at startup; `EVENTS_ENABLED=0` is the off switch.
 
 - **Imports from repo:** none (stdlib only).
-- **Imported by:** `execution/oanda_scalper_orchestrator.py`,
+- **Imported by:** `execution/oanda_forex_orchestrator.py`,
   `strategies/concrete_strategies/ml_strategy.py`, `run_oanda.py`,
   `tests/test_events.py`.
 - **Data artifacts:** writes `logs/events-*.jsonl` and `logs/status.json`

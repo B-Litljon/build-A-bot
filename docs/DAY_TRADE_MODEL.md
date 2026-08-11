@@ -1,5 +1,5 @@
 # Day Trading Model Specification
-## Universal Scalper V4.0 — Intraday Trend Engine
+## Intraday Trend Engine V4.0 — Intraday Trend Engine
 
 **Authored:** 2026-04-19
 **Base System:** Universal Scalper V3.4 (Angel/Devil Meta-Labeling)
@@ -48,7 +48,7 @@ Both are saved to `data/raw/` as Parquet files. The daily bars are fetched with 
 ```python
 """
 src/data/harvester_5m.py
-Day Trade Dataset Harvester — Universal Scalper V4.0
+Day Trade Dataset Harvester — Intraday Trend Engine V4.0
 
 Fetches:
   1. 5-minute OHLCV bars for the day trading universe → data/raw/{SYMBOL}_5min.parquet
@@ -192,7 +192,7 @@ def harvest(symbols: List[str] = DAY_TRADE_UNIVERSE) -> None:
     start_daily = end_date - timedelta(days=DAYS_BACK + DAILY_EXTRA_HISTORY)
 
     logger.info("=" * 70)
-    logger.info("DAY TRADE HARVESTER — Universal Scalper V4.0")
+    logger.info("DAY TRADE HARVESTER — Intraday Trend Engine V4.0")
     logger.info("=" * 70)
     logger.info("Universe : %s", ", ".join(symbols))
     logger.info("5m window: %s → %s", start_5min.date(), end_date.date())
@@ -345,7 +345,7 @@ session_progress[i] = clamp(
 ```python
 """
 src/ml/features/day_trade_features.py
-Day Trade Feature Engineering — Universal Scalper V4.0
+Day Trade Feature Engineering — Intraday Trend Engine V4.0
 
 Three composable BaseFeatureGenerator subclasses:
 
@@ -883,7 +883,7 @@ where:
 ```python
 """
 src/ml/targets/day_trade_targets.py
-Day Trade Target Labeling — Universal Scalper V4.0
+Day Trade Target Labeling — Intraday Trend Engine V4.0
 
 Implements the End-of-Day (EOD) Angel/Devil target architecture:
 
@@ -1165,4 +1165,4 @@ A separate `DayTradeOrchestrator` (or a `mode` parameter on `LiveOrchestrator`) 
 
 ---
 
-*Day Trade Model Specification — Universal Scalper V4.0 — Generated 2026-04-19*
+*Day Trade Model Specification — Intraday Trend Engine V4.0 — Generated 2026-04-19*

@@ -41,7 +41,7 @@ Glossary:
     hit_level -- "TP" or "SL" — which bracket was breached, shown with emoji.
     username -- the Discord display name, used as a crude persona tag so the
         source is obvious at a glance: "Build-A-Bot Executive" (Alpaca),
-        "Build-A-Bot V5 Scalper" (OANDA), "The Accountant" (retraining and
+        "Build-A-Bot V5 Forex" (OANDA), "The Accountant" (retraining and
         drift).
     color -- Discord embed sidebar colour as an integer: 0x00FF00 green (long /
         promoted), 0xFF0000 red (short / rejected / critical), 0x00A2FF blue
@@ -159,7 +159,7 @@ class NotificationManager:
         hit_level: Optional[str] = None,
     ) -> None:
         """
-        Discord alert for the OANDA scalper path.
+        Discord alert for the OANDA forex bot path.
 
         Decoupled from core.signal.Signal because the V5 forex strategy
         emits a different Signal shape (strategies.base.Signal). Accepts
@@ -171,10 +171,10 @@ class NotificationManager:
         is_long = direction.lower() == "long"
         if action == "ENTRY":
             emoji = "📈" if is_long else "📉"
-            title = f"{emoji} OANDA SCALPER ENTRY: {direction.upper()} {symbol}"
+            title = f"{emoji} OANDA FOREX ENTRY: {direction.upper()} {symbol}"
             color = 0x00FF00 if is_long else 0xFF0000
         else:
-            title = f"🏁 OANDA SCALPER {action}: {symbol}"
+            title = f"🏁 OANDA FOREX {action}: {symbol}"
             color = 0x00A2FF
 
         if close_price is not None:
@@ -200,7 +200,7 @@ class NotificationManager:
             description += f"\n📝 **Reason:** {reason}\n"
 
         payload = {
-            "username": "Build-A-Bot V5 Scalper",
+            "username": "Build-A-Bot V5 Forex",
             "embeds": [
                 {
                     "title": title,

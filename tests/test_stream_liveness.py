@@ -40,7 +40,7 @@ project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root / "src"))
 sys.path.insert(0, str(project_root))
 
-from src.execution.oanda_scalper_orchestrator import OandaScalperOrchestrator
+from src.execution.oanda_forex_orchestrator import OandaForexOrchestrator
 from src.data.oanda_provider import OandaMarketProvider
 
 
@@ -53,7 +53,7 @@ class TestStreamLiveness(unittest.TestCase):
         strategy.warmup_period = 3
         order_manager = MagicMock()
 
-        orch = OandaScalperOrchestrator(
+        orch = OandaForexOrchestrator(
             symbols=["EUR/USD"],
             provider=provider,
             strategy=strategy,

@@ -2,7 +2,7 @@
 
 Adapters for **company fundamentals** and **macroeconomic series** — the slow,
 descriptive data used by the monthly equities investor to rank stocks. The
-forex scalper never reads any of this.
+forex bot never reads any of this.
 
 Everything here implements a contract defined one level up (`FundamentalProvider`
 in [`../fundamentals.py`](../fundamentals.py), `MacroProvider` in
