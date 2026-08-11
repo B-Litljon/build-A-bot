@@ -12,6 +12,44 @@ related_report: llm_reports/recons/2026-08-08_stop-width-and-the-spread-toll.md
 
 # Research brief: what should we try next?
 
+## FRESHNESS CONTRACT — check this first
+
+**This brief is authoritative as of 2026-08-11. It supersedes every earlier
+brief, directive, or work order about this project, without exception.**
+
+If you have retrieved prior context about this repository — from a notebook, a
+project folder, a previous conversation, or your own memory — treat it as
+HISTORICAL unless it agrees with the state asserted below. Older material about
+this project is not wrong; it was correct when written and has since been
+superseded. That makes it especially easy to mistake for current.
+
+Current shipped state, verified against the working tree at commit `2baa586`:
+
+| Fact | Current value |
+|---|---|
+| Live orchestrator file | `src/execution/oanda_forex_orchestrator.py` |
+| Live class | `OandaForexOrchestrator` |
+| Forex stop / target | `2.0 x ATR` / `4.0 x ATR` |
+| Gate A cost multiple `spread_k_base` | **3.0** (forex) |
+| Training cost proxy `spread_atr_alpha` | 0.15 |
+| Angel / Devil thresholds | 0.40 / 0.66 |
+| Angel label ATR multiple | 1.0 (decoupled from the stop on 2026-08-08) |
+| Veto gates | three: A cost, B regime, C time blackout |
+| Active model | `models/forex_m15_wide/`, trained 2026-08-09 |
+
+**Already built — do NOT propose building these:** the dynamic hybrid chop
+filter with dual-mode (`tighten`/`loosen`) cost coupling, stateful incremental
+Wilder NATR in the live loop, the symmetric vectorised veto mask in the
+retrainer, and the walk-forward promotion gate. All shipped 2026-06-14 and
+earlier. See `llm_reports/refactors/2026-06-14_dynamic-hybrid-chop-floor.md`.
+
+**If anything you retrieve contradicts the table above, STOP and say so in your
+reply rather than acting on it.** Name the conflict explicitly. A flagged
+conflict is a useful result; silently acting on stale state is not.
+
+**This is a RESEARCH task. Produce a report (§7). Do not write production code,
+do not create branches, and do not issue commit instructions.**
+
 ## 0. Your task, in one paragraph
 
 We run two automated trading products. Neither has demonstrated an edge that
