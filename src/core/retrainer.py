@@ -203,6 +203,16 @@ DAYS_BACK = int(os.getenv("RETRAIN_DAYS_BACK", "60"))
 # SIGNAL separation) to a volatility-first basket: two liquid metals plus
 # three JPY/AUD-crossing pairs known for wide intraday ranges. XPT/XPD
 # skipped — too illiquid on OANDA for scalping.
+# The Angel's label is a DIRECTION question ("does price run in 45 minutes"),
+# and it is deliberately NOT the execution stop multiple. The two answer
+# different questions over different horizons: the Angel looks 3 bars ahead,
+# while the trade itself has max_hold (45) bars to resolve. Welding them
+# together means widening the stop silently doubles the move the Angel must
+# predict -- which on 2026-08-08 collapsed pooled proposals from ~300 to 49 and
+# failed the gate on sample size alone. These defaults preserve each asset
+# class's historical Angel behaviour; override with RETRAIN_ANGEL_ATR_MULT.
+_ANGEL_ATR_MULT_BY_CLASS = {"forex": 1.0, "equities": 0.5}
+
 _DEFAULT_TICKERS_BY_CLASS = {
     "forex": [
         "XAU_USD", "XAG_USD",                        # liquid metals
@@ -244,6 +254,11 @@ def get_asset_config(data_source: str) -> dict:
         "tickers": [t.strip() for t in os.getenv("RETRAIN_SYMBOLS", ",".join(default_tickers)).split(",") if t.strip()],
         "sl_mult": profile.sl_atr_multiplier,
         "tp_mult": profile.tp_atr_multiplier,
+        # Deliberately NOT sl_mult -- see _ANGEL_ATR_MULT_BY_CLASS.
+        "angel_mult": float(
+            os.getenv("RETRAIN_ANGEL_ATR_MULT", "").strip()
+            or _ANGEL_ATR_MULT_BY_CLASS[asset_class]
+        ),
         "max_hold": int(os.getenv("RETRAIN_MAX_HOLD", str(max_hold))),
         "survival_bars": int(os.getenv("RETRAIN_SURVIVAL", "5")),
         "timeframe_minutes": int(os.getenv("RETRAIN_TIMEFRAME_MINUTES", str(timeframe))),
@@ -847,6 +862,7 @@ def engineer_features_and_labels(
     max_hold: int = MAX_HOLD_BARS,
     survival_bars: int = SURVIVAL_BARS,
     htf_timeframe: str = "5m",
+    angel_mult: Optional[float] = None,
     risk_profile: Optional[RiskProfile] = None,
     alpha_table: Optional[dict] = None,
 ) -> Tuple[pl.DataFrame, List[str], float]:
@@ -861,13 +877,18 @@ def engineer_features_and_labels(
         price_sma50_ratio, log_return, hour_of_day, dist_sma50, vol_rel
 
     Targets:
-        angel_target: 1 if close 3 bars ahead > close + sl_mult × ATR (ATR-relative)
+        angel_target: 1 if close 3 bars ahead > close + angel_mult × ATR
+            (ATR-relative). angel_mult falls back to sl_mult when not given,
+            but production passes it explicitly -- the Angel's momentum bar is
+            not the execution stop. See _ANGEL_ATR_MULT_BY_CLASS.
         devil_target: 1 if TP (tp_mult × ATR) hit before SL (sl_mult × ATR) in ≤max_hold bars
 
     Args:
         df: Raw OHLCV DataFrame with columns:
             open, high, low, close, volume, symbol, timestamp
-        sl_mult: Stop-loss ATR multiplier
+        sl_mult: Stop-loss ATR multiplier (Devil labels + chop veto)
+        angel_mult: ATR multiple for the Angel's 3-bar momentum bar. None
+            falls back to sl_mult (the legacy coupling).
         tp_mult: Take-profit ATR multiplier
         max_hold: Maximum hold bars
         survival_bars: Number of survival bars for devil training
@@ -915,15 +936,19 @@ def engineer_features_and_labels(
     # 1 if close 3 bars ahead > close + sl_mult × ATR_abs
     # natr_14 is a percentage: ATR_abs = close * natr_14 / 100
     # ═══════════════════════════════════════════════════════════════════
+    _angel_mult = sl_mult if angel_mult is None else angel_mult
     df = df.with_columns(
         (
             pl.col("close").shift(-3).over("symbol")
-            > pl.col("close") + sl_mult * (pl.col("close") * pl.col("natr_14") / 100.0)
+            > pl.col("close") + _angel_mult * (pl.col("close") * pl.col("natr_14") / 100.0)
         )
         .cast(pl.Int8)
         .alias("angel_target")
     )
-    logger.info(f"Generated angel_target (ATR-relative 3-bar momentum with sl_mult={sl_mult})")
+    logger.info(
+        f"Generated angel_target (ATR-relative 3-bar momentum with "
+        f"angel_mult={_angel_mult}; execution sl_mult={sl_mult})"
+    )
 
     # ═══════════════════════════════════════════════════════════════════
     # DEVIL TARGETS (Phase 5.5 — Two-Target Architecture)
@@ -2213,6 +2238,7 @@ def main() -> int:
         features_df, feature_cols, chop_veto_rate = engineer_features_and_labels(
             raw_data,
             sl_mult=asset_config["sl_mult"],
+            angel_mult=asset_config["angel_mult"],
             tp_mult=asset_config["tp_mult"],
             max_hold=asset_config["max_hold"],
             survival_bars=asset_config["survival_bars"],
