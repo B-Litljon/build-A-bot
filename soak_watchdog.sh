@@ -24,6 +24,15 @@ set -euo pipefail
 REPO=/mnt/storage/mystuf/development/build-A-bot
 cd "$REPO"
 
+# ⚠️ MUST MATCH THE BRACKETS IN THE CHECKED-OUT TREE.
+# The Devil's training labels encode the stop/target multiples, so a model
+# trained on one bracket and served under another is train/serve skew. As of
+# 2026-08-08 the tree runs 2.0x/4.0x (RiskProfile.for_asset_class("forex")) and
+# the matching model is models/forex_m15_wide. The older models/forex_m15 was
+# trained on 1.0x/2.0x and MUST NOT be served against the current tree.
+# Override for a one-off: SOAK_MODEL_DIR=... soak_watchdog.sh
+MODEL_DIR="${SOAK_MODEL_DIR:-models/forex_m15_wide}"
+
 log() { echo "$(date '+%Y-%m-%dT%H:%M:%S') [watchdog] $*"; }
 
 if [ "${1:-}" = "selftest" ]; then
@@ -70,13 +79,13 @@ if [ -f "$STATE" ]; then
   fi
 fi
 
-log "soak not running — launching M15 soak (OANDA_MODEL_DIR=models/forex_m15, granularity 15)"
+log "soak not running — launching M15 soak (OANDA_MODEL_DIR=$MODEL_DIR, granularity 15)"
 if [ "${DRY_RUN:-0}" = "1" ]; then
-  log 'DRY_RUN=1 — would run: setsid --fork env OANDA_MODEL_DIR=models/forex_m15 bash run_soak.sh "" 15'
+  log "DRY_RUN=1 — would run: setsid --fork env OANDA_MODEL_DIR=$MODEL_DIR bash run_soak.sh \"\" 15"
   exit 0
 fi
 echo "$NOW" > "$STATE"
-setsid --fork env OANDA_MODEL_DIR=models/forex_m15 bash "$REPO/run_soak.sh" "" 15
+setsid --fork env OANDA_MODEL_DIR="$MODEL_DIR" bash "$REPO/run_soak.sh" "" 15
 sleep 5
 if pgrep -f 'bin/python -u run_oanda\.py' > /dev/null 2>&1; then
   log "launch OK — pid $(cat /tmp/soak.pid 2>/dev/null || echo '?'), log $(cat /tmp/soak_logpath 2>/dev/null || echo '?')"
