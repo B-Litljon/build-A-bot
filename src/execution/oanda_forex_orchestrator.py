@@ -34,7 +34,9 @@ Glossary:
     _positions -- symbol -> {entry, sl, tp, units, state, breach_price?,
         hit_level?}. Guarded by _positions_lock because the tick thread reads
         it while the loop writes. breach_price and hit_level are set by
-        _on_tick at breach and consumed by _watchdog_close for notifications.
+        _on_tick at breach and consumed by _watchdog_close for BOTH the Discord
+        alert and the "exit" event record -- the latter is what makes a fill a
+        labelled outcome (which bracket hit) rather than just "a trade closed".
     _positions_lock -- a threading.Lock, not an asyncio one, precisely because
         a non-async thread touches this state.
     flatten_on_exit -- whether shutdown closes everything. Default True: a
@@ -829,6 +831,8 @@ class OandaForexOrchestrator:
                 entry=pos_snapshot.get("entry"),
                 sl=pos_snapshot.get("sl"),
                 tp=pos_snapshot.get("tp"),
+                exit_price=pos_snapshot.get("breach_price"),
+                hit_level=pos_snapshot.get("hit_level"),
                 reason="watchdog",
                 attempt=attempt,
             )
@@ -1811,6 +1815,10 @@ class OandaForexOrchestrator:
         """Close all open positions on exit."""
         with self._positions_lock:
             symbols = list(self._positions.keys())
+            # Copy the bracket facts out before the close: a flatten is a
+            # real exit and its event record has to describe the whole trade,
+            # not just name the instrument.
+            snapshots = {s: dict(p) for s, p in self._positions.items()}
 
         if not symbols:
             return
@@ -1841,7 +1849,20 @@ class OandaForexOrchestrator:
                 # the cooldown like any other.
                 self._mark_exit(sym)
                 logger.info("[%s] Flattened on exit", sym)
-                events.emit("exit", sym=sym, reason="flatten")
+                snap = snapshots.get(sym, {})
+                flat_units = snap.get("units", 0)
+                events.emit(
+                    "exit",
+                    sym=sym,
+                    units=flat_units,
+                    dir="long" if flat_units > 0 else "short",
+                    entry=snap.get("entry"),
+                    sl=snap.get("sl"),
+                    tp=snap.get("tp"),
+                    exit_price=None,
+                    hit_level=None,
+                    reason="flatten",
+                )
 
         if failed:
             # Synchronous on purpose: we are shutting down and the loop may

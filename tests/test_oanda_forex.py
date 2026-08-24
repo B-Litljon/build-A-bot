@@ -38,6 +38,11 @@ Glossary:
         local state back, so it still reflects what is really held.
     test_tick_watchdog_ignores_reversing_position -- mid-flip the stop/target
         are meaningless and must not fire.
+    test_exit_event_records_which_bracket_hit -- the machine-readable exit
+        record must carry the breach price and "SL"/"TP". 6523254 fixed this
+        for the Discord alert only; the event record kept omitting it.
+    test_flatten_exit_event_carries_trade_facts -- a shutdown/liveness flatten
+        emits a complete trade record, not just the symbol.
     test_seam_catchup_* -- after a (re)prime, the newest sealed bar must be
         scored exactly once IF fresh: stale bars are skipped (weekend gap),
         already-scored bars are skipped (repeat reconnects inside one bar must
@@ -242,6 +247,78 @@ class TestOandaForexOrchestrator(unittest.TestCase):
 
         self.assertNotIn("EUR_USD", orch._positions)
         order_manager.close_position.assert_called_once_with("EUR_USD")
+
+    def test_exit_event_records_which_bracket_hit(self):
+        """
+        The exit EVENT (not just the Discord alert) must say where the trade
+        ended. Without this a fill is an unlabelled row: you know a position
+        closed but not whether the stop or the target did it, which is
+        exactly the fact any later analysis of the brackets needs.
+        """
+        orch, _, _, order_manager, _ = self._make_orchestrator()
+        order_manager.close_position.return_value = True
+        mock_loop = MagicMock()
+        mock_loop.is_running.return_value = True
+        orch._loop = mock_loop
+        orch._positions["EUR_USD"] = {
+            "entry": 1.08500, "sl": 1.08400, "tp": 1.08600,
+            "units": 1000, "state": "OPEN",
+        }
+
+        # Drive the real path: a breaching tick stamps breach_price/hit_level,
+        # then the close consumes them. Hand-stuffing the dict would not prove
+        # the handoff between the two.
+        with patch("asyncio.run_coroutine_threadsafe") as mock_dispatch:
+            orch._on_tick("EUR_USD", 1.08380, 1.08385)
+        # the dispatched coroutine is driven directly below; close the
+        # un-awaited one the mock swallowed
+        mock_dispatch.call_args[0][0].close()
+
+        with patch(
+            "src.execution.oanda_forex_orchestrator.events.emit"
+        ) as mock_emit:
+            asyncio.run(orch._watchdog_close("EUR_USD"))
+
+        exits = [
+            c for c in mock_emit.call_args_list if c.args and c.args[0] == "exit"
+        ]
+        self.assertEqual(len(exits), 1)
+        kw = exits[0].kwargs
+        self.assertEqual(kw["hit_level"], "SL")
+        self.assertEqual(kw["exit_price"], 1.08380)  # the bid that breached
+        self.assertEqual(kw["entry"], 1.08500)
+        self.assertEqual(kw["units"], 1000)
+        self.assertEqual(kw["reason"], "watchdog")
+
+    def test_flatten_exit_event_carries_trade_facts(self):
+        """
+        A flatten is a real exit too. Its event used to name the symbol and
+        nothing else, which left shutdown-closed trades unreconstructable.
+        No bracket was hit, so exit_price/hit_level are explicitly None.
+        """
+        orch, _, _, order_manager, _ = self._make_orchestrator()
+        order_manager.close_position.return_value = True
+        orch._positions["EUR_USD"] = {
+            "entry": 1.08500, "sl": 1.08400, "tp": 1.08600,
+            "units": -1000, "state": "OPEN",
+        }
+
+        with patch(
+            "src.execution.oanda_forex_orchestrator.events.emit"
+        ) as mock_emit:
+            asyncio.run(orch._flatten_all())
+
+        exits = [
+            c for c in mock_emit.call_args_list if c.args and c.args[0] == "exit"
+        ]
+        self.assertEqual(len(exits), 1)
+        kw = exits[0].kwargs
+        self.assertEqual(kw["reason"], "flatten")
+        self.assertEqual(kw["entry"], 1.08500)
+        self.assertEqual(kw["units"], -1000)
+        self.assertEqual(kw["dir"], "short")
+        self.assertIsNone(kw["exit_price"])
+        self.assertIsNone(kw["hit_level"])
 
     def test_watchdog_close_failure_retries_then_parks(self):
         """All close attempts fail -> position retained as CLOSE_FAILED."""

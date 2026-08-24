@@ -1,6 +1,6 @@
 # `tests/`
 
-**137 tests, all passing.** Run with:
+**200 tests, all passing.** Run with:
 
 ```bash
 PYTHONPATH=src:. python -m pytest -q
@@ -49,6 +49,7 @@ See the root [GLOSSARY.md](../GLOSSARY.md) for domain terms.
 | `test_oanda_tick_hook.py` | 5 | The raw tick callback contract |
 | `test_execution_safety.py` | 3 | Rebalance deadband, fill parsing, partial fills |
 | `test_retrainer_output_dir.py` | 3 | `RETRAIN_MODEL_DIR` isolation |
+| `test_retraining_notification.py` | 9 | The retrain Discord embed: a gate pass is not a deployment |
 | `test_ml_strategy_guards.py` | 5 | The stale-bar guard + threshold.json pinning |
 | `verify_warmup.py` | (1, **not collected**) | Warm-up injection |
 
@@ -97,6 +98,15 @@ failing isn't evidence.
 is the isolation mechanism for experiments; if it leaked, a side experiment
 would overwrite the promoted model a live bot hot-reloads, silently swapping the
 running strategy's brain for an unvalidated candidate.
+
+**`test_retraining_notification.py`** — the other half of that isolation. The
+files stayed isolated on 2026-08-17, but the *alert* did not: a side experiment
+posted "✅ PROMOTED — New models passed all validation gates and are now live"
+to Discord, indistinguishable from a real production promotion. Nothing had
+gone live. These tests pin that a run redirected by `RETRAIN_MODEL_DIR` is
+reported as a side candidate, in a different colour, naming the directory it
+actually wrote to. Discord is the only channel this system uses to reach a
+human, so a false alarm there costs real trust.
 
 **`test_trading_mcp.py`** — pins that a wrong, missing, or reused confirm token
 cannot act, i.e. an AI assistant can't start or stop the live bot by accident.
