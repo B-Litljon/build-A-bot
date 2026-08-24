@@ -141,6 +141,25 @@ logs. `run_oanda.py` calls it at startup; `EVENTS_ENABLED=0` is the off switch.
 - **Data artifacts:** writes `logs/events-*.jsonl` and `logs/status.json`
   (both gitignored, both regenerable). Read by `dashboard/`.
 
+### `log_filters.py` — log-flood guard
+`TruncatingFilter`, a `logging.Filter` that caps an over-long record and
+flattens it to one line. It exists because OANDA sits behind Cloudflare: during
+weekend maintenance the API answers 502/520 with a ~96 KB styled HTML page, and
+three call sites log that body verbatim (`oandapyV20`'s own logger,
+`data/oanda_provider.py`'s `get_historical_bars`, and the orchestrator's
+"stream disconnected"). The reconnect loop retries about once a minute, so the
+2026-08-16 soak wrote **447 MB across 909k lines**, 99% of it Cloudflare markup.
+
+Attached to the root *handler* (not a logger) by `run_oanda.py`, so
+third-party libraries we do not control are covered too. The record is
+rewritten in place and stamped with a sentinel attribute, which keeps it
+idempotent when a record fans out to several handlers. `LOG_MAX_CHARS=0`
+disables it for full-fidelity debugging.
+
+- **Imports from repo:** none (stdlib only).
+- **Imported by:** `run_oanda.py`, `tests/test_log_filters.py`.
+- **Reads/writes:** nothing. Reads `LOG_MAX_CHARS` from the environment.
+
 ### `order_management.py` — ⚠️ dead
 `OrderParams`, a percentage-multiplier risk config its own docstring describes
 as backtest-only and explicitly warns against wiring into live execution. It

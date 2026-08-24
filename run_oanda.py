@@ -33,6 +33,9 @@ Glossary:
     --env -- "practice" (paper money) or "live" (real). Defaults to practice.
     --daemon -- headless mode; log to file, no interactive display.
     OANDA_UNITS -- position size override.
+    _configure_logging -- sets the root format/level, then installs
+        core.log_filters so a single oversized broker error (Cloudflare HTML
+        during OANDA maintenance) cannot flood the log. See LOG_MAX_CHARS.
 """
 
 import argparse
@@ -58,6 +61,7 @@ if str(_SRC_DIR) not in sys.path:
 # Now safe to import from src/ using bare module names
 # ---------------------------------------------------------------------------
 from core import events  # noqa: E402
+from core import log_filters  # noqa: E402
 from data.oanda_provider import OandaMarketProvider  # noqa: E402
 from execution.oanda_order_manager import OandaOrderManager  # noqa: E402
 from execution.oanda_forex_orchestrator import (  # noqa: E402
@@ -174,6 +178,11 @@ def _configure_logging(daemon: bool) -> None:
         logging.basicConfig(level=logging.INFO, format=fmt, datefmt=datefmt)
     else:
         logging.basicConfig(level=logging.DEBUG, format=fmt, datefmt=datefmt)
+
+    # Broker errors arrive as HTML from Cloudflare during OANDA maintenance
+    # (~96 KB each). Unfiltered, a weekend of reconnects wrote a 447 MB log.
+    # Attach to the root handlers so oandapyV20's own logger is covered too.
+    log_filters.install()
 
 
 async def _main() -> None:
