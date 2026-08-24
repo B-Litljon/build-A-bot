@@ -61,6 +61,10 @@ Glossary:
         profile, not these constants, when reasoning about a forex run.
         Either way the value must match the live orchestrator's, or the model
         is trained on trades the bot would never take.
+    _HTF_FOR_TIMEFRAME -- bar size -> higher-timeframe context, mirroring
+        run_oanda._GRANULARITY_PROFILES. Training with a different pairing than
+        the live bot skews every htf_* feature. Override:
+        RETRAIN_HTF_TIMEFRAME.
     UNTRADEABLE_SYMBOLS -- instruments this account cannot trade (XAU_USD,
         XAG_USD; override RETRAIN_UNTRADEABLE_SYMBOLS). They stay in TRAINING
         and are excluded from the GATE's metrics only. Pooling them inverts the
@@ -277,6 +281,13 @@ _DEFAULT_TICKERS_BY_CLASS = {
     "equities": ["TSLA", "NVDA", "MARA", "COIN", "SMCI"],
 }
 
+# Higher-timeframe context per bar size. MUST mirror run_oanda.py's
+# _GRANULARITY_PROFILES: the live bot derives htf features from this pairing,
+# so training with a different one is train/serve skew in the htf_* columns
+# (htf_rsi_14, htf_vol_rel, htf_bb_pct_b, htf_trend_agreement).
+_HTF_FOR_TIMEFRAME = {1: "5m", 5: "30m", 15: "1h"}
+
+
 def _asset_class_for_source(data_source: str) -> str:
     if data_source == "oanda":
         return "forex"
@@ -298,6 +309,8 @@ def get_asset_config(data_source: str) -> dict:
         timeframe = 1
         htf_timeframe = "5m"
         
+    tf_minutes = int(os.getenv("RETRAIN_TIMEFRAME_MINUTES", str(timeframe)))
+
     return {
         "asset_class": asset_class,
         # Output directory for the trained model. Defaults to models/<asset_class>
@@ -316,8 +329,14 @@ def get_asset_config(data_source: str) -> dict:
         ),
         "max_hold": int(os.getenv("RETRAIN_MAX_HOLD", str(max_hold))),
         "survival_bars": int(os.getenv("RETRAIN_SURVIVAL", "5")),
-        "timeframe_minutes": int(os.getenv("RETRAIN_TIMEFRAME_MINUTES", str(timeframe))),
-        "htf_timeframe": os.getenv("RETRAIN_HTF_TIMEFRAME", htf_timeframe),
+        "timeframe_minutes": tf_minutes,
+        # MUST match the live bot's pairing for this bar size, or the htf_*
+        # features are computed one way in training and another at inference.
+        # run_oanda.py's _GRANULARITY_PROFILES is the authority; the old flat
+        # "5m" default was only ever correct for M1, so an M15 retrain that
+        # forgot RETRAIN_HTF_TIMEFRAME silently shipped skew.
+        "htf_timeframe": os.getenv("RETRAIN_HTF_TIMEFRAME", "").strip()
+        or _HTF_FOR_TIMEFRAME.get(tf_minutes, htf_timeframe),
     }
 
 # Model Hyperparameters
