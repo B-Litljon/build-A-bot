@@ -136,6 +136,13 @@ Glossary:
     validate_candidate -- the gate itself: 3 expanding walk-forward folds,
         each trained on the past and scored on the future it never saw. The
         full-data production model is trained only after the gate passes.
+    _GATE_THRESHOLDS -- the promotion bars bundled for the Discord embed, so
+        the notification cannot drift from the constants it quotes.
+    _resolved_model_dir -- where this run's artifacts land; mirrors
+        get_asset_config's resolution.
+    _is_production_model_dir -- False when RETRAIN_MODEL_DIR redirected the run
+        to a side directory, which suppresses every "now live" claim in the
+        Discord report. Passing the gate is not the same as deploying.
     promote_or_reject -- the single decision point. On pass it writes the model
         files; on fail it returns False and the previous production weights are
         left untouched.
@@ -1940,6 +1947,32 @@ def validate_candidate(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+# Single source of truth for the bars the Discord embed quotes. Kept next to
+# promote_or_reject so it cannot drift from the constants above the way the
+# hardcoded copies in notification_manager.py did.
+_GATE_THRESHOLDS = {
+    "brier": BRIER_THRESHOLD,
+    "ev": EV_THRESHOLD,
+    "profit_factor": PROFIT_FACTOR_THRESHOLD,
+}
+
+
+def _resolved_model_dir(asset_config: Optional[dict]) -> str:
+    """Where this run's artifacts land — the same resolution get_asset_config does."""
+    cfg = asset_config or {}
+    return cfg.get("model_dir") or f"models/{cfg.get('asset_class', 'equities')}"
+
+
+def _is_production_model_dir() -> bool:
+    """
+    False when RETRAIN_MODEL_DIR redirected this run to a side directory.
+
+    An explicit override means the operator deliberately aimed somewhere other
+    than the default path, so the run must not be announced as going live.
+    """
+    return not os.getenv("RETRAIN_MODEL_DIR", "").strip()
+
+
 def promote_or_reject(
     report: ValidationReport,
     angel_model: "lgb.LGBMClassifier",
@@ -1989,7 +2022,13 @@ def promote_or_reject(
             hmm_path = model_dir / "hmm_latest.pkl"
             save_hmm_models(hmm_models, hmm_path)
 
-        notifier.send_retraining_report(report, promoted=True)
+        notifier.send_retraining_report(
+            report,
+            promoted=True,
+            model_dir=_resolved_model_dir(asset_config),
+            is_production_path=_is_production_model_dir(),
+            gate_thresholds=_GATE_THRESHOLDS,
+        )
         return True
     else:
         logger.warning("=" * 70)
@@ -1998,7 +2037,13 @@ def promote_or_reject(
         for reason in report.rejection_reasons:
             logger.warning(f"  Rejection: {reason}")
 
-        notifier.send_retraining_report(report, promoted=False)
+        notifier.send_retraining_report(
+            report,
+            promoted=False,
+            model_dir=_resolved_model_dir(asset_config),
+            is_production_path=_is_production_model_dir(),
+            gate_thresholds=_GATE_THRESHOLDS,
+        )
         return False
 
 

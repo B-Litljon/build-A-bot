@@ -28,8 +28,17 @@ Glossary:
         startup, shutdown and connection events.
     send_retraining_report -- posts the full validation-gate verdict after a
         retrain: per-fold Brier/EV/win-rate/trade-count, the aggregate scores,
-        and PROMOTED vs REJECTED with the rejection reasons. Takes the
+        and the verdict with any rejection reasons. Takes the
         ``ValidationReport`` from retrainer.validate_candidate().
+    model_dir -- destination the retrain's artifacts were written to, named in
+        the embed so the reader can see what actually changed on disk.
+    is_production_path -- False when RETRAIN_MODEL_DIR aimed the run at a side
+        directory. Downgrades the verdict from "✅ PROMOTED" (green, claims
+        production) to "✅ GATE PASSED (side candidate)" (blue, states plainly
+        that nothing went live). A gate pass alone is not a deployment.
+    gate_thresholds -- optional {"brier","ev","profit_factor"} passed by the
+        retrainer so the embed quotes the live constants. Omitted → the
+        threshold annotations are dropped rather than guessed.
     send_drift_alert -- posts degradation warnings from feedback_loop.py's
         DriftEvaluator; escalates from WARNING to CRITICAL when Brier > 0.30 or
         expected value < -0.001.
@@ -219,16 +228,36 @@ class NotificationManager:
         except Exception as e:
             logger.error(f"Failed to send Discord OANDA trade alert: {e}")
 
-    def send_retraining_report(self, report, promoted: bool):
+    def send_retraining_report(
+        self,
+        report,
+        promoted: bool,
+        model_dir: Optional[str] = None,
+        is_production_path: bool = True,
+        gate_thresholds: Optional[dict] = None,
+    ):
         """
         Sends a detailed retraining report to Discord.
 
         Uses "The Accountant" persona.  Shows per-fold metrics, aggregate
-        scores, and the final PROMOTED / REJECTED verdict.
+        scores, and the gate verdict.
+
+        A gate pass is NOT the same thing as "this is now live". A retrain
+        aimed at a side directory (RETRAIN_MODEL_DIR) passes the same gate and
+        writes the same artifacts, but changes nothing the bot loads. Reporting
+        both cases as "PROMOTED ... now live" caused a real false alarm on
+        2026-08-17, so the verdict line now names the destination and only
+        claims production when the run actually targeted the default path.
 
         Args:
             report: ValidationReport dataclass from retrainer.validate_candidate()
-            promoted: Whether the model was promoted (True) or rejected (False)
+            promoted: Whether the gate passed (True) or rejected (False)
+            model_dir: Destination the artifacts were written to. Named in the
+                embed so the reader can see what actually changed.
+            is_production_path: False when RETRAIN_MODEL_DIR redirected this run
+                to a side directory. Suppresses every "live" claim.
+            gate_thresholds: Optional {"brier","ev","profit_factor"} so the
+                embed quotes the real bars instead of hardcoded copies.
         """
         if not self.webhook_url:
             return
@@ -245,25 +274,55 @@ class NotificationManager:
             )
         fold_text = "\n".join(fold_lines)
 
-        if promoted:
+        where = f"`{model_dir}`" if model_dir else "the configured model directory"
+
+        if promoted and is_production_path:
             verdict = "✅ PROMOTED"
             color = 0x00FF00  # Green
-            desc_header = "**New models passed all validation gates and are now live.**"
+            desc_header = (
+                f"**New models passed all validation gates and were written to "
+                f"the production path {where}.**\n"
+                f"_The live bot loads whichever directory OANDA_MODEL_DIR points "
+                f"at — confirm that before assuming this is trading._"
+            )
+        elif promoted:
+            # Side experiment: same gate, same artifacts, nothing live.
+            verdict = "✅ GATE PASSED (side candidate)"
+            color = 0x00A2FF  # Blue — deliberately NOT the green of a real promotion
+            desc_header = (
+                f"**Candidate passed the validation gate and was written to "
+                f"{where}.**\n"
+                f"_Side experiment (RETRAIN_MODEL_DIR override). Production "
+                f"weights are untouched and nothing has gone live._"
+            )
         else:
             verdict = "🚫 REJECTED"
             color = 0xFF0000  # Red
             reasons_text = "\n".join(f"• {r}" for r in report.rejection_reasons)
+            scope = (
+                "Production weights retained."
+                if is_production_path
+                else f"Side experiment targeting {where}; nothing was written."
+            )
             desc_header = (
-                f"**Models failed validation. Production weights retained.**\n\n"
+                f"**Models failed validation. {scope}**\n\n"
                 f"**Rejection Reasons:**\n{reasons_text}"
             )
+
+        # Quote the caller's real bars when supplied. The hardcoded copies
+        # these replaced had drifted: the embed advertised a Brier bar of 0.25
+        # while the gate had used 0.30 since Phase 5.5.
+        t = gate_thresholds or {}
+        brier_bar = f" (threshold ≤ {t['brier']})" if "brier" in t else ""
+        ev_bar = f" (threshold ≥ {t['ev']})" if "ev" in t else ""
+        pf_bar = f" (threshold ≥ {t['profit_factor']})" if "profit_factor" in t else ""
 
         description = (
             f"{desc_header}\n\n"
             f"**Per-Fold Results:**\n```\n{fold_text}\n```\n\n"
-            f"📊 **Mean Brier Score:** {report.mean_brier:.4f} (threshold ≤ 0.25)\n"
-            f"💰 **Mean EV:** {report.mean_ev:.6f} (threshold ≥ 0.0005)\n"
-            f"📈 **Final Profit Factor:** {report.final_profit_factor:.2f} (threshold ≥ 1.2)\n"
+            f"📊 **Mean Brier Score:** {report.mean_brier:.4f}{brier_bar}\n"
+            f"💰 **Mean EV:** {report.mean_ev:.6f}{ev_bar}\n"
+            f"📈 **Final Profit Factor:** {report.final_profit_factor:.2f}{pf_bar}\n"
             f"🎯 **Final Win Rate:** {report.final_win_rate:.1%}\n"
             f"📋 **Final Trades:** {report.final_total_trades}"
         )
