@@ -107,6 +107,21 @@ Glossary:
         correctly discards a third of the bars is not punished for the trades
         it removed. This floor exists because a handful of lucky wins at 6:1
         payoff can fake a passing profit factor.
+    HOLDOUT_FRAC -- fraction of the chronological window carved off before any
+        feature engineering (default 0.18; set RETRAIN_HOLDOUT_FRAC=0 to
+        disable). The served model trains on the remainder only and is then
+        judged on this untouched slice.
+    _split_holdout -- carves the chronologically last slice from raw fetched
+        bars. Returns (remainder, holdout, date_range). All training and fold
+        validation use the remainder; the holdout is engineered separately after
+        the fold gate and scored with the frozen production threshold.
+    _evaluate_holdout -- scores the final served artifact on the holdout using
+        the production threshold from validate_candidate. Restricts scoring to
+        tradeable instruments, mirroring the fold gate. No parameter choice on
+        the holdout.
+    HoldoutMetrics -- the artifact holdout scorecard: used flag, fraction, date
+        range, Brier/EV/win rate/PF/trade counts, and bypass_reason when the
+        holdout was disabled or empty.
     USE_HMM_FEATURES -- off by default (RETRAIN_USE_HMM=1 to enable). Adds
         3 hidden-regime probability features, fit per fold to avoid leakage.
     _SPREAD_TABLE_PATH / SPREAD_TABLE -- optional per-instrument trading-cost
@@ -156,9 +171,13 @@ Glossary:
     refit_models -- trains the Angel then the Devil on one window.
     _find_optimal_threshold -- sweeps candidate Devil cut-offs and picks the
         one maximising expected value, subject to a minimum trade count.
-    validate_candidate -- the gate itself: 3 expanding walk-forward folds,
+    validate_candidate -- the fold gate: 3 expanding walk-forward folds,
         each trained on the past and scored on the future it never saw. The
-        full-data production model is trained only after the gate passes.
+        fold schedule scales with the actual span of the input frame, so it
+        runs unchanged on the remainder after a holdout is carved off. The
+        final model is trained on the same input frame only after the fold gate
+        passes; main() passes the remainder so the served model never sees the
+        holdout.
     _GATE_THRESHOLDS -- the promotion bars bundled for the Discord embed, so
         the notification cannot drift from the constants it quotes.
     _resolved_model_dir -- where this run's artifacts land; mirrors
@@ -459,6 +478,12 @@ BASELINE_POOLED_OOS_TRADES = int(os.getenv("RETRAIN_POOLED_TRADE_FLOOR", "300"))
 # Default off so a plain LightGBM swap can be evaluated without confounds.
 USE_HMM_FEATURES = os.getenv("RETRAIN_USE_HMM", "0").strip() == "1"
 
+# Holdout fraction for the artifact-level gate. Carved from the chronologically
+# last slice of the raw window BEFORE feature engineering, so no part of the
+# pipeline can leak holdout information into the served model. 0 disables the
+# holdout and preserves the legacy full-data retrain behaviour.
+HOLDOUT_FRAC = float(os.getenv("RETRAIN_HOLDOUT_FRAC", "0.18"))
+
 # Per-instrument spread-cost table (2026-07-07 cost-awareness experiment).
 # Points at a JSON baked by scripts/bake_spread_alphas.py from live
 # SPREAD_CALIB measurements. When set:
@@ -551,6 +576,23 @@ class FoldMetrics:
 
 
 @dataclass
+class HoldoutMetrics:
+    """Metrics for the chronologically last holdout slice on the final artifact."""
+
+    used: bool
+    fraction: float
+    start_date: Optional[str]
+    end_date: Optional[str]
+    brier_score: float
+    expected_value: float
+    win_rate: float
+    profit_factor: float
+    trades: int
+    angel_proposed_trades: int
+    bypass_reason: Optional[str] = None
+
+
+@dataclass
 class ValidationReport:
     """Aggregated validation report across all walk-forward folds."""
 
@@ -565,6 +607,7 @@ class ValidationReport:
     chop_veto_rate: float = 0.0
     effective_trade_floor: float = 0.0
     rejection_reasons: List[str] = field(default_factory=list)
+    holdout: Optional[HoldoutMetrics] = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -668,6 +711,48 @@ def fetch_training_data(
 
     logger.info(f"Combined dataset: {len(combined):,} total rows")
     return combined
+
+
+def _split_holdout(
+    df: pl.DataFrame, frac: float
+) -> Tuple[pl.DataFrame, pl.DataFrame, Optional[Tuple[datetime, datetime]]]:
+    """
+    Carve a chronologically last holdout slice from raw fetched data.
+
+    The split is by timestamp BEFORE feature engineering, so no indicator,
+    label, veto, or model parameter can see across the boundary. Returns
+    ``(remainder, holdout, (holdout_start, holdout_end))``. When ``frac`` is 0
+    or the holdout would be empty, the holdout frame is empty and the date
+    range is None.
+
+    Args:
+        df: Raw stacked bars with a ``timestamp`` column.
+        frac: Fraction of the chronological span to reserve (0.0–1.0).
+
+    Returns:
+        Tuple of (remainder DataFrame, holdout DataFrame, optional date range).
+    """
+    if frac <= 0.0 or df.is_empty():
+        return df, pl.DataFrame(), None
+
+    min_ts = df["timestamp"].min()
+    max_ts = df["timestamp"].max()
+    span_seconds = (max_ts - min_ts).total_seconds()
+    if span_seconds <= 0:
+        return df, pl.DataFrame(), None
+
+    holdout_seconds = span_seconds * frac
+    holdout_start = max_ts - timedelta(seconds=holdout_seconds)
+    # Keep the boundary clean: remainder is strictly before holdout_start,
+    # holdout is from holdout_start onward. A bar exactly on the boundary
+    # belongs to the holdout.
+    remainder = df.filter(pl.col("timestamp") < holdout_start)
+    holdout = df.filter(pl.col("timestamp") >= holdout_start)
+
+    if holdout.is_empty():
+        return remainder, holdout, None
+
+    return remainder, holdout, (holdout_start, max_ts)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1563,6 +1648,135 @@ def _capture_oos_ledger(
     )
 
 
+def _evaluate_holdout(
+    holdout_df: pl.DataFrame,
+    angel_model: "lgb.LGBMClassifier",
+    devil_model: "lgb.LGBMClassifier",
+    angel_features: List[str],
+    devil_features: List[str],
+    threshold: float,
+    sl_mult: float,
+    tp_mult: float,
+) -> dict:
+    """
+    Score the final served artifact on the held-out chronologically last slice.
+
+    Uses the FROZEN production threshold returned by validate_candidate — no
+    parameter is chosen or tuned on the holdout. Scoring is restricted to
+    tradeable instruments for the same reason the fold gate does: the metric is
+    a prediction about live results.
+
+    Returns a dict with the holdout metrics and an ``approved_mask`` aligned to
+    the Angel-proposed subset, mirroring the fold computation.
+    """
+    n_total = holdout_df.height
+    if n_total == 0:
+        return {
+            "brier_score": float("nan"),
+            "expected_value": float("nan"),
+            "win_rate": 0.0,
+            "profit_factor": 0.0,
+            "trades": 0,
+            "angel_proposed_trades": 0,
+            "devil_approved_raw": 0,
+            "approved_mask": np.array([], dtype=bool),
+        }
+
+    X_base = holdout_df[angel_features].to_numpy()
+    y_angel = holdout_df["angel_target"].to_numpy()
+    y_devil = holdout_df["devil_target"].to_numpy()
+    y_devil_macro = holdout_df["devil_target_macro"].to_numpy()
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+        angel_probs = angel_model.predict_proba(X_base)[:, 1]
+
+    signal_mask = angel_probs >= ANGEL_THRESHOLD
+    n_angel_proposed = int(signal_mask.sum())
+
+    if n_angel_proposed == 0:
+        return {
+            "brier_score": float("nan"),
+            "expected_value": float("nan"),
+            "win_rate": 0.0,
+            "profit_factor": 0.0,
+            "trades": 0,
+            "angel_proposed_trades": 0,
+            "devil_approved_raw": 0,
+            "approved_mask": np.array([], dtype=bool),
+        }
+
+    proposed_base = X_base[signal_mask]
+    proposed_angel_probs = angel_probs[signal_mask]
+    proposed_devil_targets = y_devil[signal_mask]
+    proposed_devil_targets_macro = y_devil_macro[signal_mask]
+
+    meta_df = pl.DataFrame(proposed_base, schema=angel_features).with_columns(
+        pl.Series("angel_prob", proposed_angel_probs)
+    )
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+        devil_proba_full = devil_model.predict_proba(meta_df)
+
+    if devil_proba_full.shape[1] == 1:
+        only_class = int(devil_model.classes_[0])
+        const_prob = 1.0 if only_class == 1 else 0.0
+        devil_probs = np.full(len(meta_df), const_prob, dtype=np.float64)
+    else:
+        devil_probs = devil_proba_full[:, 1]
+
+    approved_mask = devil_probs >= threshold
+    n_devil_approved_raw = int(approved_mask.sum())
+
+    scored_mask, n_excluded = _tradeable_scoring_mask(
+        holdout_df, signal_mask, approved_mask
+    )
+    approved_mask = scored_mask
+    n_approved = int(approved_mask.sum())
+
+    if n_approved == 0:
+        return {
+            "brier_score": float("nan"),
+            "expected_value": float("nan"),
+            "win_rate": 0.0,
+            "profit_factor": 0.0,
+            "trades": 0,
+            "angel_proposed_trades": n_angel_proposed,
+            "devil_approved_raw": n_devil_approved_raw,
+            "approved_mask": approved_mask,
+        }
+
+    approved_devil_probs = devil_probs[approved_mask]
+    approved_targets = proposed_devil_targets[approved_mask]
+    approved_macro = proposed_devil_targets_macro[approved_mask]
+
+    brier = float(brier_score_loss(approved_targets, approved_devil_probs))
+    survival_wr = float(approved_targets.mean()) if len(approved_targets) > 0 else 0.0
+    ev = float(survival_wr * (tp_mult / sl_mult) - (1.0 - survival_wr))
+
+    macro_wins = int(approved_macro.sum())
+    macro_losses = n_approved - macro_wins
+    gross_profit = macro_wins * tp_mult
+    gross_loss = macro_losses * sl_mult
+    profit_factor = (
+        gross_profit / gross_loss if gross_loss > 0 else float("inf")
+    )
+    macro_wr = float(approved_macro.mean()) if n_approved > 0 else 0.0
+
+    return {
+        "brier_score": brier,
+        "expected_value": ev,
+        "win_rate": macro_wr,
+        "profit_factor": profit_factor,
+        "trades": n_approved,
+        "angel_proposed_trades": n_angel_proposed,
+        "devil_approved_raw": n_devil_approved_raw,
+        "approved_mask": approved_mask,
+        "n_excluded_untradeable": n_excluded,
+    }
+
+
 def validate_candidate(
     df: pl.DataFrame,
     feature_cols: List[str],
@@ -1591,39 +1805,42 @@ def validate_candidate(
     Optional[dict],
 ]:
     """
-    Run expanding-window walk-forward cross-validation and apply the promotion gate.
+    Run expanding-window walk-forward cross-validation and apply the fold gate.
 
-    Splits the 60-day dataset into 3 expanding folds by calendar date (not row
+    Splits the supplied frame into 3 expanding folds by calendar date (not row
     index) so that all symbols' data for a given date range stays in the same
-    fold.  For each fold, trains Angel + Devil on the training window and
+    fold. For each fold, trains Angel + Devil on the training window and
     evaluates strictly out-of-sample on the validation window.
 
     Fold schedule (calendar days from the earliest timestamp in df):
-        Fold 1: Train days  0–29, Validate days 30–39
-        Fold 2: Train days  0–39, Validate days 40–49
-        Fold 3: Train days  0–49, Validate days 50–59  ← Profit Factor gate
+        Fold 1: Train 0–½,   Validate ½–⅔
+        Fold 2: Train 0–⅔,   Validate ⅔–⅚
+        Fold 3: Train 0–⅚,   Validate ⅚–1   ← Profit Factor gate
+    The fractions reproduce the legacy 60-day schedule exactly (30/40, 40/50,
+    50/60) and scale automatically to the actual span of the input frame.
 
     TEMPORAL BOUNDARY:
-        The Profit Factor gate uses the Fold 3 model (trained on days 0–49)
-        evaluated on the Fold 3 val set (days 50–59). This is strictly OOS.
-        The final full-data model (all 60 days) is ONLY trained AFTER the gate
-        passes. Training on all 60 days and then evaluating on a subset would
-        be data leakage.
+        The Profit Factor gate uses the Fold 3 model evaluated on the Fold 3
+        val set. This is strictly OOS. The final model is trained on the input
+        frame only AFTER the fold gate passes. In main(), the input frame is
+        the remainder after the holdout is carved off, so the served model
+        never sees the holdout.
 
     Promotion thresholds:
-        Mean Brier Score   ≤ 0.25   (across all folds)
+        Mean Brier Score   ≤ 0.30   (across all folds)
         Mean EV            ≥ 0.0005 (across all folds)
         Profit Factor      ≥ 1.20   (Fold 3 val set only)
 
     Dynamic threshold:
         With class_weight=None, Devil probabilities reflect the true ~20% base
-        rate. Per-fold, _find_optimal_threshold() sweeps 0.10–0.44 and selects
+        rate. Per-fold, _find_optimal_threshold() sweeps 0.10–0.64 and selects
         the threshold maximizing EV. The Fold 3 threshold is returned as the
         production threshold.
 
     Args:
-        df: Full 60-day feature-engineered DataFrame (output of
-            engineer_features_and_labels).
+        df: Feature-engineered DataFrame (output of
+            engineer_features_and_labels). main() passes the remainder after
+            the holdout carve-out.
         feature_cols: List of base feature column names.
         sl_mult: Stop-loss ATR multiplier
         tp_mult: Take-profit ATR multiplier
@@ -1631,9 +1848,9 @@ def validate_candidate(
 
     Returns:
         Tuple of:
-            - ValidationReport (gate decision + per-fold metrics)
-            - angel_model (full-data if gate passed, Fold 3 if rejected)
-            - devil_model (full-data if gate passed, Fold 3 if rejected)
+            - ValidationReport (fold gate decision + per-fold metrics)
+            - angel_model (final if gate passed, Fold 3 if rejected)
+            - devil_model (final if gate passed, Fold 3 if rejected)
             - angel_feature_names
             - devil_feature_names
             - production_threshold (optimal Devil threshold from Fold 3)
@@ -1658,38 +1875,36 @@ def validate_candidate(
         )
 
     # ───────────────────────────────────────────────────────────────────
-    # Build date-based fold boundaries
+    # Build date-based fold boundaries from the actual frame span.
     # ───────────────────────────────────────────────────────────────────
     min_date = df["timestamp"].min()
 
-    # The fold schedule below is derived from the MODULE constant DAYS_BACK,
-    # not from this frame. main() keeps the two in step because it fetches with
-    # days_back=DAYS_BACK, but any other caller that fetches a longer window
-    # without setting RETRAIN_DAYS_BACK silently trains on the first DAYS_BACK
-    # days and discards the rest. Warn rather than guess: changing the schedule
-    # here would move the promotion gate's goalposts.
+    # The fold schedule is derived from the actual span of the supplied frame,
+    # not the module constant DAYS_BACK. This lets the same 3-fold expanding
+    # shape run on the remainder after a holdout is carved off, while keeping
+    # the legacy proportions intact (60 days → 30/40, 40/50, 50/60 exactly).
+    # main() still fetches with days_back=DAYS_BACK and warns if the fetched
+    # window does not match, but the folds themselves scale with the data they
+    # are given.
     span_days = (df["timestamp"].max() - min_date).total_seconds() / 86400.0
+    span = int(span_days)
     if span_days > DAYS_BACK * 1.2:
         logger.warning(
-            "Data spans %.0f days but the fold schedule is built from "
-            "DAYS_BACK=%d — folds will cover only the OLDEST %d days and "
-            "%.0f%% of this frame is unused. Set RETRAIN_DAYS_BACK=%d to use "
-            "it all.",
-            span_days, DAYS_BACK, DAYS_BACK,
-            100.0 * (1.0 - DAYS_BACK / span_days), int(span_days),
+            "Data spans %.0f days but DAYS_BACK=%d — the fold schedule now "
+            "scales to the full frame, so this run's gate is not comparable to "
+            "a DAYS_BACK=%d run. Set RETRAIN_DAYS_BACK=%d if that was intended.",
+            span_days, DAYS_BACK, DAYS_BACK, int(span_days),
         )
 
     # fold_configs: (train_end_days, val_end_days) — exclusive upper bounds.
     # Fractions chosen to reproduce the legacy 60-day schedule exactly:
-    #   (30,40),(40,50),(50,60) at DAYS_BACK=60.
-    # For larger windows the same expanding-train / fixed-fraction-val shape
-    # scales (e.g. DAYS_BACK=180 → (90,120),(120,150),(150,180)). Without
-    # this scaling the val sets stayed pinned to days 30–60 and 67% of any
-    # extended window was silently discarded.
+    #   (30,40),(40,50),(50,60) at span=60.
+    # For smaller/larger windows the same expanding-train / fixed-fraction-val
+    # shape scales (e.g. span=50 → (25,33),(33,41),(41,50)).
     fold_configs = [
-        (DAYS_BACK // 2,     DAYS_BACK * 2 // 3),   # train 0–½,  val ½–⅔
-        (DAYS_BACK * 2 // 3, DAYS_BACK * 5 // 6),   # train 0–⅔,  val ⅔–⅚
-        (DAYS_BACK * 5 // 6, DAYS_BACK),            # train 0–⅚,  val ⅚–1
+        (span // 2,     span * 2 // 3),   # train 0–½,  val ½–⅔
+        (span * 2 // 3, span * 5 // 6),   # train 0–⅔,  val ⅔–⅚
+        (span * 5 // 6, span),            # train 0–⅚,  val ⅚–1
     ]
 
     fold_metrics: List[FoldMetrics] = []
@@ -2261,18 +2476,18 @@ def promote_or_reject(
     """
     Promote or reject candidate models based on the validation report.
 
-    If gate passed: the models passed in were trained on the full 60-day
-    dataset (after CV validation confirmed generalizability). Saves them
-    atomically via save_models(), then saves the optimal threshold via
-    save_threshold().
+    If gate passed: the models passed in were trained on the frame supplied to
+    validate_candidate() (the remainder after the holdout carve-out when the
+    holdout is enabled). Saves them atomically via save_models(), then saves
+    the optimal threshold via save_threshold().
 
     If gate failed: the models passed in are Fold 3 models (not saved).
     Production weights are retained, rejection alert is sent to Discord.
 
     Args:
         report: ValidationReport from validate_candidate()
-        angel_model: Final model (full-data if gate passed, Fold 3 if failed)
-        devil_model: Final model (full-data if gate passed, Fold 3 if failed)
+        angel_model: Final model (gate-passed if gate passed, Fold 3 if failed)
+        devil_model: Final model (gate-passed if gate passed, Fold 3 if failed)
         threshold: Optimal Devil threshold from Fold 3 (default: 0.20 fallback)
         asset_config: Asset configuration dictionary.
 
@@ -2289,7 +2504,7 @@ def promote_or_reject(
         if asset_config is None:
             asset_config = {}
 
-        save_models(angel_model, devil_model, asset_config)
+        save_models(angel_model, devil_model, asset_config, report=report)
         save_threshold(threshold, asset_config)
         if SPREAD_TABLE is not None:
             save_spread_table(_SPREAD_TABLE_PATH, asset_config)
@@ -2333,6 +2548,7 @@ def save_models(
     angel_model: "lgb.LGBMClassifier",
     devil_model: "lgb.LGBMClassifier",
     asset_config: dict,
+    report: Optional[ValidationReport] = None,
 ) -> None:
     """
     Serialize models to disk using joblib with POSIX atomic writes.
@@ -2344,6 +2560,9 @@ def save_models(
         angel_model: Trained Angel model
         devil_model: Trained Devil model
         asset_config: Asset configuration dictionary.
+        report: Optional ValidationReport; when present, holdout metadata is
+            written to metadata.json so a served model can be checked against
+            what it actually earned.
     """
     logger.info("=" * 70)
     logger.info("SERIALIZING MODELS (ATOMIC)")
@@ -2411,7 +2630,37 @@ def save_models(
         # Declares the live gate this artifact requires. A non-empty
         # list served without a matching veto is train/serve skew.
         "behavior_veto": sorted(BEHAVIOR_VETO_LABELS),
+        # Holdout record: what the served artifact earned on data it never saw.
+        # If the holdout was disabled or empty, "used" is false and the reason
+        # is recorded so the artifact cannot be mistaken for one that passed a
+        # real holdout gate.
+        "holdout": {
+            "used": False,
+            "fraction": HOLDOUT_FRAC,
+            "bypass_reason": "disabled" if HOLDOUT_FRAC <= 0.0 else None,
+        },
     }
+    if report is not None and report.holdout is not None:
+        ho = report.holdout
+        metadata["holdout"] = {
+            "used": ho.used,
+            "fraction": ho.fraction,
+            "start_date": ho.start_date,
+            "end_date": ho.end_date,
+            "brier_score": (
+                round(ho.brier_score, 4) if not np.isnan(ho.brier_score) else None
+            ),
+            "expected_value": (
+                round(ho.expected_value, 6) if not np.isnan(ho.expected_value) else None
+            ),
+            "win_rate": round(ho.win_rate, 4) if ho.trades > 0 else None,
+            "profit_factor": (
+                round(ho.profit_factor, 4) if ho.trades > 0 else None
+            ),
+            "trades": ho.trades,
+            "angel_proposed_trades": ho.angel_proposed_trades,
+            "bypass_reason": ho.bypass_reason,
+        }
     with open(metadata_temp, "w") as f:
         json.dump(metadata, f, indent=2)
     os.replace(metadata_temp, metadata_path)
@@ -2544,6 +2793,40 @@ def main() -> int:
             timeframe_minutes=asset_config["timeframe_minutes"]
         )
 
+        # ─── Phase 2a: Carve holdout FIRST, before any feature engineering ───
+        # The holdout is the chronologically last slice. No indicator, label,
+        # veto, threshold, or model parameter may see across this boundary.
+        # RETRAIN_HOLDOUT_FRAC=0 disables the holdout and preserves legacy
+        # full-data behaviour.
+        remainder_raw, holdout_raw, holdout_range = _split_holdout(
+            raw_data, HOLDOUT_FRAC
+        )
+        if HOLDOUT_FRAC <= 0.0:
+            logger.warning(
+                "⚠️  HOLDOUT DISABLED (RETRAIN_HOLDOUT_FRAC=0). "
+                "The gate will judge fold models and the served artifact will be "
+                "trained on all data — the exact leakage this gate was built to stop."
+            )
+        elif holdout_raw.is_empty():
+            logger.warning(
+                "⚠️  HOLDOUT REQUESTED BUT EMPTY — bypassing artifact holdout gate. "
+                "Check the fetched window and RETRAIN_HOLDOUT_FRAC value."
+            )
+        else:
+            logger.info(
+                "HOLDOUT: reserved %.1f%% of chronological window (%.0f rows); "
+                "training/validation will use %.0f rows",
+                100.0 * HOLDOUT_FRAC,
+                holdout_raw.height,
+                remainder_raw.height,
+            )
+            if holdout_range:
+                logger.info(
+                    "HOLDOUT RANGE: %s → %s",
+                    holdout_range[0].isoformat(),
+                    holdout_range[1].isoformat(),
+                )
+
         # ─── Phase 2.5: Per-instrument spread-cost table (optional) ────────
         spread_alphas: Optional[dict] = None
         if SPREAD_TABLE is not None:
@@ -2567,8 +2850,11 @@ def main() -> int:
             )
 
         # ─── Phase 3: Engineer features with ATR-dynamic labels ────────────
+        # Feature engineering runs ONLY on the remainder. The holdout is
+        # engineered separately AFTER the fold gate, using the same parameters
+        # but no information from the future.
         features_df, feature_cols, chop_veto_rate = engineer_features_and_labels(
-            raw_data,
+            remainder_raw,
             sl_mult=asset_config["sl_mult"],
             angel_mult=asset_config["angel_mult"],
             tp_mult=asset_config["tp_mult"],
@@ -2583,10 +2869,8 @@ def main() -> int:
 
         # ─── Phase 4: Walk-forward validation (3-fold expanding window) ────
         # TEMPORAL BOUNDARY: CV folds and the Profit Factor gate are evaluated
-        # strictly OOS (Fold 3 model evaluated on days 51–60). The full-data
-        # production model is only trained AFTER the gate passes. Running the
-        # full-data model against any data used in its training would be data
-        # leakage.
+        # strictly OOS on the remainder. The final artifact is trained on the
+        # remainder too, never on the holdout.
         logger.info("=" * 70)
         logger.info("WALK-FORWARD VALIDATION (3 EXPANDING FOLDS)")
         logger.info("=" * 70)
@@ -2611,8 +2895,127 @@ def main() -> int:
         )
         logger.info(f"Optimal Devil threshold (from Fold 3): {optimal_threshold:.4f}")
 
+        # ─── Phase 4.5: Artifact-level holdout gate ────────────────────────
+        # Passing the fold gate is necessary but not sufficient. The served
+        # model has never seen the holdout, so its score here is the honest
+        # estimate of live performance.
+        holdout_metrics = HoldoutMetrics(
+            used=False,
+            fraction=HOLDOUT_FRAC,
+            start_date=None,
+            end_date=None,
+            brier_score=float("nan"),
+            expected_value=float("nan"),
+            win_rate=0.0,
+            profit_factor=0.0,
+            trades=0,
+            angel_proposed_trades=0,
+            bypass_reason=None,
+        )
+        if HOLDOUT_FRAC > 0.0 and not holdout_raw.is_empty() and report.gate_passed:
+            logger.info("=" * 70)
+            logger.info("ARTIFACT HOLDOUT EVALUATION")
+            logger.info("=" * 70)
+
+            holdout_features, _, _ = engineer_features_and_labels(
+                holdout_raw,
+                sl_mult=asset_config["sl_mult"],
+                angel_mult=asset_config["angel_mult"],
+                tp_mult=asset_config["tp_mult"],
+                max_hold=asset_config["max_hold"],
+                survival_bars=asset_config["survival_bars"],
+                htf_timeframe=asset_config.get("htf_timeframe", "5m"),
+                risk_profile=RiskProfile.for_asset_class(asset_config["asset_class"]),
+                alpha_table=spread_alphas,
+            )
+            if USE_HMM_FEATURES and final_hmm_models is not None:
+                holdout_features = predict_regime_probs(
+                    holdout_features, final_hmm_models
+                )
+
+            holdout_scores = _evaluate_holdout(
+                holdout_features,
+                angel_model,
+                devil_model,
+                angel_feats,
+                devil_feats,
+                optimal_threshold,
+                sl_mult=asset_config["sl_mult"],
+                tp_mult=asset_config["tp_mult"],
+            )
+
+            holdout_trade_floor = (
+                BASELINE_POOLED_OOS_TRADES * HOLDOUT_FRAC * (1.0 - chop_veto_rate)
+            )
+            holdout_passed = (
+                holdout_scores["trades"] >= holdout_trade_floor
+                and holdout_scores["brier_score"] <= BRIER_THRESHOLD
+                and holdout_scores["expected_value"] >= EV_THRESHOLD
+                and holdout_scores["profit_factor"] >= PROFIT_FACTOR_THRESHOLD
+            )
+
+            holdout_metrics = HoldoutMetrics(
+                used=True,
+                fraction=HOLDOUT_FRAC,
+                start_date=holdout_range[0].date().isoformat() if holdout_range else None,
+                end_date=holdout_range[1].date().isoformat() if holdout_range else None,
+                brier_score=holdout_scores["brier_score"],
+                expected_value=holdout_scores["expected_value"],
+                win_rate=holdout_scores["win_rate"],
+                profit_factor=holdout_scores["profit_factor"],
+                trades=holdout_scores["trades"],
+                angel_proposed_trades=holdout_scores["angel_proposed_trades"],
+            )
+            report.holdout = holdout_metrics
+
+            logger.info(
+                "HOLDOUT METRICS: Brier=%.4f | EV=%.6f | WR=%.1f%% | "
+                "PF=%.4f | Trades=%d (floor=%.0f)",
+                holdout_scores["brier_score"],
+                holdout_scores["expected_value"],
+                holdout_scores["win_rate"],
+                holdout_scores["profit_factor"],
+                holdout_scores["trades"],
+                holdout_trade_floor,
+            )
+
+            if not holdout_passed:
+                report.gate_passed = False
+                report.rejection_reasons.append(
+                    f"Holdout gate failed: Brier={holdout_scores['brier_score']:.4f} "
+                    f"EV={holdout_scores['expected_value']:.6f} "
+                    f"PF={holdout_scores['profit_factor']:.4f} "
+                    f"Trades={holdout_scores['trades']} (floor={holdout_trade_floor:.0f})"
+                )
+                logger.warning(
+                    "🚫 HOLDOUT GATE FAILED — artifact rejected by data it never saw"
+                )
+            else:
+                logger.info("✅ HOLDOUT GATE PASSED")
+        elif HOLDOUT_FRAC > 0.0 and not holdout_raw.is_empty() and not report.gate_passed:
+            holdout_metrics.bypass_reason = "fold gate failed — no artifact to score"
+            report.holdout = holdout_metrics
+            logger.warning(
+                "⚠️  HOLDOUT NOT SCORED: fold gate failed, so no served artifact exists."
+            )
+        elif HOLDOUT_FRAC > 0.0 and holdout_raw.is_empty():
+            holdout_metrics.bypass_reason = "empty holdout"
+            report.holdout = holdout_metrics
+            logger.warning(
+                "⚠️  HOLDOUT BYPASSED: requested fraction %.2f produced an empty holdout. "
+                "This run is gated by folds only.",
+                HOLDOUT_FRAC,
+            )
+        elif HOLDOUT_FRAC <= 0.0:
+            holdout_metrics.bypass_reason = "disabled"
+            report.holdout = holdout_metrics
+            logger.warning(
+                "⚠️  HOLDOUT BYPASSED: RETRAIN_HOLDOUT_FRAC=0. "
+                "Served model trains on the full window."
+            )
+
         # ─── Phase 5: Gate decision ─────────────────────────────────────────
-        # If gate passed: angel_model/devil_model are trained on full 60 days
+        # If gate passed: angel_model/devil_model are trained on the remainder.
         # If gate failed: they are Fold 3 models (will NOT be saved)
         promoted = promote_or_reject(
             report,

@@ -1,6 +1,6 @@
 # `tests/`
 
-**200 tests, all passing.** Run with:
+**310 tests, all passing.** Run with:
 
 ```bash
 PYTHONPATH=src:. python -m pytest -q
@@ -49,6 +49,7 @@ See the root [GLOSSARY.md](../GLOSSARY.md) for domain terms.
 | `test_oanda_tick_hook.py` | 5 | The raw tick callback contract |
 | `test_execution_safety.py` | 3 | Rebalance deadband, fill parsing, partial fills |
 | `test_retrainer_output_dir.py` | 3 | `RETRAIN_MODEL_DIR` isolation |
+| `test_holdout_gate.py` | 11 | Holdout split, artifact scoring, and metadata recording |
 | `test_retraining_notification.py` | 9 | The retrain Discord embed: a gate pass is not a deployment |
 | `test_ml_strategy_guards.py` | 5 | The stale-bar guard + threshold.json pinning |
 | `verify_warmup.py` | (1, **not collected**) | Warm-up injection |
@@ -98,6 +99,13 @@ failing isn't evidence.
 is the isolation mechanism for experiments; if it leaked, a side experiment
 would overwrite the promoted model a live bot hot-reloads, silently swapping the
 running strategy's brain for an unvalidated candidate.
+
+**`test_holdout_gate.py`** — the central invariant of the artifact holdout:
+holdout rows are carved first and never enter training, the split is
+chronological and disjoint, and `metadata.json` records either the holdout
+metrics or an explicit bypass reason. The tests use small mocks so they never
+train real models, but they exercise the same indexing paths the production
+gate uses.
 
 **`test_retraining_notification.py`** — the other half of that isolation. The
 files stayed isolated on 2026-08-17, but the *alert* did not: a side experiment

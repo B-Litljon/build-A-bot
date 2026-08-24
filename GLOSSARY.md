@@ -338,6 +338,17 @@ model leans toward current market behaviour.
 live ones. Failing is a *healthy* outcome, not a crash: the retrainer exits 2 and
 the previous weights stay in place.
 
+**holdout** — a chronologically last slice of data carved off before any feature
+engineering, used to score the actual artifact that gets served. Passing the
+fold gate is necessary but not sufficient; the served model must also earn its
+bars on the holdout. Recorded in `metadata.json` so a deployed model can be
+checked against what it actually earned. *(`src/core/retrainer.py`)*
+
+**artifact holdout gate** — the additional pass/fail applied to the final model
+on the holdout, using the same thresholds as the fold gate and the frozen
+production threshold. Disabled by `RETRAIN_HOLDOUT_FRAC=0`; when disabled or
+empty the metadata records the bypass explicitly. *(`src/core/retrainer.py`)*
+
 **lift over random vs lift over benchmark** — two different questions, and for a
 long time the investor only asked the first. "Better than guessing" is measured
 against the base rate (a top-*quintile* target makes random guessing score 0.20).
@@ -500,7 +511,7 @@ travelling together so a model always matches its assumptions:
 |---|---|
 | `angel_latest.pkl` / `devil_latest.pkl` | The two trained models. |
 | `threshold.json` | The Devil threshold tuned for *this* model, plus (since 2026-07) the pinned Angel bar the pair was trained at. |
-| `metadata.json` | Asset class, timeframe, symbols, training date. Read at boot to confirm the bot trades what the model was trained on. |
+| `metadata.json` | Asset class, timeframe, symbols, training date, and holdout metrics (or bypass reason). Read at boot to confirm the bot trades what the model was trained on and to check what the artifact earned on untouched data. |
 | `feature_stats.json` | Training feature distributions + null calibration, for drift probing. |
 | `spread_alphas.json` | The cost table this model was trained against. |
 | `hmm_latest.pkl` | Per-symbol regime models, when that experiment is on. |

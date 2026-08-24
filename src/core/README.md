@@ -21,12 +21,15 @@ drift).
 
 ## Files
 
-### `retrainer.py` (2166 lines — the big one)
-The training pipeline and the promotion gate. Fetches history, engineers
-features, builds two labels, runs a 3-fold expanding walk-forward validation,
-and overwrites the live model files **only** if the candidate clears every
-threshold. Exit code 2 means "trained but rejected", which is a healthy
-outcome, not a crash.
+### `retrainer.py` (the big one)
+The training pipeline and the promotion gate. Fetches history, carves a
+chronologically last holdout slice **before** any feature engineering, engineers
+features on the remainder, runs a 3-fold expanding walk-forward validation on
+that remainder, trains the final model on the remainder too, and only then
+scores the served artifact on the untouched holdout. The live model files are
+overwritten **only** if the candidate clears both the fold gate and the
+artifact holdout gate. Exit code 2 means "trained but rejected", which is a
+healthy outcome, not a crash.
 
 - **Imports from repo:** `src.data.factory` (`get_market_provider`),
   `src.data.market_provider`, `src.execution.risk_manager` (`RiskProfile`,
@@ -34,13 +37,16 @@ outcome, not a crash.
   chop veto identical to the live one), `src.ml.feature_pipeline`,
   `src.ml.feature_stats`, `src.ml.features.v3_features`,
   `src.ml.regimes.hmm_regime`, `src.core.notification_manager`.
-- **Imported by:** `tests/test_retrainer_output_dir.py`. Otherwise run as a
-  script (`python -m src.core.retrainer`) from `run_pipeline.sh` Phase 5.
+- **Imported by:** `tests/test_retrainer_output_dir.py`,
+  `tests/test_holdout_gate.py`. Otherwise run as a script
+  (`python -m src.core.retrainer`) from `run_pipeline.sh` Phase 5.
 - **Reads:** bars from the configured provider (network); optionally a spread
   table JSON named by `RETRAIN_SPREAD_TABLE`.
 - **Writes** (into `model_dir`, default `models/<asset_class>/`, all atomically):
   `angel_latest.pkl`, `devil_latest.pkl`, `metadata.json`, `threshold.json`,
   `feature_stats.json`, and `spread_alphas.json` when the cost experiment is on.
+  `metadata.json` records the holdout fraction, date range, and metrics (or the
+  bypass reason when the holdout is disabled/empty).
 
 ### `feedback_loop.py`
 `DriftEvaluator` — scores an already-graded ledger and decides whether the
