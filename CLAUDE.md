@@ -41,8 +41,13 @@ Conventions for Layer 3:
   `ps aux | grep run_oanda` before assuming otherwise.
 - **`soak_watchdog.sh` is in cron every 5 minutes** and will relaunch the soak
   if it dies — from whatever is in the working tree, on whatever branch is
-  checked out. To stop the soak, `touch soak.off` **before** killing it, or it
+  checked out. To stop the soak, `touch soak.off` **before** stopping it, or it
   comes back within 5 minutes.
+- **The soak runs as the `soak.service` systemd user unit** (since 2026-08-22).
+  Stop it with `systemctl --user stop soak.service`; how a run ended is in
+  `systemctl --user status soak.service` and in the watchdog's post-mortem line
+  in `logs/watchdog.log`. The served model dir is declared in `soak.service` —
+  that is the single source of truth, and it must match the tree's brackets.
 - **Stops and targets are enforced in software**, by the bot process itself. A
   dead bot means an unwatched open position. Treat anything that could crash or
   hang `src/execution/` as a money-losing bug, not a cosmetic one.
@@ -76,7 +81,7 @@ Verified during the 2026-07-27 glossary pass:
 ## Testing
 
 ```bash
-PYTHONPATH=src:. python -m pytest -q     # 137 tests
+PYTHONPATH=src:. python -m pytest -q     # 200 tests
 ```
 
 `PYTHONPATH=src:.` is required — entry points prepend `src/` to the path, which

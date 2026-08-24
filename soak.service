@@ -1,0 +1,58 @@
+# M15 forex paper soak, supervised by systemd (user manager).
+#
+# Why this exists: launched via `setsid` from cron, the bot died six times in
+# twelve days leaving NO trace — no traceback, no OOM record, no signal. A
+# detached process that vanishes is unattributable. Under systemd the exit is
+# recorded either way:
+#
+#     systemctl --user status soak.service
+#     journalctl --user -u soak.service | grep -E 'Main process|Failed|Stopped'
+#
+# giving "code=killed, signal=KILL" or "code=exited, status=N" the next time.
+#
+# Install (symlink so edits in the repo take effect after a daemon-reload):
+#     ln -sf /mnt/storage/mystuf/development/build-A-bot/soak.service \
+#            ~/.config/systemd/user/soak.service
+#     systemctl --user daemon-reload
+#
+# Lingering must stay ON or the unit dies when the desktop session ends:
+#     loginctl enable-linger tha_magick_man
+#
+# NOT enabled at boot on purpose — soak_watchdog.sh owns *when* to launch
+# (kill switch, weekend blackout, crash-loop brake). This unit owns *how*.
+
+[Unit]
+Description=V5 OANDA M15 forex paper soak
+# Don't fight the network coming up after a reboot; the watchdog retries.
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/mnt/storage/mystuf/development/build-A-bot
+
+# ⚠️ SINGLE SOURCE OF TRUTH FOR THE SERVED MODEL — MUST MATCH THE BRACKETS IN
+# THE CHECKED-OUT TREE. The Devil's training labels encode the stop/target
+# multiples, so a model trained on one bracket and served under another is
+# train/serve skew. As of 2026-08-08 the tree runs 2.0x/4.0x
+# (RiskProfile.for_asset_class("forex")) and the matching model is
+# models/forex_m15_wide. The older models/forex_m15 was trained on 1.0x/2.0x
+# and MUST NOT be served against the current tree.
+Environment=OANDA_MODEL_DIR=models/forex_m15_wide
+Environment=SOAK_GRANULARITY=15
+
+ExecStart=/bin/bash /mnt/storage/mystuf/development/build-A-bot/run_soak.sh
+
+# Stops and targets are enforced in software by this process, and SIGTERM
+# triggers a flatten of open positions. Signal the main process only, and give
+# the flatten room to finish before systemd escalates to SIGKILL.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=90
+
+# Restarts are soak_watchdog.sh's call, not systemd's: an unconditional
+# restart here would cold-start into a closed market on a weekend and would
+# bypass the crash-loop brake.
+Restart=no
+
+[Install]
+WantedBy=default.target
