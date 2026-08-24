@@ -196,3 +196,14 @@ Its **"DO NOT COMMIT" header is stale** — the file is committed, and equivalen
 assertions now live in `tests/test_risk_manager.py`.
 - **Imports from repo:** `execution.factory_orchestrator`,
   `execution.risk_manager`, `data.feed`.
+
+### `diagnose_5yr_holdout.py`
+Diagnostic, not a gate: trains the would-be 5-year artifact on the
+post-holdout remainder and scores it on the untouched holdout so a rejected
+config's overfitting gap can be quantified. Saves nothing, promotes nothing.
+Written for the 2026-08-24 artifact-holdout report
+(`llm_reports/refactors/2026-08-24_artifact-holdout-gate.md`).
+
+- **Imports from repo:** `core.retrainer`, `data.factory`.
+- **Reads:** bars via OANDA REST (pinned window env vars). **Writes:** stdout
+  only.

@@ -2973,7 +2973,7 @@ def main() -> int:
                 "PF=%.4f | Trades=%d (floor=%.0f)",
                 holdout_scores["brier_score"],
                 holdout_scores["expected_value"],
-                holdout_scores["win_rate"],
+                100.0 * holdout_scores["win_rate"],
                 holdout_scores["profit_factor"],
                 holdout_scores["trades"],
                 holdout_trade_floor,
