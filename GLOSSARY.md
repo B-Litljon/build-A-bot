@@ -28,8 +28,9 @@ Two live products share this repo, plus a lot of scaffolding around them:
 - **V5 OANDA forex bot** — the intraday bot. Trades currency pairs and
   metals on OANDA, decides on each sealed bar, enforces its own stops in
   software. *Currently running* as a practice-account soak
-  (`run_oanda.py --daemon --env practice --granularity 15`, kept alive by
-  `soak_watchdog.sh` in cron).
+  (`run_oanda.py --daemon --env practice --granularity 15`), running as the
+  `soak.service` systemd user unit and kept alive by `soak_watchdog.sh` in
+  cron.
 - **V4 equities investor** — a monthly stock ranker on Alpaca. Picks 8 names,
   equal-weighted, max 2 per sector, rebalances once a month from cron. Holds
   for weeks; never watches a tick.
@@ -71,7 +72,8 @@ tests) or dormant experiments kept for reference.
 | File | What it does |
 |---|---|
 | `run_soak.sh` | Launches the forex soak. |
-| `soak_watchdog.sh` | Cron, every 5 min: relaunches the soak if it died. **Kill switch: `touch soak.off` *before* killing it**, or it comes back within 5 minutes. |
+| `soak.service` | systemd **user** unit the soak actually runs as (symlinked into `~/.config/systemd/user/`). Declares the served model dir, and records how the process died — `systemctl --user status soak.service`. Needs `loginctl enable-linger`. |
+| `soak_watchdog.sh` | Cron, every 5 min: starts `soak.service` if the soak died, and logs a post-mortem of the previous run. **Kill switch: `touch soak.off` *before* stopping it**, or it comes back within 5 minutes. |
 | `run_pipeline.sh` | The offline loop: harvest → replay → grade → check drift → retrain if needed. Branches on exit codes. |
 | `run_investor_rebalance.sh` | Monthly investor cron wrapper. |
 | `run_chop_ab.sh` | Wrapper for the chop A/B harness. |
@@ -408,6 +410,25 @@ edge-less stretch and retraining would be chasing noise.
 `reinforcement_voter.py` it means a *volatility band*. In `src/ml/regimes/` it
 means a *hidden market mode* inferred statistically by a Gaussian HMM (states
 are unnamed — "state 0" has no fixed meaning across symbols or runs). Unrelated.
+
+**behavior tag** — a plain-language label for what the market was doing at one
+bar, along two axes: volatility (`low`/`normal`/`high`) and trend
+(`range`/`mixed`/`trend`), combined into names like `trend_high` or
+`range_low`. A third state, `cold`, means the trailing window was not yet warm
+enough to judge — it is excluded from analysis, never pooled. Produced by
+`ml/regimes/behavior_tagger.py`. Distinct from both meanings of *regime* above:
+it is computed for **analysis**, is never fed to the model, and is deliberately
+causal (trailing window only) so a tag means the same thing offline and live.
+
+**behavior matrix** — the table the tagger exists to produce: behavior tag ×
+candidate configuration, scored on trade count, win rate, expectancy and profit
+factor. Answers "which configuration earns its keep in *this* kind of market".
+Its output is a hypothesis to test, not a promotion decision — per-cell samples
+are thin and the scoring is in-sample unless walk-forward.
+
+**candidate** — one evaluation configuration in the behavior matrix: a model
+directory, a threshold pair, bracket widths, and a chop-gate config. Not new
+strategy code — every candidate runs the same strategy with different settings.
 
 ## Live operation
 

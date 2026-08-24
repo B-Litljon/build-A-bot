@@ -18,6 +18,42 @@ bracket, NATR, drift, OOS).
 
 ## Files
 
+### `behavior_matrix.py` — the exception to the warning above
+Scores candidate **configurations** per market behavior: rows are behavior tags
+from `ml/regimes/behavior_tagger.py` (`trend_high`, `range_low`, …), columns are
+candidates, cells carry trade count, win rate, expectancy and profit factor with
+bootstrap intervals. Answers "which configuration earns its keep when the market
+looks like *this*", and `recommend()` names the winner per behavior — or returns
+`None`, which is a real answer when the evidence is thin.
+
+Unlike its neighbours it is **current, not legacy**: every trade it scores is a
+Devil-approved OOS trade captured from the retrainer's own expanding
+walk-forward via `validate_candidate(oos_ledger=...)`. That means the chop veto,
+the labels and the feature pipeline are identical to the ones the promotion gate
+sees — there is no second, drifting scorer. It deliberately does *not* build on
+`replay_test.py` / `evaluate_performance.py`, which are Alpaca-era and hardcode
+the equities setup.
+
+Two rules it enforces so results stay honest:
+
+- **Cost is not optional.** Cells are reported net of a per-trade spread toll in
+  R, with gross beside it. Gross PF is the trap this project has already been
+  caught by (gross 1.373 → net 1.004 on the shipped model). Because the toll is
+  a constant subtracted from every trade, it never changes the *ranking* of
+  cells — only where the zero line falls.
+- **Thin cells are flagged, not hidden.** Below `MIN_CELL_TRADES` (30) a cell is
+  marked uninformative and `recommend()` skips it. A recommender that always
+  recommends is a random number generator with a nice interface.
+
+⚠️ **Lookback must be set with `RETRAIN_DAYS_BACK`**, not by passing `days_back`
+to the fetch. The fold schedule is derived from the module constant, so a longer
+fetch without that env var silently trains on the oldest 60 days and discards
+the rest. `validate_candidate` now warns when the frame's span exceeds it.
+
+- **Imports from repo:** `ml.regimes.behavior_tagger`.
+- **Imported by:** `tests/test_behavior_matrix.py`. Driven by hand.
+- **Reads/writes:** nothing directly; the caller supplies the captured ledger.
+
 ### `failure_modes.py`
 Answers **"*how* are the losers losing?"** — stopped out instantly, bled out
 slowly, or timed out flat. The distinction matters because each points at a
