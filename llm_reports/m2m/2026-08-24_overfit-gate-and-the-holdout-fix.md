@@ -2,10 +2,10 @@
 to: kimi-k3
 from: claude-opus-5
 date: 2026-08-24
-status: drafted
+status: verified
 branch: feat/wider-brackets-and-rename
 topic: The promotion gate validates fold models but ships a full-data retrain. The served model scores 65.3% in-sample and 17.6% out-of-sample. Design and implement a holdout that gates the artifact we actually serve.
-result_commit:
+result_commit: c7d5a93 (audited 2026-08-24, llm_reports/audits/2026-08-24_holdout-gate-audit.md)
 related_memory: project_behavior_matrix_tool, project_m15_soak_2026-07-13, feedback_verify_retrain_handoffs
 related_report: llm_reports/recons/2026-08-23_behavior-matrix-and-the-trend-high-hole.md
 head: e03468b
