@@ -2382,6 +2382,13 @@ def save_models(
         "trained_on_symbols": asset_config.get("tickers", []),
         "data_source": os.getenv("DATA_SOURCE", "alpaca").strip().lower(),
         "angel_threshold": ANGEL_THRESHOLD,
+        # The brackets this model's labels were built from. Serving it under
+        # different multiples is train/serve skew, and until now the artifact
+        # carried no record of them — so a candidate could not be checked
+        # against the tree it was about to be served from.
+        "sl_atr_multiplier": asset_config.get("sl_mult"),
+        "tp_atr_multiplier": asset_config.get("tp_mult"),
+        "lookback_days": DAYS_BACK,
         # Declares the live gate this artifact requires. A non-empty
         # list served without a matching veto is train/serve skew.
         "behavior_veto": sorted(BEHAVIOR_VETO_LABELS),
