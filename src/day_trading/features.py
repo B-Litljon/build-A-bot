@@ -1,6 +1,6 @@
 """
 src/day_trading/features.py
-Feature Engineering Pipeline — Universal Scalper V4.0
+Feature Engineering Pipeline — Intraday Trend Engine V4.0
 
 Three composable generators chained in this order:
 

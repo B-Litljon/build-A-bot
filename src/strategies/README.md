@@ -37,8 +37,8 @@ the live set is 22 columns (23 with `cost_ratio`).
 
 - **Imports from repo:** none. **Data artifacts:** none.
 - **Imported by:** `concrete_strategies/ml_strategy.py`,
-  `src/execution/oanda_scalper_orchestrator.py`,
-  `src/execution/factory_orchestrator.py`, `tests/test_oanda_scalper.py`.
+  `src/execution/oanda_forex_orchestrator.py`,
+  `src/execution/factory_orchestrator.py`, `tests/test_oanda_forex.py`.
 
 ### `__init__.py`
 Empty package marker.
@@ -81,7 +81,7 @@ Two runtime behaviours worth knowing:
   `ml.feature_pipeline`, `ml.features.v3_features`, `ml.regimes.hmm_regime`,
   `ml.trainers.v3_rf_trainer`.
 - **Imported by:** `concrete_strategies/__init__.py`,
-  `ml_factory_strategy.py`, `src/execution/oanda_scalper_orchestrator.py`,
+  `ml_factory_strategy.py`, `src/execution/oanda_forex_orchestrator.py`,
   `run_oanda.py`, `tests/`.
 - **Reads:** `models/<asset_class>/angel_latest.pkl`, `devil_latest.pkl`,
   `threshold.json`, `metadata.json`, `spread_alphas.json`, and

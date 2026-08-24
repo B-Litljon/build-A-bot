@@ -44,7 +44,7 @@ the canonical bar shape.
 ### `fundamentals.py` / `macro.py`
 `FundamentalProvider` (company financials: sector, valuation ratios, quarterly
 income statements) and `MacroProvider` (economy-wide series like VIX and
-yields). Both are used by the **equities investor**, never by the forex scalper.
+yields). Both are used by the **equities investor**, never by the forex bot.
 - **Imported by:** `factory.py`, `providers/*`, `tests/test_composite_fundamentals.py`.
 
 ### `enums.py`
@@ -82,15 +82,18 @@ ticks itself. Contains the hardening that keeps the live soak alive: a
 20-second read-inactivity timeout (OANDA heartbeats every ~5s, so silence means
 a dead socket), a `seconds_since_last_message` liveness property the
 orchestrator's watchdog polls, and `force_disconnect()` to force a reconnect.
-Also exposes a raw `tick_callback` the scalper uses to measure live spreads —
-that hook runs inline on the stream thread and must not block.
+Also exposes a raw `tick_callback` the forex bot uses to measure live spreads —
+that hook runs inline on the stream thread and must not block. And
+`get_tradeable_instruments()`, the account's full instrument set, which the
+forex bot uses at boot to drop symbols it would only get rejected on; it returns
+an empty set on failure, meaning "unknown", never "nothing tradeable".
 
 > ⚠️ `volume` from this provider is **tick count, not traded size** — OANDA
 > doesn't report real volume. Training data uses the same proxy, so the two
 > agree, but don't read it as money changing hands.
 
 - **Imports from repo:** `data.market_provider`.
-- **Imported by:** `run_oanda.py`, `src/execution/oanda_scalper_orchestrator.py`,
+- **Imported by:** `run_oanda.py`, `src/execution/oanda_forex_orchestrator.py`,
   `factory.py`, `scripts/probe_model.py`, `tests/test_oanda_tick_hook.py`,
   `tests/test_stream_liveness.py`.
 

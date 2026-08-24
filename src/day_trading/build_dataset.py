@@ -1,6 +1,6 @@
 """
 src/day_trading/build_dataset.py
-Master Training Dataset Compiler — Universal Scalper V4.0
+Master Training Dataset Compiler — Intraday Trend Engine V4.0
 
 Loads raw 5-minute and daily Parquet files produced by harvester_5m.py,
 runs the full feature-engineering and target-labeling pipeline for each
@@ -181,7 +181,7 @@ def build(universe: List[str] = UNIVERSE) -> pl.DataFrame:
     t0 = time.perf_counter()
 
     logger.info("=" * 70)
-    logger.info("DAY TRADE DATASET COMPILER  —  Universal Scalper V4.0")
+    logger.info("DAY TRADE DATASET COMPILER  —  Intraday Trend Engine V4.0")
     logger.info("=" * 70)
     logger.info("Universe : %s", ", ".join(universe))
     logger.info("Output   : %s", OUTPUT_PATH)

@@ -1,6 +1,6 @@
 # `tests/`
 
-**128 tests, all passing.** Run with:
+**200 tests, all passing.** Run with:
 
 ```bash
 PYTHONPATH=src:. python -m pytest -q
@@ -13,7 +13,7 @@ webhook on import).
 
 > ⚠️ **`verify_warmup.py` is never run.** It contains a real test case, but
 > collection also requires the default `test_*.py` filename pattern and this
-> file doesn't match. The suite reports 128 collected and this one isn't among
+> file doesn't match. The suite reports 137 collected and this one isn't among
 > them. Renaming it to `test_warmup.py` would include it. Flagged, not changed.
 
 **No network, no broker, no real models.** Every test stubs its dependencies —
@@ -37,9 +37,11 @@ See the root [GLOSSARY.md](../GLOSSARY.md) for domain terms.
 |---|---:|---|
 | `test_composite_fundamentals.py` | 18 | Provider chaining: first non-empty wins; a raising source is a miss, not an error |
 | `test_risk_manager.py` | 16 | The bracket floors and all three chop gates |
-| `test_oanda_scalper.py` | 22 | The live bot's control flow — mostly failure paths |
+| `test_oanda_forex.py` | 31 | The live bot's control flow — mostly failure paths |
 | `test_feature_stats.py` | 12 | The stats artifact and the PSI maths |
 | `test_stream_liveness.py` | 9 | What happens when the price feed goes silent |
+| `test_entry_guards.py` | 15 | Post-exit cooldown + the correlated-exposure cap |
+| `test_events.py` | 11 | The telemetry sink: never raises, never blocks, never on the tick path |
 | `test_cost_feature.py` | 9 | The per-instrument cost feature and veto alphas |
 | `test_trading_mcp.py` | 9 | The MCP two-step confirm-token safety flow |
 | `execution/test_live_orchestrator.py` | 12 | State machine + **thread-ownership regression** + persistence ownership |
@@ -47,6 +49,7 @@ See the root [GLOSSARY.md](../GLOSSARY.md) for domain terms.
 | `test_oanda_tick_hook.py` | 5 | The raw tick callback contract |
 | `test_execution_safety.py` | 3 | Rebalance deadband, fill parsing, partial fills |
 | `test_retrainer_output_dir.py` | 3 | `RETRAIN_MODEL_DIR` isolation |
+| `test_retraining_notification.py` | 9 | The retrain Discord embed: a gate pass is not a deployment |
 | `test_ml_strategy_guards.py` | 5 | The stale-bar guard + threshold.json pinning |
 | `verify_warmup.py` | (1, **not collected**) | Warm-up injection |
 
@@ -58,7 +61,7 @@ trades the system was built to refuse. Note `test_cold_start_bypasses_regime_gat
 with too little history the regime gate must stand down rather than veto
 everything, or a just-restarted bot freezes.
 
-**`test_oanda_scalper.py`** — the failure-path collection.
+**`test_oanda_forex.py`** — the failure-path collection.
 `test_rapid_breach_ticks_close_once` (quotes arrive far faster than a close
 completes, so a burst must produce *one* close),
 `test_close_not_called_synchronously_in_tick` (the tick callback runs on the
@@ -71,7 +74,10 @@ The `test_seam_catchup_*` group pins the reconnect-gap fix: a bar that sealed
 while the stream was down is scored exactly once if fresh — stale bars and
 already-scored bars are skipped, and an evaluation error must not escape (it
 would kill the reconnect loop). This is the fix for the 2026-07 soak losing
-~half its signals in re-prime gaps.
+~half its signals in re-prime gaps. The `test_seam_backfill_*` group covers
+its other half — the bar in flight when the stream died is re-fetched from
+REST and scored, with retries for REST lag and a quiet give-up that never
+raises inside the bar callback.
 
 **`test_oanda_tick_hook.py`** — `test_tick_callback_exception_logged_continues`
 is the important one: an exception escaping the callback would kill the price
@@ -93,8 +99,25 @@ is the isolation mechanism for experiments; if it leaked, a side experiment
 would overwrite the promoted model a live bot hot-reloads, silently swapping the
 running strategy's brain for an unvalidated candidate.
 
+**`test_retraining_notification.py`** — the other half of that isolation. The
+files stayed isolated on 2026-08-17, but the *alert* did not: a side experiment
+posted "✅ PROMOTED — New models passed all validation gates and are now live"
+to Discord, indistinguishable from a real production promotion. Nothing had
+gone live. These tests pin that a run redirected by `RETRAIN_MODEL_DIR` is
+reported as a side candidate, in a different colour, naming the directory it
+actually wrote to. Discord is the only channel this system uses to reach a
+human, so a false alarm there costs real trust.
+
 **`test_trading_mcp.py`** — pins that a wrong, missing, or reused confirm token
 cannot act, i.e. an AI assistant can't start or stop the live bot by accident.
+
+**`test_investor_benchmark_gate.py`** — covers the investor's lift-over-benchmark
+gate: the sector cap it simulates, the month-pairing that turns model scores into
+realised returns (including the holding period that legitimately closes *outside*
+the test window), and that an unmeasurable model **fails closed** rather than
+sliding through. One test asserts the gate's `TOP_K`/`SECTOR_CAP` still equal the
+orchestrator's — if the deployed basket shape changes, the gate must fail loudly
+rather than quietly measure a basket nobody trades.
 
 ### `__init__.py` / `execution/__init__.py`
 Empty package markers.

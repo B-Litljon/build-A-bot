@@ -25,11 +25,12 @@ that no longer exist: `src/core/trading_bot.py`, `main.py`, `src/main.py`.)
 
 Two live products share this repo, plus a lot of scaffolding around them:
 
-- **V5 OANDA forex scalper** — the intraday bot. Trades currency pairs and
+- **V5 OANDA forex bot** — the intraday bot. Trades currency pairs and
   metals on OANDA, decides on each sealed bar, enforces its own stops in
   software. *Currently running* as a practice-account soak
-  (`run_oanda.py --daemon --env practice --granularity 15`, kept alive by
-  `soak_watchdog.sh` in cron).
+  (`run_oanda.py --daemon --env practice --granularity 15`), running as the
+  `soak.service` systemd user unit and kept alive by `soak_watchdog.sh` in
+  cron.
 - **V4 equities investor** — a monthly stock ranker on Alpaca. Picks 8 names,
   equal-weighted, max 2 per sector, rebalances once a month from cron. Holds
   for weeks; never watches a tick.
@@ -43,7 +44,7 @@ tests) or dormant experiments kept for reference.
 |---|---|---|
 | [`src/`](src/README.md) | All library code. See its README for the package map. | training + live |
 | [`scripts/`](scripts/README.md) | Hand-run tools: the whole V4 investor, model diagnostics, calibration, paper launchers. | manual + monthly cron |
-| [`tests/`](tests/README.md) | 114 tests. No network, no broker, no real models. | CI / manual |
+| [`tests/`](tests/README.md) | 163 tests. No network, no broker, no real models. | CI / manual |
 | `models/` | Trained model artifacts. Subdirectories are separate models: `forex/`, `forex_m15/`, `forex_swing/`, plus legacy root-level `angel_latest.pkl` and `dt_*` (day-trade experiment) and `v4_investor_lgbm.txt`. | read live |
 | `data/` | Bars, ledgers, and processed datasets (`raw/`, `processed/`, `cache/`). Mostly gitignored. | training + analysis |
 | `config/` | Configuration not in code — currently just a baked spread-cost table. | training + live |
@@ -51,6 +52,7 @@ tests) or dormant experiments kept for reference.
 | `docs/` | Three older design documents (architecture, day-trade model, an RSI/Bollinger strategy). | reference |
 | `llm_reports/` | Written reports of work done, filed by category (`audits/`, `handoffs/`, `refactors/`, `recons/`, `stops/`). See its README for the convention. | reference |
 | `m2m_prompts/` | The other half of that ledger: the briefs that *requested* the work. | reference |
+| [`dashboard/`](dashboard/README.md) | Read-only web view of the soak: Rust (axum) API + TypeScript front-end. Reads `logs/events-*.jsonl`, `logs/status.json`, and OANDA REST. Cannot affect trading. | manual |
 | `viz/` | Empty. | — |
 | `src/autopilot/`, `src/research/` | **No source files on this branch** — only stale `__pycache__`. | — |
 
@@ -70,7 +72,8 @@ tests) or dormant experiments kept for reference.
 | File | What it does |
 |---|---|
 | `run_soak.sh` | Launches the forex soak. |
-| `soak_watchdog.sh` | Cron, every 5 min: relaunches the soak if it died. **Kill switch: `touch soak.off` *before* killing it**, or it comes back within 5 minutes. |
+| `soak.service` | systemd **user** unit the soak actually runs as (symlinked into `~/.config/systemd/user/`). Declares the served model dir, and records how the process died — `systemctl --user status soak.service`. Needs `loginctl enable-linger`. |
+| `soak_watchdog.sh` | Cron, every 5 min: starts `soak.service` if the soak died, and logs a post-mortem of the previous run. **Kill switch: `touch soak.off` *before* stopping it**, or it comes back within 5 minutes. |
 | `run_pipeline.sh` | The offline loop: harvest → replay → grade → check drift → retrain if needed. Branches on exit codes. |
 | `run_investor_rebalance.sh` | Monthly investor cron wrapper. |
 | `run_chop_ab.sh` | Wrapper for the chop A/B harness. |
@@ -151,7 +154,7 @@ first live decision. 260 bars is the usual figure (a 50-period average on
 
 **history seam** — the junction where replayed warm-up history meets the live
 stream. They overlap in time, so the orchestrator tracks where history ended to
-avoid double-counting. *(`oanda_scalper_orchestrator.py`)*
+avoid double-counting. *(`oanda_forex_orchestrator.py`)*
 
 **window floor** — rounding a timestamp down to its clock window (12:34 → 12:30
 for 5-minute bars), so bars align to the wall clock rather than to whenever data
@@ -241,6 +244,63 @@ training (`retrainer._compute_chop_veto_mask`), so the model only ever learns
 from bars the live bot would actually take. Changing a gate on one side without
 the other is a silent correctness bug.
 
+## Telemetry
+
+The machine-readable half of the bot's output, added 2026-07-31 so the
+dashboard reads facts rather than regex-scraping a log written for humans.
+*(`src/core/events.py`, consumed by `dashboard/`)*
+
+**event stream** — `logs/events-YYYY-MM-DD.jsonl`, one JSON object per line,
+append-only. Every line carries `ts` (UTC ISO-8601) and `ev` (the kind); see
+`dashboard/README.md` for the per-kind fields.
+
+**bar event** — one record per *evaluation*, carrying that bar's angel and
+devil probabilities and the outcome. The heartbeat summarises 30 bars; this is
+the bar itself, and it is the first per-bar probability record this project has
+kept.
+
+**status snapshot** — `logs/status.json`, the bot's "right now": positions,
+counters, config, last bar per symbol. Replaced atomically (temp + rename) each
+bar, so a reader never sees a partial file.
+
+**opt-in telemetry** — nothing is written until `events.configure()` is called.
+Importing a strategy in a test or backtest must never append to the live bot's
+logs. `EVENTS_ENABLED=0` disables it outright.
+
+**best-effort** — the sink never raises, never blocks (bounded queue + daemon
+writer; a full queue DROPS events), and is never called from the tick path.
+Losing telemetry always beats stalling a bar.
+
+## The entry guards
+
+Distinct from the gates above: the gates ask "is this trade worth its cost?",
+these ask "should we be taking *this* trade *now*, given what we just did and
+what we already hold?" They live in the orchestrator, not the RiskManager, and
+have no training-side mirror — they constrain sequencing and concentration,
+not the merit of a setup. *(`src/execution/oanda_forex_orchestrator.py`,
+both added 2026-07-30)*
+
+**post-exit cooldown** — a symbol cannot be re-entered for a set window after
+its position closes (`OANDA_REENTRY_COOLDOWN_SECONDS`, default one bar period;
+0 disables). A fresh stop is evidence the read was wrong, and the next bar is
+too soon to re-litigate it. Blocks *opening* only — reversing a position that
+is still open is a different act and stays allowed.
+
+**currency leg** — one side of an instrument, signed by direction. Long
+GBP_JPY is `+GBP, −JPY`; short is the mirror. XAU_USD decomposes the same way,
+which is what makes a metals position and a fiat cross comparable.
+
+**correlated-exposure cap** — the maximum number of open positions sharing the
+same signed currency leg (`OANDA_MAX_PER_CURRENCY`, default 2; 0 disables).
+Long GBP_JPY + long AUD_JPY + long NZD_JPY is not three trades, it is one
+short-yen bet at triple size — which is exactly how it behaved on 2026-07-30,
+when all three lost together.
+
+**reservation (`_pending_entries`)** — an entry that has passed the cap but
+whose fill has not returned yet, counted as though already held. Without it,
+two signals evaluated on the same bar both see the pre-trade world and both
+pass a cap they jointly breach.
+
 ## Training
 
 **feature** — one input column the model sees. The live set is 22 columns, or 23
@@ -277,6 +337,28 @@ model leans toward current market behaviour.
 **promotion gate** — the pass/fail that decides whether new models overwrite the
 live ones. Failing is a *healthy* outcome, not a crash: the retrainer exits 2 and
 the previous weights stay in place.
+
+**lift over random vs lift over benchmark** — two different questions, and for a
+long time the investor only asked the first. "Better than guessing" is measured
+against the base rate (a top-*quintile* target makes random guessing score 0.20).
+"Better than doing nothing" is measured against equal-weighting the whole
+universe. A model can pass the first and fail the second — the 2026-07-03
+investor promotion did exactly that — so the investor's gate now requires both.
+
+**benchmark gate** — the investor's lift-over-benchmark check
+(`scripts/investor_train_model.py`). Simulates the basket actually deployed
+(top 8, max 2 per sector) against equal-weighting all 96 names. The bar that
+binds is a **t-statistic** on the monthly excess, not the excess itself: that
+quantity carries a standard error of roughly 60 basis points over ~30 months,
+so point estimates are nearly uninformative on their own. The shipped model is
+the worked example — +47.3 bps/month reads as substantial and is t = 0.75.
+
+**effective sample size** — how much independent evidence a set of overlapping
+measurements really contains. The gate re-measures at five fold alignments, but
+those share nearly all their rows and their excess series correlate 0.71, so
+they amount to about 2.2 independent samples. Re-slicing the same data guards
+against a lucky boundary; it does not manufacture statistical power. The same
+caution applies to the horizon study's "held at 5 of 5 alignments".
 
 ## Scoring
 
@@ -328,6 +410,25 @@ edge-less stretch and retraining would be chasing noise.
 `reinforcement_voter.py` it means a *volatility band*. In `src/ml/regimes/` it
 means a *hidden market mode* inferred statistically by a Gaussian HMM (states
 are unnamed — "state 0" has no fixed meaning across symbols or runs). Unrelated.
+
+**behavior tag** — a plain-language label for what the market was doing at one
+bar, along two axes: volatility (`low`/`normal`/`high`) and trend
+(`range`/`mixed`/`trend`), combined into names like `trend_high` or
+`range_low`. A third state, `cold`, means the trailing window was not yet warm
+enough to judge — it is excluded from analysis, never pooled. Produced by
+`ml/regimes/behavior_tagger.py`. Distinct from both meanings of *regime* above:
+it is computed for **analysis**, is never fed to the model, and is deliberately
+causal (trailing window only) so a tag means the same thing offline and live.
+
+**behavior matrix** — the table the tagger exists to produce: behavior tag ×
+candidate configuration, scored on trade count, win rate, expectancy and profit
+factor. Answers "which configuration earns its keep in *this* kind of market".
+Its output is a hypothesis to test, not a promotion decision — per-cell samples
+are thin and the scoring is in-sample unless walk-forward.
+
+**candidate** — one evaluation configuration in the behavior matrix: a model
+directory, a threshold pair, bracket widths, and a chop-gate config. Not new
+strategy code — every candidate runs the same strategy with different settings.
 
 ## Live operation
 
@@ -418,6 +519,6 @@ Under `data/`:
 ## Discord personas
 
 Alerts are tagged by sender so the source is obvious at a glance:
-**Build-A-Bot Executive** (Alpaca path), **Build-A-Bot V5 Scalper** (OANDA
+**Build-A-Bot Executive** (Alpaca path), **Build-A-Bot V5 Forex** (OANDA
 path), **The Accountant** (retraining verdicts and drift alerts).
 *(`src/core/notification_manager.py`)*

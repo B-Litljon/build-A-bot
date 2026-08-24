@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 """
-Tests for the provider's raw tick callback -- the hook the scalper's software
+Tests for the provider's raw tick callback -- the hook the forex bot's software
 stop-loss depends on.
 
 This callback runs inline on the blocking stream thread for EVERY quote, so the

@@ -29,7 +29,7 @@ see the model is alive during no-trade stretches.
   `ml.feature_pipeline`, `ml.features.v3_features`, `ml.regimes.hmm_regime`,
   `ml.trainers.v3_rf_trainer`.
 - **Imported by:** `__init__.py`, `ml_factory_strategy.py`,
-  `src/execution/oanda_scalper_orchestrator.py`, `run_oanda.py`, and tests.
+  `src/execution/oanda_forex_orchestrator.py`, `run_oanda.py`, and tests.
 - **Reads:** `models/<asset_class>/` — `angel_latest.pkl`, `devil_latest.pkl`,
   `threshold.json`, `metadata.json`, `spread_alphas.json`, and `hmm_latest.pkl`
   when regime features are on. **Writes:** nothing.

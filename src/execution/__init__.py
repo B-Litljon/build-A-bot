@@ -9,7 +9,7 @@ Note: LiveOrchestrator (legacy monolith) is intentionally excluded.
       It lives in live_orchestrator.py and is quarantined until Tier 3
       decoupling is complete.
 
-Note also that OandaScalperOrchestrator -- the orchestrator actually running
+Note also that OandaForexOrchestrator -- the orchestrator actually running
 live -- is likewise not exported here; run_oanda.py imports it by path.
 
 Glossary:

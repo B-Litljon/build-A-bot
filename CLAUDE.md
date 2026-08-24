@@ -41,8 +41,13 @@ Conventions for Layer 3:
   `ps aux | grep run_oanda` before assuming otherwise.
 - **`soak_watchdog.sh` is in cron every 5 minutes** and will relaunch the soak
   if it dies — from whatever is in the working tree, on whatever branch is
-  checked out. To stop the soak, `touch soak.off` **before** killing it, or it
+  checked out. To stop the soak, `touch soak.off` **before** stopping it, or it
   comes back within 5 minutes.
+- **The soak runs as the `soak.service` systemd user unit** (since 2026-08-22).
+  Stop it with `systemctl --user stop soak.service`; how a run ended is in
+  `systemctl --user status soak.service` and in the watchdog's post-mortem line
+  in `logs/watchdog.log`. The served model dir is declared in `soak.service` —
+  that is the single source of truth, and it must match the tree's brackets.
 - **Stops and targets are enforced in software**, by the bot process itself. A
   dead bot means an unwatched open position. Treat anything that could crash or
   hang `src/execution/` as a money-losing bug, not a cosmetic one.
@@ -61,7 +66,10 @@ Verified during the 2026-07-27 glossary pass:
 - **`Signal.raw_tp_distance` is written but never read.** Target sizing belongs
   to `RiskManager`'s multipliers, deliberately.
 - **Bracket multipliers differ by asset class.** The module constants say
-  0.5×/3.0×, but `RiskProfile.for_asset_class("forex")` overrides to 1.0×/2.0×.
+  0.5×/3.0×, but `RiskProfile.for_asset_class("forex")` overrides to 2.0×/4.0×
+  (was 1.0×/2.0× until 2026-08-08). `spread_k_base` is 3.0 for forex, not the
+  module default 1.5 — it is a toll cap, admitting a trade only when the spread
+  eats at most `1/k` of the stop distance.
 - **"regime" means two things** (volatility band vs HMM hidden state), and so
   does **"watchdog"** (in-process stop monitor vs the cron restarter) and
   **"heartbeat"** (OANDA keepalive vs the strategy's periodic log).
@@ -73,7 +81,7 @@ Verified during the 2026-07-27 glossary pass:
 ## Testing
 
 ```bash
-PYTHONPATH=src:. python -m pytest -q     # 128 tests
+PYTHONPATH=src:. python -m pytest -q     # 200 tests
 ```
 
 `PYTHONPATH=src:.` is required — entry points prepend `src/` to the path, which

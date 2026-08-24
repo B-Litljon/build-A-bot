@@ -2,7 +2,7 @@
 """
 Bake a per-instrument spread-alpha table from a soak log's SPREAD_CALIB lines.
 
-The live orchestrator (execution.oanda_scalper_orchestrator) periodically logs
+The live orchestrator (execution.oanda_forex_orchestrator) periodically logs
 empirical spread calibration per instrument:
 
     SPREAD_CALIB XAU_USD | n=294 med_spread_pct=0.01481 [p25=... p75=...] \

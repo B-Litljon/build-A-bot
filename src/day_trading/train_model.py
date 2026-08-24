@@ -1,6 +1,6 @@
 """
 src/day_trading/train_model.py
-Walk-Forward Angel/Devil Training — Universal Scalper V4.0
+Walk-Forward Angel/Devil Training — Intraday Trend Engine V4.0
 
 Pipeline
 --------
@@ -669,7 +669,7 @@ def _print_report(report: TrainingReport) -> None:
     thin = "-" * 70
     logger.info("")
     logger.info(bar)
-    logger.info("TRAINING REPORT — Universal Scalper V4.0 (Day Trade)")
+    logger.info("TRAINING REPORT — Intraday Trend Engine V4.0 (Day Trade)")
     logger.info(bar)
 
     logger.info("Walk-Forward Fold Results:")
@@ -721,7 +721,7 @@ def _print_report(report: TrainingReport) -> None:
 
 def main() -> None:
     logger.info("=" * 70)
-    logger.info("DAY TRADE MODEL TRAINER — Universal Scalper V4.0")
+    logger.info("DAY TRADE MODEL TRAINER — Intraday Trend Engine V4.0")
     logger.info("=" * 70)
 
     # ── Load dataset ──────────────────────────────────────────────────────────

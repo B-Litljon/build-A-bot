@@ -9,7 +9,7 @@ which is the main thing to get straight before reading any of it:
 
 | File | Market | Status |
 |---|---|---|
-| `oanda_scalper_orchestrator.py` | OANDA forex | ⚠️ **currently running live** (M15 practice soak) |
+| `oanda_forex_orchestrator.py` | OANDA forex | ⚠️ **currently running live** (M15 practice soak) |
 | `live_orchestrator.py` | Alpaca equities + crypto | Working, tested, not the live bot |
 | `factory_orchestrator.py` | Alpaca (Factory path) | Smallest/clearest; good place to start reading |
 
@@ -61,15 +61,15 @@ Note the forex profile overrides the bracket multipliers to **1.0× / 2.0×**
 
 - **Imports from repo:** none (numpy only — deliberately dependency-light).
 - **Imported by:** `src/core/retrainer.py`, `factory_orchestrator.py`,
-  `oanda_scalper_orchestrator.py`, `__init__.py`, `run_factory.py`,
+  `oanda_forex_orchestrator.py`, `__init__.py`, `run_factory.py`,
   `run_oanda.py`, `chop_ab_test.py`, `scripts/generate_feature_stats.py`,
   `scripts/run_paper_live.py`, `scripts/smoke_test.py`,
   `tests/test_risk_manager.py`, `tests/test_cost_feature.py`.
 - **Data artifacts:** none directly; reads per-instrument costs passed in from
   the model dir's `spread_alphas.json`.
 
-### `oanda_scalper_orchestrator.py` (1218 lines) — ⚠️ the live bot
-`OandaScalperOrchestrator`. Two clocks run at once, and most of the design
+### `oanda_forex_orchestrator.py` (1621 lines) — ⚠️ the live bot
+`OandaForexOrchestrator`. Two clocks run at once, and most of the design
 follows from that:
 
 - **Slow path** — a bar seals, features are computed, the model is asked, a
@@ -87,9 +87,37 @@ Things worth knowing:
   stream was down and is still fresh (`SEAM_CATCHUP_MAX_AGE_SECONDS`; default
   one bar period). Before this existed, signals sealing during an outage were
   silently lost — ~6 of 15 would-be signals in the 2026-07 soak.
+  Its other half, `_backfill_seam_bar`, handles the bar that was *in flight*
+  when the stream died: the stream's copy is incomplete so it is dropped, but
+  it has sealed, so the complete version is re-fetched from REST and scored
+  (`SEAM_BACKFILL_ATTEMPTS`, `SEAM_BACKFILL_RETRY_DELAY`). Measured cost
+  without it: 5 lost evaluations per symbol in the first 16h of the
+  2026-07-28 soak, ~8% of bars.
+- **Reconnect backoff** — jittered exponential, 5s base / 60s cap, reset after
+  120s of healthy streaming (`OANDA_RECONNECT_*`). The cap sits below the
+  liveness watchdog's 60s flatten threshold, so backing off never leaves a
+  position unwatched longer than the stall response already permits.
+- **Entry guards** (added 2026-07-30, both born from one morning's trades) —
+  a **post-exit cooldown** (`OANDA_REENTRY_COOLDOWN_SECONDS`, default one bar
+  period) keeps a symbol from being re-entered on the bar after its own stop,
+  and a **correlated-exposure cap** (`OANDA_MAX_PER_CURRENCY`, default 2)
+  limits how many open positions may share the same *signed currency leg* —
+  long GBP_JPY and long AUD_JPY are two short-JPY bets, and on 2026-07-30 a
+  third one joined them and all three lost together. In-flight entries are
+  reserved in `_pending_entries` so two signals on the same bar cannot both
+  pass the cap before either fills. The cooldown does not block *flipping* an
+  already-open position; set either knob to 0 to disable it.
 - **`_reconcile_on_boot`** — asks the broker what's actually open before
   trading. A restart must adopt reality, not assume it's flat, or a position
   left by a crashed process runs with nothing watching its stop.
+- **`_drop_untradeable_symbols`** — at boot, drops configured symbols the
+  account isn't permitted to trade. `XAU_USD`/`XAG_USD` are in the trained
+  basket but not on this account, so every metals signal became a submitted
+  order, an `INSTRUMENT_NOT_TRADEABLE` rejection and a stack trace that reads
+  like a real fault. Deliberately **fail-open**: only a successful instrument
+  lookup may drop anything, because an API blip that silently muted the whole
+  basket would be far worse than the odd rejection. Dropping *everything*
+  aborts startup instead of running a bot that can't place an order.
 - **Liveness watchdog** — 60s of silence (OANDA heartbeats every ~5s) means the
   feed is dead, so it reconnects **and flattens exposure**. Correct, given
   software-enforced stops.
@@ -104,7 +132,8 @@ Things worth knowing:
   `execution.oanda_order_manager`, `execution.risk_manager`,
   `strategies.concrete_strategies.ml_strategy`.
 - **Imported by:** `run_oanda.py`, `scripts/bake_spread_alphas.py`,
-  `tests/test_oanda_scalper.py`, `tests/test_stream_liveness.py`.
+  `tests/test_oanda_forex.py`, `tests/test_stream_liveness.py`,
+  `tests/test_entry_guards.py`.
 - **Data artifacts:** none written directly; logs to `logs/soak_*.log`.
 
 ### `oanda_order_manager.py`
@@ -120,8 +149,8 @@ than "buy N", which is what makes a retry after an ambiguous network failure
 safe.
 
 - **Imports from repo:** none (oandapyV20 only).
-- **Imported by:** `oanda_scalper_orchestrator.py`, `run_oanda.py`,
-  `tests/test_oanda_entry.py`, `tests/test_oanda_scalper.py`,
+- **Imported by:** `oanda_forex_orchestrator.py`, `run_oanda.py`,
+  `tests/test_oanda_entry.py`, `tests/test_oanda_forex.py`,
   `tests/test_execution_safety.py`.
 
 ### `live_orchestrator.py` (2475 lines) — Alpaca dual-stream
@@ -175,6 +204,6 @@ The live paths use market orders only.
 
 ### `__init__.py`
 Exports only `FactoryOrchestrator` and `RiskManager`. Both `LiveOrchestrator`
-and `OandaScalperOrchestrator` are **intentionally excluded** so importing this
+and `OandaForexOrchestrator` are **intentionally excluded** so importing this
 package doesn't pull in the heavy orchestrators; entry-point scripts import them
 by path.

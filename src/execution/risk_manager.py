@@ -25,8 +25,14 @@ Glossary:
         for_asset_class(), which also reads the environment overrides.
     sl_atr_multiplier / tp_atr_multiplier -- bracket width in units of recent
         volatility. Defaults 0.5 / 3.0 (a 6:1 payoff) for equities; the FOREX
-        profile overrides these to 1.0 / 2.0 (2:1). Always check which profile
-        is live before assuming a ratio.
+        profile overrides these to 2.0 / 4.0 (2:1). Always check which profile
+        is live before assuming a ratio. The forex pair was 1.0 / 2.0 until
+        2026-08-08; it was doubled because the spread was eating a median 40%
+        of a 1x-ATR stop. Widening does NOT improve the odds of the bracket
+        (measured stop-hit rate is ~66.6% at every width, against 66.7% for a
+        fair 2:1) -- it dilutes a fixed cost over more risk, cutting the toll
+        to ~22% and the break-even win rate from 46.7% to 40.6%. See
+        llm_reports/recons/2026-08-08_stop-width-and-the-spread-toll.md.
     risk_per_trade -- 0.02, i.e. risk 2% of account equity per trade. This,
         not a fixed size, is what determines position size.
     max_notional_cap -- 100000, a hard ceiling on position value regardless of
@@ -61,7 +67,11 @@ Glossary:
         not UTC, so it tracks daylight saving instead of drifting an hour
         twice a year.
 
-    spread_k_base -- 1.5; the base safety multiple on cost in Gate A.
+    spread_k_base -- 3.0 for forex; the base safety multiple on cost in Gate A.
+        Algebraically a TOLL CAP: the gate is sl_dist >= k * spread, i.e. it
+        admits a trade only when the spread eats at most 1/k of the stop
+        distance. k=3.0 caps the toll at 33%. It was 1.5 (a 67% cap) until
+        2026-08-08, which admitted trades that could not pay for themselves.
     spread_k_coupling -- 0.0 by default, i.e. DECOUPLED and flat. Non-zero
         makes the multiplier scale with volatility.
     spread_k_coupling_mode -- "tighten" (more cost discipline as volatility
@@ -249,12 +259,12 @@ class RiskProfile:
         if asset_class == "forex":
             bo = _parse_blackout_et(os.getenv(ENV_BLACKOUT_ET, _DEFAULT_BLACKOUT_ET))
             return cls(
-                sl_atr_multiplier=1.0,
-                tp_atr_multiplier=2.0,
+                sl_atr_multiplier=2.0,
+                tp_atr_multiplier=4.0,
                 min_sl_pips=float(os.getenv(ENV_FOREX_MIN_SL_PIPS, "2.0")),
                 min_sl_pct_metals=float(os.getenv(ENV_METALS_MIN_SL_PCT, "0.0001")),
                 round_precision=5,
-                spread_k_base=float(os.getenv(ENV_SPREAD_K, "1.5")),
+                spread_k_base=float(os.getenv(ENV_SPREAD_K, "3.0")),
                 spread_k_coupling=float(os.getenv(ENV_SPREAD_K_COUPLING, "0.0")),
                 spread_k_coupling_mode=os.getenv(
                     ENV_COUPLING_MODE, COUPLING_TIGHTEN

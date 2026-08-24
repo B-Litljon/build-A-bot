@@ -10,7 +10,7 @@ Required environment variables:
     OANDA_API_KEY       - Bearer token from hub.oanda.com
     OANDA_ACCOUNT_ID    - Account ID (numeric string)
 
-This is the data feed for the live forex scalper. OANDA streams individual
+This is the data feed for the live forex bot. OANDA streams individual
 price quotes rather than finished bars, so this module builds the bars itself
 from ticks. See GLOSSARY.md (bid/ask, mid price, sealed bar, heartbeat).
 
@@ -44,7 +44,7 @@ Glossary:
         threads safely into the event loop when one is running.
     _tick_callback -- optional raw-quote hook called on every tick with
         (symbol, bid, ask). Must return in under 50 microseconds and do no
-        blocking I/O; it runs inline on the stream thread. The scalper uses it
+        blocking I/O; it runs inline on the stream thread. The forex bot uses it
         to track live spreads.
     _last_stream_msg / seconds_since_last_message -- when any message last
         arrived, heartbeats included. The orchestrator's watchdog reads this to
@@ -56,6 +56,9 @@ Glossary:
         every part-built bar rather than discarding it.
     get_historical_bars -- pages complete mid-price candles over a date range.
         In-progress candles are skipped, so warm-up never sees a partial bar.
+    get_tradeable_instruments -- the full set of instrument names this ACCOUNT
+        may trade, for membership tests. Returns an empty set on API failure,
+        which callers must read as "unknown", never as "nothing tradeable".
 """
 
 import asyncio
@@ -293,6 +296,27 @@ class OandaMarketProvider(MarketDataProvider):
         except Exception as e:
             logger.error("OandaMarketProvider.get_active_symbols failed: %s", e)
             return []
+
+    def get_tradeable_instruments(self) -> set:
+        """
+        Return every instrument this account may trade, as OANDA names.
+
+        Unlike :meth:`get_active_symbols` this is unlimited and returns a set,
+        because callers use it as a membership test rather than a shortlist.
+
+        Returns an EMPTY set if the account cannot be queried. Callers must
+        treat empty as "unknown", never as "nothing is tradeable" — a
+        transient API failure must not be able to disable trading.
+        """
+        try:
+            req = v20_accounts.AccountInstruments(accountID=self._account_id)
+            self._client.request(req)
+            return {i["name"] for i in req.response.get("instruments", [])}
+        except Exception as e:
+            logger.error(
+                "OandaMarketProvider.get_tradeable_instruments failed: %s", e
+            )
+            return set()
 
     def get_historical_bars(
         self,

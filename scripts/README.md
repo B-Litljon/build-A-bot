@@ -18,7 +18,7 @@ See the root [GLOSSARY.md](../GLOSSARY.md) for domain terms.
 
 ## 1. The V4 Investor — monthly stock ranker
 
-A separate product from the forex scalper, sharing almost nothing but the repo.
+A separate product from the forex bot, sharing almost nothing but the repo.
 Pipeline:
 
 ```
@@ -79,8 +79,29 @@ Two subtleties:
   chance. `GATE_P8_MIN_LIFT = 1.1` is the one that matters in practice — the
   orchestrator deploys `TOP_K=8`, so it gates at the depth actually traded.
   `INVESTOR_GATE_FORCE=1` is a deliberately awkward escape hatch.
+- **The benchmark gate (added 2026-08-03) is the one that bites.** Every
+  threshold above measures lift over *random*, which cannot tell "better than
+  guessing" from "better than doing nothing" — on 2026-07-03 a model passed
+  all of them while losing to an equal-weighted basket of the same universe.
+  The benchmark gate simulates the deployed basket (`TOP_K=8`, `SECTOR_CAP=2`)
+  against equal-weighting the whole universe. **`INVESTOR_GATE_BENCH_T`
+  (default 2.0) is the constraint that binds** — the mean monthly excess has a
+  standard error of roughly 60 bps on ~30 months, so a point estimate on its
+  own means little. The current model illustrates it: +47.3 bps looks
+  substantial and is t = 0.75. `INVESTOR_GATE_BENCH_BPS` (default 25) is a
+  secondary sanity floor, checked at every alignment in
+  `INVESTOR_GATE_BENCH_ALIGNMENTS` (default `0,7,14,21,28`) to catch results
+  that hang on one lucky set of fold boundaries — but note the alignments'
+  excess series correlate ~0.71, so five are worth about **2.2 independent
+  samples**, not five. If prices cannot be loaded, the gate **fails closed**.
+  If nothing ever clears this bar, that is a finding, not a broken gate: the
+  fallback is equal-weighting.
 
-- **Writes:** `models/v4_investor_lgbm.txt`.
+- **Reads:** `data/processed/v4_training_features.parquet`, plus
+  `data/raw/v4_investor_data.parquet` (closing prices — the training frame
+  carries none, since prices leak the forward return).
+- **Writes:** `models/v4_investor_lgbm.txt` and its `.metadata.json` sidecar
+  (now including a `benchmark` block with the per-alignment spread).
 
 ### `portfolio_orchestrator.py`
 The only part that places real orders. Monthly cron
@@ -138,7 +159,7 @@ placeholder assumption (0.15) with measured reality.
 > size, so alphas measured on 15-minute bars are **not valid** for 1-minute
 > bars. It's recorded in the output and the retrainer warns loudly on mismatch.
 
-- **Imports from repo:** `execution.oanda_scalper_orchestrator`.
+- **Imports from repo:** `execution.oanda_forex_orchestrator`.
 - **Reads:** a soak log. **Writes:** a spread-table JSON (e.g.
   `config/spread_alphas_m15.json`), consumed via `RETRAIN_SPREAD_TABLE`.
 

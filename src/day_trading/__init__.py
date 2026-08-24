@@ -1,5 +1,5 @@
 """
-Day Trading Model -- Universal Scalper V4.0.
+Day Trading Model -- Intraday Trend Engine V4.0.
 
 Isolated from the V3.4 scalper. All modules live in src/day_trading/, and every
 artifact carries a "dt_" prefix so this experiment can never overwrite a live
@@ -11,5 +11,5 @@ outside this folder imports it.
 Glossary:
     (none -- package marker, no identifiers of its own)
 """
-# Day Trading Model — Universal Scalper V4.0
+# Day Trading Model — Intraday Trend Engine V4.0
 # Isolated from V3.4 Scalper. All modules live in src/day_trading/.

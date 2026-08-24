@@ -5,7 +5,7 @@ Market provider — reads ``DATA_SOURCE`` env:
     - ``alpaca``  (default) — Alpaca REST + WebSocket
     - ``polygon`` — Polygon.io REST + WebSocket
     - ``yahoo``   — Yahoo Finance (polling, **paper trading only**)
-    - ``oanda``   — OANDA v20 REST + Streaming (forex, V5 scalper)
+    - ``oanda``   — OANDA v20 REST + Streaming (forex, V5 forex bot)
 
 Fundamental provider — reads ``FUNDAMENTAL_SOURCES`` env (comma-separated):
     - ``simfin``           (default) — SimFin institutional fundamentals
@@ -14,7 +14,7 @@ Fundamental provider — reads ``FUNDAMENTAL_SOURCES`` env (comma-separated):
     Multiple sources are chained: first non-empty result wins.
 
 This is the single switch that decides which market the bot is trading. The
-live forex scalper runs with DATA_SOURCE=oanda; the equities work uses alpaca.
+live forex bot runs with DATA_SOURCE=oanda; the equities work uses alpaca.
 Vendor SDKs are imported lazily inside each branch so that, for example,
 running OANDA never requires the Polygon package to be installed.
 
@@ -32,7 +32,7 @@ Glossary:
     YAHOO_POLL_INTERVAL -- seconds between Yahoo polls (default 60); Yahoo has
         no push feed.
     get_fundamental_provider -- builds the company-financials source used by
-        the equities investor, not the scalper.
+        the equities investor, not the forex bot.
     FUNDAMENTAL_SOURCES -- ordered comma-separated list ("simfin" default,
         also "yfinance"/"yahoo", or "none"). Sources are chained and the first
         non-empty answer wins, so a primary can fall back to a secondary.

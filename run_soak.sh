@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# V5 OANDA forex paper soak — runs the promoted scalper on the practice
+# V5 OANDA forex paper soak — runs the promoted forex bot on the practice
 # account and accumulates per-instrument spread samples so we can derive an
 # empirical spread_atr_alpha (grep SPREAD_CALIB in the log).
 #

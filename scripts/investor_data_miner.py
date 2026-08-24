@@ -23,7 +23,7 @@ Data layers:
                       Requires SIMFIN_API_KEY in .env.
 
 Step 1 of the V4 Investor (the monthly stock ranker -- a completely separate
-product from the forex scalper). Merges three data layers that update at wildly
+product from the forex bot). Merges three data layers that update at wildly
 different rates into one daily table.
 
 Glossary:

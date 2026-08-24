@@ -57,10 +57,29 @@ Glossary:
         6:1 payoff). ⚠️ These are the EQUITIES/default values and are only
         function defaults here -- get_asset_config() takes the real numbers
         from RiskProfile.for_asset_class(), and the FOREX profile overrides
-        them to 1.0x / 2.0x (a 2:1 payoff). Check the profile, not these
-        constants, when reasoning about a forex run. Either way the value must
-        match the live orchestrator's or the model is trained on trades the bot
-        would never take.
+        them to 2.0x / 4.0x (a 2:1 payoff, widened 2026-08-08). Check the
+        profile, not these constants, when reasoning about a forex run.
+        Either way the value must match the live orchestrator's, or the model
+        is trained on trades the bot would never take.
+    UNTRADEABLE_SYMBOLS -- instruments this account cannot trade (XAU_USD,
+        XAG_USD; override RETRAIN_UNTRADEABLE_SYMBOLS). They stay in TRAINING
+        and are excluded from the GATE's metrics only. Pooling them inverts the
+        verdict, so this is a correctness fix, not a tidy-up.
+    BEHAVIOR_VETO_LABELS -- behavior tags dropped as trade entries
+        (RETRAIN_BEHAVIOR_VETO, e.g. "trend_high"). EMPTY by default. A model
+        trained with this set REQUIRES a matching live gate or it is train/serve
+        skew; the labels are recorded in metadata.json as "behavior_veto".
+    _tradeable_scoring_mask -- narrows an approval mask to tradeable
+        instruments. Runs on validation approvals only; training is untouched.
+    validate_candidate(oos_ledger=...) -- opt-in per-trade capture of the
+        walk-forward's Devil-approved OOS trades, for offline analysis such as
+        the behavior matrix. None in every production path; when a list is
+        passed it is appended to and NOTHING about the gate changes.
+    _capture_oos_ledger -- builds one fold's ledger frame from masks the fold
+        already computed. Observational only; cannot affect promotion.
+    oos_ledger_cols -- which columns to carry from the validation frame into
+        the ledger. Missing columns are skipped, so a caller can request
+        optional ones (e.g. behavior_label) without knowing the schema.
     MAX_HOLD_BARS -- 45. A trade that reaches neither level within 45 bars is
         labelled a loss (timeout), because capital was tied up for nothing.
     SURVIVAL_BARS -- 5. The horizon for the Devil's survival label, below.
@@ -136,6 +155,13 @@ Glossary:
     validate_candidate -- the gate itself: 3 expanding walk-forward folds,
         each trained on the past and scored on the future it never saw. The
         full-data production model is trained only after the gate passes.
+    _GATE_THRESHOLDS -- the promotion bars bundled for the Discord embed, so
+        the notification cannot drift from the constants it quotes.
+    _resolved_model_dir -- where this run's artifacts land; mirrors
+        get_asset_config's resolution.
+    _is_production_model_dir -- False when RETRAIN_MODEL_DIR redirected the run
+        to a side directory, which suppresses every "now live" claim in the
+        Discord report. Passing the gate is not the same as deploying.
     promote_or_reject -- the single decision point. On pass it writes the model
         files; on fail it returns False and the previous production weights are
         left untouched.
@@ -156,7 +182,7 @@ import warnings
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import joblib
 import lightgbm as lgb
@@ -199,10 +225,49 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 DAYS_BACK = int(os.getenv("RETRAIN_DAYS_BACK", "60"))
+
+# Instruments this OANDA account cannot trade. They stay in the TRAINING basket
+# — the volatility-first basket is load-bearing (a shrink was tried and
+# rejected 2026-07-02, and measurement on 2026-08-23 put the crosses at gross PF
+# 1.742 when metals were in training vs 1.461 without) — but their trades are
+# excluded from the PROMOTION GATE's metrics, because the gate is supposed to
+# predict live results and no live trade in these can ever happen.
+#
+# Why it matters (2026-08-23): pooling them INVERTS the verdict. Pooled gate PF
+# read 1.245 with metals vs 1.500 without, while the same two configs scored on
+# the six tradeable crosses read 1.742 vs 1.461 — the opposite ordering. The
+# pooled figure was diluted by trades that do not exist.
+#
+# Live already refuses them at boot via
+# OandaForexOrchestrator._drop_untradeable_symbols (2026-08-06); this closes
+# the same gap on the offline side. Empty string scores everything (old
+# behaviour) — set RETRAIN_UNTRADEABLE_SYMBOLS="" to restore it.
+# Behavior labels to drop as trade entries, e.g. "trend_high". OFF by default:
+# a model trained with this MUST be served behind a matching live gate, and no
+# such gate exists yet. See engineer_features_and_labels.
+BEHAVIOR_VETO_LABELS = frozenset(
+    s.strip() for s in os.getenv("RETRAIN_BEHAVIOR_VETO", "").split(",") if s.strip()
+)
+
+UNTRADEABLE_SYMBOLS = frozenset(
+    s.strip().upper()
+    for s in os.getenv("RETRAIN_UNTRADEABLE_SYMBOLS", "XAU_USD,XAG_USD").split(",")
+    if s.strip()
+)
 # Forex basket pivoted 2026-05-23 from G7 majors (failed integrity gate, NO
 # SIGNAL separation) to a volatility-first basket: two liquid metals plus
 # three JPY/AUD-crossing pairs known for wide intraday ranges. XPT/XPD
 # skipped — too illiquid on OANDA for scalping.
+# The Angel's label is a DIRECTION question ("does price run in 45 minutes"),
+# and it is deliberately NOT the execution stop multiple. The two answer
+# different questions over different horizons: the Angel looks 3 bars ahead,
+# while the trade itself has max_hold (45) bars to resolve. Welding them
+# together means widening the stop silently doubles the move the Angel must
+# predict -- which on 2026-08-08 collapsed pooled proposals from ~300 to 49 and
+# failed the gate on sample size alone. These defaults preserve each asset
+# class's historical Angel behaviour; override with RETRAIN_ANGEL_ATR_MULT.
+_ANGEL_ATR_MULT_BY_CLASS = {"forex": 1.0, "equities": 0.5}
+
 _DEFAULT_TICKERS_BY_CLASS = {
     "forex": [
         "XAU_USD", "XAG_USD",                        # liquid metals
@@ -244,6 +309,11 @@ def get_asset_config(data_source: str) -> dict:
         "tickers": [t.strip() for t in os.getenv("RETRAIN_SYMBOLS", ",".join(default_tickers)).split(",") if t.strip()],
         "sl_mult": profile.sl_atr_multiplier,
         "tp_mult": profile.tp_atr_multiplier,
+        # Deliberately NOT sl_mult -- see _ANGEL_ATR_MULT_BY_CLASS.
+        "angel_mult": float(
+            os.getenv("RETRAIN_ANGEL_ATR_MULT", "").strip()
+            or _ANGEL_ATR_MULT_BY_CLASS[asset_class]
+        ),
         "max_hold": int(os.getenv("RETRAIN_MAX_HOLD", str(max_hold))),
         "survival_bars": int(os.getenv("RETRAIN_SURVIVAL", "5")),
         "timeframe_minutes": int(os.getenv("RETRAIN_TIMEFRAME_MINUTES", str(timeframe))),
@@ -847,6 +917,7 @@ def engineer_features_and_labels(
     max_hold: int = MAX_HOLD_BARS,
     survival_bars: int = SURVIVAL_BARS,
     htf_timeframe: str = "5m",
+    angel_mult: Optional[float] = None,
     risk_profile: Optional[RiskProfile] = None,
     alpha_table: Optional[dict] = None,
 ) -> Tuple[pl.DataFrame, List[str], float]:
@@ -861,13 +932,18 @@ def engineer_features_and_labels(
         price_sma50_ratio, log_return, hour_of_day, dist_sma50, vol_rel
 
     Targets:
-        angel_target: 1 if close 3 bars ahead > close + sl_mult × ATR (ATR-relative)
+        angel_target: 1 if close 3 bars ahead > close + angel_mult × ATR
+            (ATR-relative). angel_mult falls back to sl_mult when not given,
+            but production passes it explicitly -- the Angel's momentum bar is
+            not the execution stop. See _ANGEL_ATR_MULT_BY_CLASS.
         devil_target: 1 if TP (tp_mult × ATR) hit before SL (sl_mult × ATR) in ≤max_hold bars
 
     Args:
         df: Raw OHLCV DataFrame with columns:
             open, high, low, close, volume, symbol, timestamp
-        sl_mult: Stop-loss ATR multiplier
+        sl_mult: Stop-loss ATR multiplier (Devil labels + chop veto)
+        angel_mult: ATR multiple for the Angel's 3-bar momentum bar. None
+            falls back to sl_mult (the legacy coupling).
         tp_mult: Take-profit ATR multiplier
         max_hold: Maximum hold bars
         survival_bars: Number of survival bars for devil training
@@ -915,15 +991,19 @@ def engineer_features_and_labels(
     # 1 if close 3 bars ahead > close + sl_mult × ATR_abs
     # natr_14 is a percentage: ATR_abs = close * natr_14 / 100
     # ═══════════════════════════════════════════════════════════════════
+    _angel_mult = sl_mult if angel_mult is None else angel_mult
     df = df.with_columns(
         (
             pl.col("close").shift(-3).over("symbol")
-            > pl.col("close") + sl_mult * (pl.col("close") * pl.col("natr_14") / 100.0)
+            > pl.col("close") + _angel_mult * (pl.col("close") * pl.col("natr_14") / 100.0)
         )
         .cast(pl.Int8)
         .alias("angel_target")
     )
-    logger.info(f"Generated angel_target (ATR-relative 3-bar momentum with sl_mult={sl_mult})")
+    logger.info(
+        f"Generated angel_target (ATR-relative 3-bar momentum with "
+        f"angel_mult={_angel_mult}; execution sl_mult={sl_mult})"
+    )
 
     # ═══════════════════════════════════════════════════════════════════
     # DEVIL TARGETS (Phase 5.5 — Two-Target Architecture)
@@ -989,6 +1069,54 @@ def engineer_features_and_labels(
             f"k_base={risk_profile.spread_k_base}, coupling={risk_profile.spread_k_coupling}, "
             f"P{risk_profile.regime_pctile:.0f}, alpha={risk_profile.spread_atr_alpha})"
         )
+
+    # ═══════════════════════════════════════════════════════════════════
+    # BEHAVIOR VETO (experimental, OFF unless RETRAIN_BEHAVIOR_VETO is set)
+    # ═══════════════════════════════════════════════════════════════════
+    # Drops bars whose market behavior is a measured money-loser — 2026-08-23
+    # put `trend_high` at 19-26% wins against a 33.3% break-even, the only
+    # behavior cell significantly negative in every run.
+    #
+    # ⚠️ TRAIN/SERVE SYMMETRY: a model trained with this veto MUST be served
+    # behind a matching live gate, or it is skew of exactly the kind the chop
+    # veto exists to avoid. The label is written into metadata.json
+    # ("behavior_veto") so a candidate declares the gate it requires; nothing
+    # serves it today. Applied AFTER target generation for the same reason as
+    # the chop veto — the bracket walk needs the contiguous price path.
+    if BEHAVIOR_VETO_LABELS:
+        from ml.regimes.behavior_tagger import tag_series, trend_strength_from_ppo
+
+        if "symbol" in df.columns and "ppo" in df.columns:
+            tagged = []
+            for sym in df["symbol"].unique(maintain_order=True).to_list():
+                d = df.filter(pl.col("symbol") == sym).sort("timestamp")
+                tags = tag_series(
+                    d["natr_14"].to_numpy().astype(float),
+                    trend_strength_from_ppo(d["ppo"].to_numpy().astype(float)),
+                )
+                tagged.append(
+                    d.with_columns(pl.Series("behavior_label", [t.label for t in tags]))
+                )
+            df = pl.concat(tagged)
+            before = df.height
+            df = df.filter(~pl.col("behavior_label").is_in(list(BEHAVIOR_VETO_LABELS)))
+            n_behavior = before - df.height
+            # Fold into chop_veto_rate so the gate's dynamic trade floor scales
+            # with the combined drop; otherwise the veto is penalised purely
+            # for trading less.
+            chop_veto_rate = 1.0 - (df.height / pre_veto) if pre_veto else 0.0
+            logger.info(
+                "Behavior veto dropped %s rows tagged %s (%.1f%% of %s); "
+                "combined drop rate now %.1f%%",
+                f"{n_behavior:,}", sorted(BEHAVIOR_VETO_LABELS),
+                100.0 * n_behavior / before if before else 0.0, f"{before:,}",
+                100.0 * chop_veto_rate,
+            )
+        else:
+            logger.warning(
+                "RETRAIN_BEHAVIOR_VETO=%s set but the frame lacks symbol/ppo — "
+                "behavior veto SKIPPED", sorted(BEHAVIOR_VETO_LABELS),
+            )
 
     # ═══════════════════════════════════════════════════════════════════
     # CLEANUP: Drop NaN/null rows (uses FeaturePipeline.clean_data)
@@ -1340,6 +1468,82 @@ def _find_optimal_threshold(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+def _tradeable_scoring_mask(
+    val_df: pl.DataFrame,
+    signal_mask: np.ndarray,
+    approved_mask: np.ndarray,
+) -> Tuple[np.ndarray, int]:
+    """
+    Narrow an approval mask to instruments the account can actually trade.
+
+    Returns ``(scored_mask, n_excluded)``, where ``scored_mask`` is aligned to
+    the Angel-proposed subset exactly like ``approved_mask`` is. A gate metric
+    is a prediction about live results, so a trade that could never be placed
+    must not move it — see :data:`UNTRADEABLE_SYMBOLS` for why this inverts the
+    verdict rather than merely adding noise.
+
+    Training is unaffected: this runs on validation approvals only, well after
+    the models have been fit on the full basket.
+
+    Falls back to the unmodified mask when nothing is marked untradeable or the
+    frame carries no ``symbol`` column, so single-symbol callers and older
+    frames behave exactly as before.
+    """
+    if not UNTRADEABLE_SYMBOLS or "symbol" not in val_df.columns:
+        return approved_mask, 0
+
+    proposed_symbols = (
+        val_df.filter(pl.Series(signal_mask))["symbol"]
+        .cast(pl.Utf8)
+        .str.to_uppercase()
+        .to_numpy()
+    )
+    tradeable = ~np.isin(proposed_symbols, list(UNTRADEABLE_SYMBOLS))
+    scored_mask = approved_mask & tradeable
+    return scored_mask, int(approved_mask.sum() - scored_mask.sum())
+
+
+def _capture_oos_ledger(
+    ledger: List[pl.DataFrame],
+    val_df: pl.DataFrame,
+    signal_mask: np.ndarray,
+    approved_mask: np.ndarray,
+    macro_targets: np.ndarray,
+    devil_probs: np.ndarray,
+    angel_probs: np.ndarray,
+    fold_number: int,
+    carry_cols: Sequence[str],
+) -> None:
+    """
+    Append this fold's Devil-approved OOS trades to ``ledger``.
+
+    Read-only with respect to the gate: it observes masks the fold has already
+    computed and appends a frame. Nothing here can change a promotion decision.
+
+    The rows are strictly out-of-sample by construction — ``val_df`` is the
+    fold's validation window and the models were fit on the train window only,
+    so the ledger inherits the walk-forward's honesty rather than re-deriving
+    it. Columns absent from the frame are skipped rather than raising, so a
+    caller may ask for optional feature columns without knowing the schema.
+    """
+    proposed = val_df.filter(pl.Series(signal_mask))
+    approved = proposed.filter(pl.Series(approved_mask))
+    if approved.height == 0:
+        return
+
+    present = [c for c in carry_cols if c in approved.columns]
+    ledger.append(
+        approved.select(present).with_columns(
+            [
+                pl.Series("fold", np.full(approved.height, fold_number, dtype=np.int32)),
+                pl.Series("macro_win", macro_targets[approved_mask].astype(np.int8)),
+                pl.Series("devil_prob", devil_probs[approved_mask].astype(np.float64)),
+                pl.Series("angel_prob", angel_probs[approved_mask].astype(np.float64)),
+            ]
+        )
+    )
+
+
 def validate_candidate(
     df: pl.DataFrame,
     feature_cols: List[str],
@@ -1349,6 +1553,15 @@ def validate_candidate(
     angel_params: Optional[dict] = None,
     devil_params: Optional[dict] = None,
     chop_veto_rate: float = 0.0,
+    oos_ledger: Optional[List[pl.DataFrame]] = None,
+    oos_ledger_cols: Sequence[str] = (
+        "timestamp",
+        "symbol",
+        "natr_14",
+        "ppo",
+        "close",
+        "behavior_label",
+    ),
 ) -> Tuple[
     ValidationReport,
     "lgb.LGBMClassifier",
@@ -1429,6 +1642,23 @@ def validate_candidate(
     # Build date-based fold boundaries
     # ───────────────────────────────────────────────────────────────────
     min_date = df["timestamp"].min()
+
+    # The fold schedule below is derived from the MODULE constant DAYS_BACK,
+    # not from this frame. main() keeps the two in step because it fetches with
+    # days_back=DAYS_BACK, but any other caller that fetches a longer window
+    # without setting RETRAIN_DAYS_BACK silently trains on the first DAYS_BACK
+    # days and discards the rest. Warn rather than guess: changing the schedule
+    # here would move the promotion gate's goalposts.
+    span_days = (df["timestamp"].max() - min_date).total_seconds() / 86400.0
+    if span_days > DAYS_BACK * 1.2:
+        logger.warning(
+            "Data spans %.0f days but the fold schedule is built from "
+            "DAYS_BACK=%d — folds will cover only the OLDEST %d days and "
+            "%.0f%% of this frame is unused. Set RETRAIN_DAYS_BACK=%d to use "
+            "it all.",
+            span_days, DAYS_BACK, DAYS_BACK,
+            100.0 * (1.0 - DAYS_BACK / span_days), int(span_days),
+        )
 
     # fold_configs: (train_end_days, val_end_days) — exclusive upper bounds.
     # Fractions chosen to reproduce the legacy 60-day schedule exactly:
@@ -1740,6 +1970,66 @@ def validate_candidate(
                 fold3_angel_feats, fold3_devil_feats = angel_feats, devil_feats
             continue
 
+        # Opt-in per-trade OOS capture for offline analysis (behavior matrix).
+        # Purely observational; `oos_ledger is None` in every production path.
+        if oos_ledger is not None:
+            _capture_oos_ledger(
+                oos_ledger,
+                val_df,
+                signal_mask,
+                approved_mask,
+                proposed_devil_targets_macro,
+                devil_probs_val,
+                proposed_angel_probs,
+                fold_number,
+                oos_ledger_cols,
+            )
+
+        # ─────────────────────────────────────────────────────────────
+        # Restrict SCORING (not training) to instruments the account can
+        # actually trade. A gate metric is a prediction about live results, so
+        # a trade that could never be placed must not move it. Training keeps
+        # every instrument — see UNTRADEABLE_SYMBOLS.
+        # ─────────────────────────────────────────────────────────────
+        scored_mask, n_excluded = _tradeable_scoring_mask(
+            val_df, signal_mask, approved_mask
+        )
+        if n_excluded:
+            logger.info(
+                "[Fold %d] Gate scoring excludes %d untradeable approvals "
+                "(%s); %d scored. Training basket is unchanged.",
+                fold_number, n_excluded, ",".join(sorted(UNTRADEABLE_SYMBOLS)),
+                int(scored_mask.sum()),
+            )
+
+        n_scored = int(scored_mask.sum())
+        if n_scored == 0:
+            logger.warning(
+                "[Fold %d] Every approval was in an untradeable instrument — "
+                "no scoreable trades; setting worst-case metrics",
+                fold_number,
+            )
+            fold_metrics.append(
+                FoldMetrics(
+                    fold_number=fold_number,
+                    train_size=len(train_df),
+                    val_size=len(val_df),
+                    brier_score=1.0,
+                    expected_value=-1.0,
+                    angel_proposed_trades=n_angel_proposed,
+                    devil_approved_trades=0,
+                    win_rate=0.0,
+                )
+            )
+            if fold_number == n_folds:
+                fold3_angel, fold3_devil = angel_model, devil_model
+                fold3_angel_feats, fold3_devil_feats = angel_feats, devil_feats
+            continue
+
+        # From here on the gate sees only tradeable approvals.
+        approved_mask = scored_mask
+        n_devil_approved = n_scored
+
         # ─────────────────────────────────────────────────────────────
         # Compute fold metrics on Devil-approved trades
         # ─────────────────────────────────────────────────────────────
@@ -1915,6 +2205,32 @@ def validate_candidate(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+# Single source of truth for the bars the Discord embed quotes. Kept next to
+# promote_or_reject so it cannot drift from the constants above the way the
+# hardcoded copies in notification_manager.py did.
+_GATE_THRESHOLDS = {
+    "brier": BRIER_THRESHOLD,
+    "ev": EV_THRESHOLD,
+    "profit_factor": PROFIT_FACTOR_THRESHOLD,
+}
+
+
+def _resolved_model_dir(asset_config: Optional[dict]) -> str:
+    """Where this run's artifacts land — the same resolution get_asset_config does."""
+    cfg = asset_config or {}
+    return cfg.get("model_dir") or f"models/{cfg.get('asset_class', 'equities')}"
+
+
+def _is_production_model_dir() -> bool:
+    """
+    False when RETRAIN_MODEL_DIR redirected this run to a side directory.
+
+    An explicit override means the operator deliberately aimed somewhere other
+    than the default path, so the run must not be announced as going live.
+    """
+    return not os.getenv("RETRAIN_MODEL_DIR", "").strip()
+
+
 def promote_or_reject(
     report: ValidationReport,
     angel_model: "lgb.LGBMClassifier",
@@ -1964,7 +2280,13 @@ def promote_or_reject(
             hmm_path = model_dir / "hmm_latest.pkl"
             save_hmm_models(hmm_models, hmm_path)
 
-        notifier.send_retraining_report(report, promoted=True)
+        notifier.send_retraining_report(
+            report,
+            promoted=True,
+            model_dir=_resolved_model_dir(asset_config),
+            is_production_path=_is_production_model_dir(),
+            gate_thresholds=_GATE_THRESHOLDS,
+        )
         return True
     else:
         logger.warning("=" * 70)
@@ -1973,7 +2295,13 @@ def promote_or_reject(
         for reason in report.rejection_reasons:
             logger.warning(f"  Rejection: {reason}")
 
-        notifier.send_retraining_report(report, promoted=False)
+        notifier.send_retraining_report(
+            report,
+            promoted=False,
+            model_dir=_resolved_model_dir(asset_config),
+            is_production_path=_is_production_model_dir(),
+            gate_thresholds=_GATE_THRESHOLDS,
+        )
         return False
 
 
@@ -2054,6 +2382,16 @@ def save_models(
         "trained_on_symbols": asset_config.get("tickers", []),
         "data_source": os.getenv("DATA_SOURCE", "alpaca").strip().lower(),
         "angel_threshold": ANGEL_THRESHOLD,
+        # The brackets this model's labels were built from. Serving it under
+        # different multiples is train/serve skew, and until now the artifact
+        # carried no record of them — so a candidate could not be checked
+        # against the tree it was about to be served from.
+        "sl_atr_multiplier": asset_config.get("sl_mult"),
+        "tp_atr_multiplier": asset_config.get("tp_mult"),
+        "lookback_days": DAYS_BACK,
+        # Declares the live gate this artifact requires. A non-empty
+        # list served without a matching veto is train/serve skew.
+        "behavior_veto": sorted(BEHAVIOR_VETO_LABELS),
     }
     with open(metadata_temp, "w") as f:
         json.dump(metadata, f, indent=2)
@@ -2213,6 +2551,7 @@ def main() -> int:
         features_df, feature_cols, chop_veto_rate = engineer_features_and_labels(
             raw_data,
             sl_mult=asset_config["sl_mult"],
+            angel_mult=asset_config["angel_mult"],
             tp_mult=asset_config["tp_mult"],
             max_hold=asset_config["max_hold"],
             survival_bars=asset_config["survival_bars"],

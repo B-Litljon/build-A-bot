@@ -30,6 +30,12 @@ Glossary:
         that Gate C exists for.
     test_no_regime_series_uses_static_floor -- without volatility context the
         manager falls back to the legacy floor rather than failing.
+    TestProductionForexProfile -- pins the SHIPPED forex numbers (2.0/4.0
+        bracket, k=3.0 cost gate). Everything else in this file builds its own
+        profile to test mechanism, which meant no test noticed when the live
+        values changed. These are the numbers the model is trained against;
+        if they move, retrainer.get_asset_config feeds different labels to the
+        Devil and train/serve skew follows silently.
 """
 
 # Add src to path
@@ -271,6 +277,39 @@ class TestDynamicHybridFloor(unittest.TestCase):
         # JPY pip floor = 2.0 * 0.01 = 0.02; sl_dist 0.5*0.03=... uses mult 1.0 → 0.015 < 0.02
         self.assertIsNone(rm.calculate_bracket(155.0, 0.015, symbol="USD_JPY"))
         self.assertIsNotNone(rm.calculate_bracket(155.0, 0.05, symbol="USD_JPY"))
+
+
+class TestProductionForexProfile(unittest.TestCase):
+    """The live forex numbers, pinned.
+
+    These are NOT arbitrary: `retrainer.get_asset_config` reads the same
+    profile to build the Devil's training labels ("was the target reached
+    before the stop"). Changing a multiplier here without retraining puts the
+    model's labels out of step with the brackets it is scored against.
+    """
+
+    def test_forex_bracket_is_two_and_four_atr(self):
+        p = RiskProfile.for_asset_class("forex")
+        self.assertEqual(p.sl_atr_multiplier, 2.0)
+        self.assertEqual(p.tp_atr_multiplier, 4.0)
+
+    def test_forex_payoff_ratio_is_two_to_one(self):
+        """Widening the stop on 2026-08-08 held the payoff ratio deliberately;
+        the change was about diluting the spread toll, not re-aiming the trade."""
+        p = RiskProfile.for_asset_class("forex")
+        self.assertEqual(p.tp_atr_multiplier / p.sl_atr_multiplier, 2.0)
+
+    def test_forex_cost_gate_caps_the_toll_at_one_third(self):
+        """Gate A is `sl_dist >= k * spread`, i.e. the spread may eat at most
+        1/k of the stop. k=3.0 caps it at 33%; the old 1.5 allowed 67%."""
+        p = RiskProfile.for_asset_class("forex")
+        self.assertEqual(p.spread_k_base, 3.0)
+        self.assertAlmostEqual(1.0 / p.spread_k_base, 1.0 / 3.0, places=6)
+
+    def test_equities_profile_untouched_by_the_forex_change(self):
+        p = RiskProfile.for_asset_class("equities")
+        self.assertEqual(p.sl_atr_multiplier, 0.5)
+        self.assertEqual(p.tp_atr_multiplier, 3.0)
 
 
 if __name__ == "__main__":

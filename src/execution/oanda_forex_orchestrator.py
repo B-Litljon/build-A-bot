@@ -1,5 +1,5 @@
 """
-OANDA Scalper Orchestrator — V5 Forex Pivot.
+OANDA Forex Orchestrator — V5 Forex Pivot.
 
 Lean async loop wiring OandaMarketProvider → MLStrategy → OandaOrderManager
 with an embedded software SL/TP watchdog.
@@ -31,8 +31,12 @@ Glossary:
     _max_bars -- warmup * 2, the per-symbol buffer cap, so memory stays flat
         over a multi-day soak.
     _bar_buffers -- rolling recent bars per symbol, the input to inference.
-    _positions -- symbol -> {entry, sl, tp, units, state}. Guarded by
-        _positions_lock because the tick thread reads it while the loop writes.
+    _positions -- symbol -> {entry, sl, tp, units, state, breach_price?,
+        hit_level?}. Guarded by _positions_lock because the tick thread reads
+        it while the loop writes. breach_price and hit_level are set by
+        _on_tick at breach and consumed by _watchdog_close for BOTH the Discord
+        alert and the "exit" event record -- the latter is what makes a fill a
+        labelled outcome (which bracket hit) rather than just "a trade closed".
     _positions_lock -- a threading.Lock, not an asyncio one, precisely because
         a non-async thread touches this state.
     flatten_on_exit -- whether shutdown closes everything. Default True: a
@@ -45,6 +49,12 @@ Glossary:
         first live bars are not double-counted or scored twice. The "seam" is
         that junction between replayed and live data.
     _prime_history -- fetches the warm-up bars at boot.
+    _drop_untradeable_symbols -- at boot, removes configured symbols the
+        account may not trade (XAU_USD/XAG_USD here), so a metals signal is
+        never spent on an order OANDA will reject. Fail-OPEN: only a
+        successful instrument lookup may drop anything, and dropping
+        everything aborts startup rather than running a bot that cannot
+        place an order.
     _last_scored_ts -- per symbol, the newest bar timestamp that actually went
         through signal evaluation (streamed or catch-up). Deliberately NOT
         reset on reconnect: it is the dedup that stops repeated re-primes
@@ -58,17 +68,36 @@ Glossary:
     _seam_catchup_max_age -- SEAM_CATCHUP_MAX_AGE_SECONDS; how stale a missed
         bar may be and still be scored. -1 (default) = one bar period,
         0 disables catch-up.
+    _backfill_seam_bar -- the OTHER half of the reconnect gap: the bar in
+        flight when the stream died is dropped (the stream's copy is
+        incomplete), but it has sealed by then, so its complete version is
+        re-fetched from REST and scored. Costs one evaluation per symbol per
+        reconnect if absent -- measured at 5/symbol in 16h on 2026-07-28.
+    _seam_backfill_attempts / _seam_backfill_retry_delay --
+        SEAM_BACKFILL_ATTEMPTS (3, 0 disables) and SEAM_BACKFILL_RETRY_DELAY
+        (2s). REST can lag the bar seal by a second or two.
+    _reconnect_delay / _reconnect_base_delay / _reconnect_max_delay /
+        _reconnect_healthy_seconds -- jittered capped exponential backoff
+        (5s base, 60s cap, reset after 120s of healthy streaming) so a
+        flapping endpoint is not hammered on a fixed cadence. The cap sits
+        below the liveness watchdog's 60s flatten threshold.
     _evaluate_and_trade -- the decision tail (inference → guards → bracket →
         order) shared by the stream path and the catch-up path.
     _reconcile_on_boot -- asks the broker what is actually open before trading.
         A restart must adopt reality rather than assume it is flat -- otherwise
         a position left by a crashed process would run with nothing watching
-        its stop.
+        its stop. Unverifiable state still refuses to start, but only after
+        _reconcile_max_attempts tries (OANDA_RECONCILE_MAX_ATTEMPTS / _RETRY_DELAY):
+        one transient error used to cost 15 minutes of downtime via the cron
+        watchdog's crash-loop brake.
 
     ── the fast path ──
     _on_tick -- runs on the provider's stream thread for EVERY quote. Records
         the spread and checks stop/target. Must return in under 50
         microseconds and do no blocking I/O; anything slower stalls the feed.
+        On breach it stores breach_price (the live bid/ask that triggered)
+        and hit_level ("TP"/"SL") in the position dict so _watchdog_close
+        can relay them accurately to the Discord close notification.
     _latest_spread / _latest_spread_ts -- most recent bid-ask gap per symbol,
         written lock-free from that thread (single writer, so safe).
     _spread_stale_seconds -- 5 (RISK_SPREAD_STALE_SECONDS). Older than this and
@@ -77,6 +106,27 @@ Glossary:
     _watchdog_close -- the actual software exit. Retries up to
         _close_max_attempts (5, OANDA_CLOSE_MAX_ATTEMPTS) because a failed
         close leaves a live position with no protection.
+
+    ── entry guards (added 2026-07-30 after the first multi-fill day) ──
+    _reentry_cooldown -- OANDA_REENTRY_COOLDOWN_SECONDS: how long after an
+        exit a symbol may not be re-entered. -1 (default) = one bar period,
+        0 disables. Blocks OPENING only; flipping an already-open position is
+        untouched.
+    _last_exit_ts -- symbol -> time.monotonic() of its last close.
+    _mark_exit / _cooldown_remaining -- start the cooldown / seconds left.
+    _max_per_currency -- OANDA_MAX_PER_CURRENCY, default 2: how many open
+        positions may share the SAME signed currency leg. Long GBP_JPY +
+        long AUD_JPY are two short-JPY positions; a third would breach a cap
+        of 2. 0 or negative disables.
+    _currency_legs -- splits SYMBOL + signed units into {currency: ±1}, the
+        unit the cap counts in. Unparseable symbol -> {} = uncapped.
+    _exposure_conflict -- the cap check; returns a human-readable reason or
+        None. Must be called holding _positions_lock.
+    _pending_entries -- symbol -> signed units for an entry that passed the
+        cap but whose fill has not returned. Counted as held, so two entries
+        on the same bar cannot both pass. Released on every path out.
+    _cooldown_rejections / _exposure_rejections -- how often each guard has
+        blocked an entry, for the soak log.
 
     ── volatility tracking ──
     _wilder_atr / _regime_natr / _regime_prev_close -- a running volatility
@@ -128,6 +178,7 @@ import asyncio
 import functools
 import logging
 import os
+import random
 import signal as sig
 import threading
 import time
@@ -139,6 +190,7 @@ import numpy as np
 import polars as pl
 import talib
 
+from core import events
 from core.notification_manager import NotificationManager
 from data.oanda_provider import OandaMarketProvider, _to_oanda_symbol
 from execution.oanda_order_manager import OandaOrderManager, OrderCloseError
@@ -148,9 +200,9 @@ from strategies.concrete_strategies.ml_strategy import MLStrategy
 logger = logging.getLogger(__name__)
 
 
-class OandaScalperOrchestrator:
+class OandaForexOrchestrator:
     """
-    Async scalper orchestrator for OANDA v20 forex.
+    Async orchestrator for OANDA v20 forex.
 
     Parameters
     ----------
@@ -226,9 +278,66 @@ class OandaScalperOrchestrator:
             os.getenv("SEAM_CATCHUP_MAX_AGE_SECONDS", "-1")
         )
 
+        # Seam backfill: how hard to chase the complete version of a dropped
+        # in-flight bar from REST (0 disables), and how long to wait between
+        # tries when REST has not published the sealed candle yet.
+        self._seam_backfill_attempts = int(os.getenv("SEAM_BACKFILL_ATTEMPTS", "3"))
+        self._seam_backfill_retry_delay = float(
+            os.getenv("SEAM_BACKFILL_RETRY_DELAY", "2")
+        )
+
+        # Reconnect backoff. A flat retry hammers a struggling endpoint:
+        # 2026-07-28 saw six reconnects in two minutes, each re-priming all
+        # eight instruments, while OANDA's stream edge went silent for 20s
+        # at a time. Capped below the liveness watchdog's flatten threshold
+        # so a backoff never leaves a position unwatched longer than the
+        # stall response already allows.
+        self._reconnect_base_delay = float(
+            os.getenv("OANDA_RECONNECT_BASE_DELAY", "5")
+        )
+        self._reconnect_max_delay = float(
+            os.getenv("OANDA_RECONNECT_MAX_DELAY", "60")
+        )
+        self._reconnect_healthy_seconds = float(
+            os.getenv("OANDA_RECONNECT_HEALTHY_SECONDS", "120")
+        )
+
         # Position state: symbol -> {entry, sl, tp, units, state}
         self._positions: Dict[str, dict] = {}
         self._positions_lock = threading.Lock()
+
+        # ── post-exit cooldown ──
+        # On 2026-07-30 NZD_JPY was stopped out at 13:53 UTC and re-entered
+        # LONG at 14:00 on the next bar, into the same falling move, for a
+        # second loss. A fresh stop is evidence the read was wrong; the next
+        # bar is too soon to re-litigate it. -1 = one bar period (resolved
+        # from the provider's granularity), 0 disables.
+        self._reentry_cooldown = float(
+            os.getenv("OANDA_REENTRY_COOLDOWN_SECONDS", "-1")
+        )
+        # symbol -> time.monotonic() when the position was closed. Monotonic
+        # so an NTP step cannot retroactively expire or extend a cooldown.
+        self._last_exit_ts: Dict[str, float] = {}
+
+        # ── correlated-exposure cap ──
+        # Also 2026-07-30: three simultaneous longs on GBP_JPY, AUD_JPY and
+        # NZD_JPY are one short-JPY bet at 3x size, and the yen leg moved
+        # against all three at once. Counts SIGNED currency legs across open
+        # and in-flight positions; 0 or negative disables.
+        self._max_per_currency = int(os.getenv("OANDA_MAX_PER_CURRENCY", "2"))
+        # symbol -> signed target units for an entry that has passed the cap
+        # check but whose fill has not returned yet. Guarded by
+        # _positions_lock. Without this, two entries evaluated on the same
+        # bar both see the pre-trade world and both pass a cap of 2.
+        self._pending_entries: Dict[str, int] = {}
+
+        # Entry-guard telemetry (mirrors the chop-gate counters).
+        self._cooldown_rejections: int = 0
+        self._exposure_rejections: int = 0
+
+        # Process start, reported in the status snapshot so a dashboard can
+        # show uptime without shelling out to ps.
+        self._started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
         # asyncio loop reference (set in run())
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -303,6 +412,17 @@ class OandaScalperOrchestrator:
         # Watchdog close retry policy (C1 hardening)
         self._close_max_attempts = int(os.getenv("OANDA_CLOSE_MAX_ATTEMPTS", "5"))
 
+        # Boot reconciliation retry policy. Refusing to start when broker
+        # state is unverifiable is deliberate, but a single transient error
+        # should not trigger it — with the cron watchdog's crash-loop brake,
+        # one blip costs 15 minutes of downtime.
+        self._reconcile_max_attempts = int(
+            os.getenv("OANDA_RECONCILE_MAX_ATTEMPTS", "3")
+        )
+        self._reconcile_retry_delay = float(
+            os.getenv("OANDA_RECONCILE_RETRY_DELAY", "3")
+        )
+
         # Stream liveness policy (C3 hardening). The provider's read
         # timeout is the primary stall defense; this watchdog is the
         # backstop that also flattens exposure if the stream goes quiet.
@@ -353,23 +473,42 @@ class OandaScalperOrchestrator:
         tp = pos["tp"]
         units = pos["units"]
 
-        breached = False
+        # Determine breach price and which bracket was hit
+        breached: bool = False
+        breach_price: float = 0.0
+        hit_level: str = ""
         if units > 0:  # long
-            if bid <= sl or bid >= tp:
+            if bid <= sl:
                 breached = True
+                breach_price = bid
+                hit_level = "SL"
+            elif bid >= tp:
+                breached = True
+                breach_price = bid
+                hit_level = "TP"
         elif units < 0:  # short
-            if ask >= sl or ask <= tp:
+            if ask >= sl:
                 breached = True
+                breach_price = ask
+                hit_level = "SL"
+            elif ask <= tp:
+                breached = True
+                breach_price = ask
+                hit_level = "TP"
 
         if not breached:
             return
 
-        # Idempotent guard — set state to PENDING_CLOSE under lock
+        # Idempotent guard — set state to PENDING_CLOSE under lock;
+        # also store breach metadata so _watchdog_close can relay them
+        # accurately to the Discord notification.
         with self._positions_lock:
             current = self._positions.get(symbol)
             if not current or current.get("state") != "OPEN":
                 return
             current["state"] = "PENDING_CLOSE"
+            current["breach_price"] = breach_price
+            current["hit_level"] = hit_level
 
         # Dispatch close OFF the stream thread onto the asyncio loop
         loop = self._loop
@@ -485,6 +624,157 @@ class OandaScalperOrchestrator:
                 "med_baseline_natr=%.5f alpha_emp=%.4f",
                 norm_sym, len(spreads), med_spread, p25, p75, med_base, alpha,
             )
+            events.emit(
+                "calib",
+                sym=norm_sym,
+                n=len(spreads),
+                alpha_emp=round(alpha, 4),
+                med_spread_pct=round(med_spread, 5),
+                med_baseline_natr=round(med_base, 5),
+            )
+
+    # ── entry guards (cooldown + correlated exposure) ──────────────────
+
+    # ── telemetry ──────────────────────────────────────────────────────
+
+    def _emit_status(self) -> None:
+        """
+        Publish the 'right now' snapshot for the dashboard.
+
+        Called once per bar and on every entry/exit. Serialises state that
+        already exists — no new bookkeeping — so this stays a pure read of the
+        orchestrator plus a queue put.
+        """
+        try:
+            with self._positions_lock:
+                positions = {
+                    sym: dict(pos) for sym, pos in self._positions.items()
+                }
+                pending = dict(self._pending_entries)
+            events.write_status(
+                {
+                    "pid": os.getpid(),
+                    "started": self._started_at,
+                    "granularity": getattr(self._provider, "_stream_gran", None),
+                    # _symbols, not _bar_buffers: the buffers are keyed from
+                    # the CONFIGURED basket at construction, so after
+                    # _drop_untradeable_symbols they still hold instruments
+                    # this run will never trade. Report what is actually
+                    # traded, or a dashboard shows phantom coverage.
+                    "symbols": list(self._symbols),
+                    "positions": positions,
+                    "pending_entries": pending,
+                    "counters": {
+                        "devil_approved": self._devil_approved_total,
+                        "spread_veto": self._spread_gate_rejections,
+                        "regime_veto": self._regime_gate_rejections,
+                        "time_veto": self._time_gate_rejections,
+                        "cooldown_blocks": self._cooldown_rejections,
+                        "exposure_blocks": self._exposure_rejections,
+                    },
+                    "last_bar": {
+                        sym: str(ts) if ts else None
+                        for sym, ts in self._last_scored_ts.items()
+                    },
+                    "config": {
+                        "units": self._units_per_trade,
+                        "cooldown_s": self._reentry_cooldown,
+                        "max_per_ccy": self._max_per_currency,
+                        "angel_thr": getattr(self._strategy, "angel_threshold", None),
+                        "devil_thr": getattr(self._strategy, "devil_threshold", None),
+                    },
+                }
+            )
+        except Exception:
+            # Telemetry must never reach the trading path.
+            pass
+
+    def _release_pending(self, symbol: str) -> None:
+        """Drop ``symbol``'s in-flight exposure reservation. Takes the lock."""
+        with self._positions_lock:
+            self._pending_entries.pop(symbol, None)
+
+    def _mark_exit(self, symbol: str) -> None:
+        """Start ``symbol``'s re-entry cooldown. Call on every real exit."""
+        self._last_exit_ts[symbol] = time.monotonic()
+
+    def _cooldown_remaining(self, symbol: str) -> float:
+        """
+        Seconds left before ``symbol`` may be re-entered; 0.0 if clear.
+
+        The default (-1) resolves to one bar period, so an instrument that
+        just exited sits out the next bar rather than re-entering on it.
+        """
+        window = self._reentry_cooldown
+        if window < 0:
+            window = float(getattr(self._provider, "_stream_gran", 1)) * 60.0
+        if window <= 0:
+            return 0.0
+        last = self._last_exit_ts.get(symbol)
+        if last is None:
+            return 0.0
+        return max(0.0, window - (time.monotonic() - last))
+
+    @staticmethod
+    def _currency_legs(symbol: str, units: int) -> Dict[str, int]:
+        """
+        Decompose a signed position into its two signed currency legs.
+
+        Long GBP_JPY is "+GBP, -JPY"; short is the mirror. XAU_USD decomposes
+        the same way (XAU against USD), which is what makes a metals position
+        and a fiat cross comparable. Returns {} for an unparseable symbol so a
+        naming surprise degrades to "uncapped", never to a crash on the
+        entry path.
+        """
+        parts = symbol.split("_")
+        if len(parts) != 2 or not all(parts):
+            return {}
+        base, quote = parts
+        sign = 1 if units > 0 else -1
+        return {base: sign, quote: -sign}
+
+    def _exposure_conflict(self, symbol: str, target_units: int) -> Optional[str]:
+        """
+        Reason string if opening ``target_units`` would breach the cap, else None.
+
+        MUST be called with ``_positions_lock`` held: it reads ``_positions``
+        and ``_pending_entries`` together, and the caller reserves its own
+        slot in ``_pending_entries`` under the same acquisition.
+        """
+        if self._max_per_currency <= 0:
+            return None
+        want = self._currency_legs(symbol, target_units)
+        if not want:
+            return None
+
+        # Existing signed legs, counting in-flight entries as already held.
+        # Keyed by (currency, sign) so "two shorts of JPY" and "one long,
+        # one short" are counted as the different things they are.
+        held: Dict[tuple, int] = {}
+        others: Dict[tuple, List[str]] = {}
+        existing_units = {
+            sym: pos.get("units", 0)
+            for sym, pos in self._positions.items()
+            if sym != symbol and pos.get("units", 0)
+        }
+        existing_units.update(
+            {sym: u for sym, u in self._pending_entries.items() if sym != symbol}
+        )
+        for sym, units in existing_units.items():
+            for ccy, sign in self._currency_legs(sym, units).items():
+                held[(ccy, sign)] = held.get((ccy, sign), 0) + 1
+                others.setdefault((ccy, sign), []).append(sym)
+
+        for ccy, sign in want.items():
+            count = held.get((ccy, sign), 0)
+            if count + 1 > self._max_per_currency:
+                side = "long" if sign > 0 else "short"
+                return (
+                    f"{side} {ccy} exposure would reach {count + 1} positions "
+                    f"(cap {self._max_per_currency}); already held via "
+                    f"{', '.join(others.get((ccy, sign), []))}"
+                )
+        return None
 
     async def _watchdog_close(self, symbol: str) -> None:
         """
@@ -529,9 +819,24 @@ class OandaScalperOrchestrator:
             # Success (close submitted, or broker already flat)
             with self._positions_lock:
                 self._positions.pop(symbol, None)
+            self._mark_exit(symbol)
             logger.info(
                 "[%s] Watchdog close completed (attempt %d)", symbol, attempt
             )
+            events.emit(
+                "exit",
+                sym=symbol,
+                units=units,
+                dir=direction,
+                entry=pos_snapshot.get("entry"),
+                sl=pos_snapshot.get("sl"),
+                tp=pos_snapshot.get("tp"),
+                exit_price=pos_snapshot.get("breach_price"),
+                hit_level=pos_snapshot.get("hit_level"),
+                reason="watchdog",
+                attempt=attempt,
+            )
+            self._emit_status()
             if pos_snapshot:
                 self._notify(
                     self._notifier.send_oanda_trade_alert,
@@ -540,6 +845,10 @@ class OandaScalperOrchestrator:
                     action="WATCHDOG_CLOSE",
                     price=pos_snapshot.get("entry", 0.0),
                     units=units,
+                    sl_price=pos_snapshot.get("sl"),
+                    tp_price=pos_snapshot.get("tp"),
+                    close_price=pos_snapshot.get("breach_price"),
+                    hit_level=pos_snapshot.get("hit_level"),
                     reason="SL or TP breach detected by tick watchdog",
                 )
             return
@@ -564,6 +873,8 @@ class OandaScalperOrchestrator:
             action="CLOSE_FAILED",
             price=pos_snapshot.get("entry", 0.0),
             units=units,
+            sl_price=pos_snapshot.get("sl"),
+            tp_price=pos_snapshot.get("tp"),
             reason=(
                 f"MANUAL INTERVENTION REQUIRED: watchdog close failed "
                 f"{self._close_max_attempts} times ({last_error}). Position "
@@ -589,6 +900,11 @@ class OandaScalperOrchestrator:
                     symbol,
                     bar["timestamp"],
                 )
+                # The stream's copy of this bar is incomplete (it missed the
+                # ticks from before the reconnect), but it HAS sealed — REST
+                # holds the complete version. Fetch and score that instead of
+                # losing the bar outright.
+                await self._backfill_seam_bar(symbol, bar["timestamp"])
                 return  # Drop the first bar > last_ts (the partial seam bar)
 
         # ── update rolling buffer ──
@@ -624,6 +940,118 @@ class OandaScalperOrchestrator:
         self._last_scored_ts[symbol] = bar["timestamp"]
 
         await self._evaluate_and_trade(symbol)
+        self._emit_status()
+
+    async def _backfill_seam_bar(self, symbol: str, ts: "datetime") -> None:
+        """
+        Re-fetch a dropped partial seam bar from REST and score it.
+
+        The bar in flight when a disconnect happens is lost twice over: the
+        re-prime cannot see it (it had not sealed yet) and the stream's own
+        copy is incomplete, so ``_on_bar`` drops it. It has nonetheless
+        SEALED by the time that drop fires — this runs at the bar boundary —
+        so REST holds a complete version. Without this, every reconnect
+        silently costs one evaluation per symbol (measured: 5 per symbol in
+        the first 16h of the 2026-07-28 soak, ~8% of bars).
+
+        Retries a few times because REST can lag the seal by a second or two;
+        ``get_historical_bars`` filters out still-forming candles, so a miss
+        is an empty frame rather than a partial bar. Failure is logged and
+        dropped — never raised — because this runs inside the bar callback.
+        """
+        if self._seam_backfill_attempts <= 0:
+            return
+
+        last = self._last_scored_ts.get(symbol)
+        if last is not None and ts <= last:
+            return  # already scored by another path
+
+        gran_min = getattr(self._provider, "_stream_gran", 1)
+        loop = asyncio.get_running_loop()
+        start = ts - timedelta(seconds=1)
+        end = ts + timedelta(minutes=gran_min)
+
+        for attempt in range(1, self._seam_backfill_attempts + 1):
+            df = None
+            try:
+                df = await loop.run_in_executor(
+                    None,
+                    self._provider.get_historical_bars,
+                    symbol,
+                    gran_min,
+                    start,
+                    end,
+                )
+            except Exception as e:
+                logger.warning(
+                    "[%s] Seam backfill fetch failed (attempt %d/%d): %s",
+                    symbol, attempt, self._seam_backfill_attempts, e,
+                )
+
+            row = None
+            if df is not None and not df.is_empty():
+                match = df.filter(pl.col("timestamp") == ts)
+                if match.height:
+                    row = match.row(0, named=True)
+
+            if row is None:
+                if attempt < self._seam_backfill_attempts:
+                    await asyncio.sleep(self._seam_backfill_retry_delay)
+                continue
+
+            if row["timestamp"].tzinfo is None:
+                logger.warning(
+                    "[%s] Seam backfill got a timezone-naive bar at %s — "
+                    "skipping (seam dedup would misbehave)",
+                    symbol, row["timestamp"],
+                )
+                return
+
+            buf = self._bar_buffers.get(symbol)
+            if not buf:
+                return
+            # Re-check ordering after the await: a later bar must never be
+            # overtaken by this one, or the buffer stops being monotonic.
+            newest = buf[-1].get("timestamp")
+            if newest is not None and ts <= newest:
+                return
+            if len(buf) < self._warmup:
+                return
+
+            buf.append({**row, "symbol": symbol})
+            if len(buf) > self._max_bars:
+                buf.pop(0)
+
+            self._update_regime(symbol, buf[-1])
+            self._sample_spread_calibration(symbol, buf[-1]["close"])
+            self._spread_calib_bars += 1
+
+            logger.info(
+                "SEAM_BACKFILL [%s] recovered the in-flight bar %s from REST "
+                "(attempt %d) — scoring it now",
+                symbol, ts, attempt,
+            )
+            events.emit(
+                "stream", kind="seam_backfill", sym=symbol,
+                bar_ts=str(ts), attempt=attempt,
+            )
+            # Mark before evaluating: a failure here must not be retried into
+            # a possible duplicate order on the next reconnect.
+            self._last_scored_ts[symbol] = ts
+            try:
+                await self._evaluate_and_trade(symbol)
+            except Exception as e:
+                logger.error(
+                    "[%s] Seam backfill evaluation failed: %s",
+                    symbol, e, exc_info=True,
+                )
+            return
+
+        logger.warning(
+            "[%s] Seam backfill gave up after %d attempts — the in-flight "
+            "bar at %s is lost (one missed evaluation, no position risk)",
+            symbol, self._seam_backfill_attempts, ts,
+        )
 
     async def _evaluate_and_trade(self, symbol: str) -> None:
         """
@@ -660,6 +1088,31 @@ class OandaScalperOrchestrator:
                     "[%s] Signal generated but position state=%s — skipping",
                     symbol,
                     existing.get("state"),
+                )
+                return
+
+        # ── guard: post-exit cooldown ──
+        # Only applies to OPENING a position. If one is already open this is
+        # a flip, which is the model changing its mind about a live trade
+        # rather than re-entering a closed one; the direction guards below
+        # own that case.
+        if existing is None:
+            remaining = self._cooldown_remaining(symbol)
+            if remaining > 0:
+                self._cooldown_rejections += 1
+                logger.info(
+                    "[%s] Entry blocked by post-exit cooldown — %.0fs left "
+                    "(%d blocked so far)",
+                    symbol,
+                    remaining,
+                    self._cooldown_rejections,
+                )
+                events.emit(
+                    "guard_block",
+                    sym=symbol,
+                    guard="cooldown",
+                    remaining_s=round(remaining, 1),
+                    total=self._cooldown_rejections,
                 )
                 return
 
@@ -708,6 +1161,15 @@ class OandaScalperOrchestrator:
                 self._devil_approved_total,
                 ratio,
             )
+            events.emit(
+                "gate_veto",
+                sym=symbol,
+                gate=gate,
+                spread=self._spread_gate_rejections,
+                regime=self._regime_gate_rejections,
+                time=self._time_gate_rejections,
+                devil_approved=self._devil_approved_total,
+            )
             return
 
         # ── derive signed target units ──
@@ -724,8 +1186,34 @@ class OandaScalperOrchestrator:
         # so the tick watchdog cannot fire on its stale SL/TP mid-submit.
         reversing = False
         with self._positions_lock:
+            # Correlated-exposure cap, checked and RESERVED under one lock
+            # acquisition so two same-bar entries cannot both pass it.
+            conflict = self._exposure_conflict(symbol, target_units)
+            if conflict is not None:
+                self._exposure_rejections += 1
+                logger.warning(
+                    "[%s] Entry blocked by exposure cap: %s (%d blocked so far)",
+                    symbol,
+                    conflict,
+                    self._exposure_rejections,
+                )
+                # emit() is a non-blocking queue put, so it is safe to call
+                # while holding the positions lock.
+                events.emit(
+                    "guard_block",
+                    sym=symbol,
+                    guard="exposure",
+                    detail=conflict,
+                    total=self._exposure_rejections,
+                )
+                return
+            self._pending_entries[symbol] = target_units
+
             existing = self._positions.get(symbol)
             if existing:
+                # Each bail-out below releases the reservation inline: the
+                # lock is held here and is NOT reentrant, so it cannot be
+                # released through a helper that takes it.
                 if existing.get("state") != "OPEN":
                     logger.info(
                         "[%s] Position state changed to %s before submit — "
@@ -733,12 +1221,15 @@ class OandaScalperOrchestrator:
                         symbol,
                         existing.get("state"),
                     )
+                    self._pending_entries.pop(symbol, None)
                     return
                 if existing["units"] > 0 and target_units > 0:
                     logger.info("[%s] Already long — skipping re-entry", symbol)
+                    self._pending_entries.pop(symbol, None)
                     return
                 if existing["units"] < 0 and target_units < 0:
                     logger.info("[%s] Already short — skipping re-entry", symbol)
+                    self._pending_entries.pop(symbol, None)
                     return
                 existing["state"] = "REVERSING"
                 reversing = True
@@ -753,6 +1244,9 @@ class OandaScalperOrchestrator:
                     current["state"] = "OPEN"
 
         # ── submit order (blocking HTTP → executor) ──
+        # From here the exposure reservation is live and MUST be released on
+        # every path out — including the ones that record a position, since
+        # _positions then carries the exposure itself.
         try:
             result = await asyncio.get_running_loop().run_in_executor(
                 None,
@@ -768,6 +1262,7 @@ class OandaScalperOrchestrator:
                 exc_info=True,
             )
             _restore_open()
+            self._release_pending(symbol)
             return
 
         filled = result.get("filled", 0)
@@ -777,6 +1272,7 @@ class OandaScalperOrchestrator:
                 symbol,
             )
             _restore_open()
+            self._release_pending(symbol)
             return
 
         # ── record position state ──
@@ -795,7 +1291,11 @@ class OandaScalperOrchestrator:
             # would block future entries and watchdog alike).
             with self._positions_lock:
                 self._positions.pop(symbol, None)
+                self._pending_entries.pop(symbol, None)
             return
+        # Record the position and hand the exposure over to _positions in ONE
+        # lock acquisition, so the symbol is never briefly invisible to a
+        # concurrent cap check.
         with self._positions_lock:
             self._positions[symbol] = {
                 "entry": avg_price,
@@ -804,6 +1304,7 @@ class OandaScalperOrchestrator:
                 "units": actual_units,
                 "state": "OPEN",
             }
+            self._pending_entries.pop(symbol, None)
 
         logger.info(
             "[%s] Position opened | units=%d entry=%.5f sl=%.5f tp=%.5f",
@@ -814,8 +1315,21 @@ class OandaScalperOrchestrator:
             tp_price,
         )
 
-        # Discord trade alert (no-op if webhook unset; posted off-loop)
         meta = signal.metadata or {}
+        events.emit(
+            "entry",
+            sym=symbol,
+            dir=signal.direction,
+            units=actual_units,
+            entry=avg_price,
+            sl=sl_price,
+            tp=tp_price,
+            angel=meta.get("angel_prob"),
+            devil=meta.get("devil_prob"),
+        )
+        self._emit_status()
+
+        # Discord trade alert (no-op if webhook unset; posted off-loop)
         self._notify(
             self._notifier.send_oanda_trade_alert,
             symbol=symbol,
@@ -840,17 +1354,37 @@ class OandaScalperOrchestrator:
         an orphan (crash recovery, failed watchdog close from a prior run)
         with no known SL/TP — flatten it. If broker state cannot even be
         *verified*, abort startup: never trade blind.
+
+        That refusal is retried before it becomes fatal. On 2026-07-28 a
+        single transient 401 on one instrument aborted startup, and the
+        cron watchdog's crash-loop brake then kept the bot down for 15
+        minutes over a blip that had cleared seconds later. Retrying costs
+        nothing and does not weaken the guard: startup still refuses if the
+        broker cannot be reached after every attempt.
         """
         loop = asyncio.get_running_loop()
         for symbol in self._symbols:
             norm_sym = _to_oanda_symbol(symbol)
 
-            ok = await loop.run_in_executor(
-                None, self._order_manager.sync_position, norm_sym
-            )
+            ok = False
+            for attempt in range(1, self._reconcile_max_attempts + 1):
+                ok = await loop.run_in_executor(
+                    None, self._order_manager.sync_position, norm_sym
+                )
+                if ok:
+                    break
+                if attempt < self._reconcile_max_attempts:
+                    delay = self._reconcile_retry_delay * attempt
+                    logger.warning(
+                        "[%s] Boot reconciliation attempt %d/%d could not "
+                        "verify broker state; retrying in %.1fs",
+                        norm_sym, attempt, self._reconcile_max_attempts, delay,
+                    )
+                    await asyncio.sleep(delay)
             if not ok:
                 raise RuntimeError(
-                    f"[{norm_sym}] Boot reconciliation failed: could not "
+                    f"[{norm_sym}] Boot reconciliation failed after "
+                    f"{self._reconcile_max_attempts} attempts: could not "
                     "verify broker position state — refusing to start."
                 )
 
@@ -888,6 +1422,59 @@ class OandaScalperOrchestrator:
                     "reconciliation — flattened (no known SL/TP)."
                 ),
             )
+
+    async def _drop_untradeable_symbols(self) -> None:
+        """
+        Remove configured symbols this account is not permitted to trade.
+
+        Motivation (2026-08-06): XAU_USD and XAG_USD are in the trained basket
+        but not on this account's instrument list. The model kept proposing
+        them, the order was submitted, and OANDA rejected it with
+        INSTRUMENT_NOT_TRADEABLE — three times in four days. Each one is a
+        signal spent on an order that could never fill, plus a stack trace in
+        the log that looks like a real fault.
+
+        Fail-open by design. If the account cannot be queried we keep every
+        symbol: eating an occasional rejection is far cheaper than a transient
+        API blip silently muting the whole basket. Only a *successful* lookup
+        that positively excludes a symbol may drop it.
+        """
+        get = getattr(self._provider, "get_tradeable_instruments", None)
+        if get is None:
+            return
+
+        tradeable = await asyncio.get_running_loop().run_in_executor(None, get)
+        if not tradeable:
+            logger.warning(
+                "Could not determine tradeable instruments — keeping all %d "
+                "configured symbol(s). Untradeable ones will be rejected at "
+                "order time.",
+                len(self._symbols),
+            )
+            return
+
+        keep = [s for s in self._symbols if _to_oanda_symbol(s) in tradeable]
+        dropped = [s for s in self._symbols if s not in keep]
+
+        if not keep:
+            raise RuntimeError(
+                "None of the configured symbols are tradeable on this "
+                f"account: {self._symbols}. Refusing to start a bot that "
+                "cannot place a single order."
+            )
+
+        if dropped:
+            logger.warning(
+                "UNTRADEABLE — dropping %s from this run; the account cannot "
+                "trade %s. Trading %d of %d configured symbols.",
+                dropped,
+                "them" if len(dropped) > 1 else "it",
+                len(keep),
+                len(self._symbols),
+            )
+            events.emit("untradeable_dropped", dropped=dropped, kept=keep)
+
+        self._symbols = keep
 
     async def _prime_history(self) -> None:
         """Prime bar buffers with historical REST data to bypass cold warm-up."""
@@ -1003,6 +1590,10 @@ class OandaScalperOrchestrator:
                     ts,
                     age,
                 )
+                events.emit(
+                    "stream", kind="seam_catchup", sym=norm_sym,
+                    bar_ts=str(ts), age_s=round(age, 1),
+                )
                 # Mark BEFORE evaluating: a failed evaluation must not retry
                 # on the next reconnect — duplicate-order risk outranks one
                 # lost signal.
@@ -1013,9 +1604,24 @@ class OandaScalperOrchestrator:
                     "[%s] Seam catch-up failed: %s", norm_sym, e, exc_info=True
                 )
 
+    def _reconnect_delay(self, attempt: int) -> float:
+        """
+        Jittered, capped exponential backoff for reconnects (0-based attempt).
+
+        Jitter spreads retries so a flapping endpoint is not hammered on a
+        fixed cadence; the result is always in [cap/2, cap] and never exceeds
+        ``_reconnect_max_delay``.
+        """
+        ceiling = min(
+            self._reconnect_base_delay * (2 ** attempt), self._reconnect_max_delay
+        )
+        return ceiling * (0.5 + 0.5 * random.random())
+
     async def _stream_with_retry(self) -> None:
         """Run the pricing stream with reconnect-on-disconnect."""
+        attempt = 0
         while not self._shutdown_event.is_set():
+            started = time.monotonic()
             try:
                 await asyncio.to_thread(self._provider.run_stream)
             except Exception as e:
@@ -1029,8 +1635,23 @@ class OandaScalperOrchestrator:
             if self._shutdown_event.is_set():
                 break
 
-            logger.warning("Stream reconnect in 5s; re-priming history on resume")
-            await asyncio.sleep(5)
+            # A stream that ran healthily before dying is a fresh incident,
+            # not an escalating one — start the backoff over.
+            if time.monotonic() - started >= self._reconnect_healthy_seconds:
+                attempt = 0
+
+            delay = self._reconnect_delay(attempt)
+            attempt += 1
+            logger.warning(
+                "Stream reconnect in %.1fs (consecutive failure %d); "
+                "re-priming history on resume",
+                delay,
+                attempt,
+            )
+            events.emit(
+                "stream", kind="disconnect", delay_s=round(delay, 1), attempt=attempt
+            )
+            await asyncio.sleep(delay)
 
             # Reset seam state so re-prime + new stream dedup cleanly
             for sym in list(self._bar_buffers.keys()):
@@ -1113,6 +1734,24 @@ class OandaScalperOrchestrator:
         # raises if state can't be verified.
         await self._reconcile_on_boot()
 
+        # Drop instruments the account cannot trade. Runs AFTER reconciliation
+        # so orphan checks still cover every configured symbol.
+        await self._drop_untradeable_symbols()
+
+        events.emit(
+            "boot",
+            pid=os.getpid(),
+            symbols=self._symbols,
+            granularity=getattr(self._provider, "_stream_gran", None),
+            units=self._units_per_trade,
+            warmup=self._warmup,
+            cooldown_s=self._reentry_cooldown,
+            max_per_ccy=self._max_per_currency,
+            angel_thr=getattr(self._strategy, "angel_threshold", None),
+            devil_thr=getattr(self._strategy, "devil_threshold", None),
+        )
+        self._emit_status()
+
         self._provider.subscribe(
             self._symbols,
             self._on_bar,
@@ -1133,7 +1772,7 @@ class OandaScalperOrchestrator:
         self._liveness_task = asyncio.create_task(self._liveness_watchdog())
 
         logger.info(
-            "OandaScalperOrchestrator started | symbols=%s warmup=%d",
+            "OandaForexOrchestrator started | symbols=%s warmup=%d",
             self._symbols,
             self._warmup,
         )
@@ -1143,7 +1782,7 @@ class OandaScalperOrchestrator:
 
     async def shutdown(self) -> None:
         """Graceful shutdown: stop stream, flatten if configured."""
-        logger.info("OandaScalperOrchestrator shutting down...")
+        logger.info("OandaForexOrchestrator shutting down...")
 
         # Final spread-calibration dump (durable even if flatten hangs below).
         self._log_spread_calibration()
@@ -1170,12 +1809,16 @@ class OandaScalperOrchestrator:
         if self._flatten_on_exit:
             await self._flatten_all()
 
-        logger.info("OandaScalperOrchestrator shutdown complete.")
+        logger.info("OandaForexOrchestrator shutdown complete.")
 
     async def _flatten_all(self) -> None:
         """Close all open positions on exit."""
         with self._positions_lock:
             symbols = list(self._positions.keys())
+            # Copy the bracket facts out before the close: a flatten is a
+            # real exit and its event record has to describe the whole trade,
+            # not just name the instrument.
+            snapshots = {s: dict(p) for s, p in self._positions.items()}
 
         if not symbols:
             return
@@ -1201,7 +1844,25 @@ class OandaScalperOrchestrator:
                     result,
                 )
             else:
+                # Also reached by the liveness watchdog mid-run, where the
+                # process keeps trading: a flatten is a real exit and starts
+                # the cooldown like any other.
+                self._mark_exit(sym)
                 logger.info("[%s] Flattened on exit", sym)
+                snap = snapshots.get(sym, {})
+                flat_units = snap.get("units", 0)
+                events.emit(
+                    "exit",
+                    sym=sym,
+                    units=flat_units,
+                    dir="long" if flat_units > 0 else "short",
+                    entry=snap.get("entry"),
+                    sl=snap.get("sl"),
+                    tp=snap.get("tp"),
+                    exit_price=None,
+                    hit_level=None,
+                    reason="flatten",
+                )
 
         if failed:
             # Synchronous on purpose: we are shutting down and the loop may
