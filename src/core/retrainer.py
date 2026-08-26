@@ -106,11 +106,36 @@ Glossary:
         (effective_floor = 300 x (1 - chop_veto_rate)), so a filter that
         correctly discards a third of the bars is not punished for the trades
         it removed. This floor exists because a handful of lucky wins at 6:1
-        payoff can fake a passing profit factor.
+        payoff can fake a passing profit factor. FOLD gate only -- the
+        artifact holdout no longer borrows it (see HOLDOUT_PF_CONFIDENCE).
     HOLDOUT_FRAC -- fraction of the chronological window carved off before any
         feature engineering (default 0.18; set RETRAIN_HOLDOUT_FRAC=0 to
         disable). The served model trains on the remainder only and is then
         judged on this untouched slice.
+    HOLDOUT_PF_CONFIDENCE -- 0.95. One-sided confidence level for the holdout
+        profit-factor gate. The verdict gates on the Clopper-Pearson LOWER
+        bound of the macro win rate mapped through PF, not the point
+        estimate, because a PF on 55-82 trades flips with the clock (audit
+        2026-08-24). Exact for independent trades; overlapping 45-bar walks
+        make it conservative in practice. Deliberately not env-tunable.
+    _holdout_pf_lower_bound -- one-sided lower confidence bound
+        (Clopper-Pearson) on holdout PF from (wins, trades) and the bracket
+        multiples. CP rather than Wilson because Wilson under-covers below
+        ~40 trades, exactly the regime that used to flip.
+    _holdout_verdict -- applies the holdout bars (CI-bound PF, Brier, EV) to
+        an _evaluate_holdout score dict. NaN metrics fail loudly rather than
+        passing vacuously.
+    _tail_cutoff_by_symbol -- per-symbol timestamp where the unresolvable
+        tail begins: the last max_hold bars per symbol, whose macro walk runs
+        off the end of the frame and reads "timeout -> loss" regardless of
+        the true outcome. Derived from the RAW series, applied after
+        engineering.
+    _purge_boundary_tail -- drops engineered rows at/after their symbol's
+        tail cutoff; returns the frame and how many rows went.
+    _score_artifact_holdout -- engineers the holdout slice (same parameters
+        as the remainder, no cross-boundary access), purges its unresolvable
+        tail, and scores the artifact with the frozen production threshold.
+        Used by main() for both the pass-verdict and the fold-fail diagnostic.
     _split_holdout -- carves the chronologically last slice from raw fetched
         bars. Returns (remainder, holdout, date_range). All training and fold
         validation use the remainder; the holdout is engineered separately after
@@ -118,10 +143,13 @@ Glossary:
     _evaluate_holdout -- scores the final served artifact on the holdout using
         the production threshold from validate_candidate. Restricts scoring to
         tradeable instruments, mirroring the fold gate. No parameter choice on
-        the holdout.
+        the holdout. The score dict carries wins/losses so the confidence
+        bound can be recomputed from the raw evidence.
     HoldoutMetrics -- the artifact holdout scorecard: used flag, fraction, date
-        range, Brier/EV/win rate/PF/trade counts, and bypass_reason when the
-        holdout was disabled or empty.
+        range, Brier/EV/win rate/PF/trade counts, bypass_reason when the
+        holdout was disabled or empty, plus wins, the PF lower confidence
+        bound, purged tail-row count, and diagnostic_only (fold gate already
+        failed; verdict not applied).
     USE_HMM_FEATURES -- off by default (RETRAIN_USE_HMM=1 to enable). Adds
         3 hidden-regime probability features, fit per fold to avoid leakage.
     _SPREAD_TABLE_PATH / SPREAD_TABLE -- optional per-instrument trading-cost
@@ -211,6 +239,7 @@ import joblib
 import lightgbm as lgb
 import numpy as np
 import polars as pl
+from scipy.stats import beta as _scipy_beta
 from sklearn.metrics import brier_score_loss
 from sklearn.model_selection import cross_val_predict, TimeSeriesSplit
 
@@ -465,11 +494,16 @@ PROFIT_FACTOR_THRESHOLD = 1.2  # Min acceptable Profit Factor
 # "NO SIGNAL." 100 is the minimum sample for any honest PF claim.
 MIN_OOS_TRADES_FOR_PF = 100  # legacy Fold-3-only floor (superseded below)
 
-# Pooled, drop-rate-scaled OOS-trade floor (replaces the Fold-3-only cliff).
-# Pool Devil-approved OOS trades across ALL folds, then scale the requirement
+# Pooled, drop-rate-scaled OOS-trade floor for the FOLD gate. Pool
+# Devil-approved OOS trades across ALL folds, then scale the requirement
 # down by the chop filter's row-drop rate so a high-precision filter that
 # correctly prunes ~30% of bars isn't penalized for the trades it removed:
 #     effective_floor = BASELINE_POOLED_OOS_TRADES * (1 - chop_veto_rate)
+# The ARTIFACT HOLDOUT no longer borrows this floor: 300 * 0.18 * 0.776 ~= 42
+# demanded less evidence of the decisive test than the fold gate demands of
+# the rehearsal, and a PF on 55-82 trades flipped with the clock (audit
+# 2026-08-24). The holdout's sample-size discipline now lives in the exact
+# confidence bound -- see HOLDOUT_PF_CONFIDENCE / _holdout_pf_lower_bound.
 BASELINE_POOLED_OOS_TRADES = int(os.getenv("RETRAIN_POOLED_TRADE_FLOOR", "300"))
 
 # Toggle for the HMM regime-feature experiment. When enabled, a per-symbol
@@ -483,6 +517,18 @@ USE_HMM_FEATURES = os.getenv("RETRAIN_USE_HMM", "0").strip() == "1"
 # pipeline can leak holdout information into the served model. 0 disables the
 # holdout and preserves the legacy full-data retrain behaviour.
 HOLDOUT_FRAC = float(os.getenv("RETRAIN_HOLDOUT_FRAC", "0.18"))
+
+# One-sided confidence level for the holdout profit-factor gate. The verdict
+# gates on the Clopper-Pearson LOWER bound of the macro win rate mapped
+# through PF, not the point estimate (audit 2026-08-24: the same config
+# passed at PF 1.444 and failed at 0.982 an hour apart). For independent
+# trades a break-even artifact passes with probability at most 1-confidence
+# at any trade count; the 45-bar macro walks overlap, so treat the bound as
+# conservative rather than a literal coverage guarantee -- either way it is
+# strictly stronger than the point estimate it replaced. The sample-size
+# floor, generalised from a cliff to a continuous evidential bar.
+# Deliberately NOT env-tunable: the promotion gate is not a knob.
+HOLDOUT_PF_CONFIDENCE = 0.95
 
 # Per-instrument spread-cost table (2026-07-07 cost-awareness experiment).
 # Points at a JSON baked by scripts/bake_spread_alphas.py from live
@@ -590,6 +636,20 @@ class HoldoutMetrics:
     trades: int
     angel_proposed_trades: int
     bypass_reason: Optional[str] = None
+    # Macro wins among the scored trades -- the PF gate's raw evidence, carried
+    # so the confidence bound can be recomputed from metadata alone.
+    wins: int = 0
+    # Lower confidence bound on the holdout PF (see HOLDOUT_PF_CONFIDENCE).
+    # 0.0 for a zero-trade scored holdout; None when the holdout was never
+    # scored (bypassed, disabled, or no fold models to score).
+    pf_lower_bound: Optional[float] = None
+    pf_confidence: Optional[float] = None
+    # Rows dropped at the tail of this slice because their macro walk ran off
+    # the end of the fetched window (unresolvable outcome).
+    purged_tail_rows: int = 0
+    # True when the fold gate already failed and the holdout was scored for
+    # diagnostics only -- the metrics inform, the fold verdict stands.
+    diagnostic_only: bool = False
 
 
 @dataclass
@@ -1680,6 +1740,8 @@ def _evaluate_holdout(
             "angel_proposed_trades": 0,
             "devil_approved_raw": 0,
             "approved_mask": np.array([], dtype=bool),
+            "wins": 0,
+            "losses": 0,
         }
 
     X_base = holdout_df[angel_features].to_numpy()
@@ -1704,6 +1766,8 @@ def _evaluate_holdout(
             "angel_proposed_trades": 0,
             "devil_approved_raw": 0,
             "approved_mask": np.array([], dtype=bool),
+            "wins": 0,
+            "losses": 0,
         }
 
     proposed_base = X_base[signal_mask]
@@ -1745,6 +1809,8 @@ def _evaluate_holdout(
             "angel_proposed_trades": n_angel_proposed,
             "devil_approved_raw": n_devil_approved_raw,
             "approved_mask": approved_mask,
+            "wins": 0,
+            "losses": 0,
         }
 
     approved_devil_probs = devil_probs[approved_mask]
@@ -1774,7 +1840,211 @@ def _evaluate_holdout(
         "devil_approved_raw": n_devil_approved_raw,
         "approved_mask": approved_mask,
         "n_excluded_untradeable": n_excluded,
+        "wins": macro_wins,
+        "losses": macro_losses,
     }
+
+
+def _holdout_pf_lower_bound(
+    wins: int,
+    trades: int,
+    sl_mult: float,
+    tp_mult: float,
+    confidence: float = HOLDOUT_PF_CONFIDENCE,
+) -> float:
+    """
+    Exact lower confidence bound on the holdout profit factor.
+
+    The old point-estimate gate flipped with the clock because a PF on 55-82
+    trades cannot separate 0.98 from 1.44 (audit 2026-08-24, three window
+    endpoints). Rather than pretend the sample is larger, the gate demands
+    what the sample can actually prove: the Clopper-Pearson one-sided lower
+    bound on the macro win rate p, mapped through the PF formula
+    PF = p*tp / ((1-p)*sl). A promotion now requires the holdout to exclude
+    break-even at ``confidence``. The bound is exact for independent trades;
+    the 45-bar macro walks overlap in price, so in practice it is
+    conservative rather than a literal coverage guarantee -- which is the
+    safe direction for a promotion gate.
+
+    Clopper-Pearson, not the Wilson approximation: Wilson under-covers at
+    n < ~40, the exact regime that used to flip. Example: a perfect 3-for-3
+    holdout clears Wilson's bound, but CP's is 0.3684 -- below the 0.375
+    break-even at 2:1 -- so it is (correctly) rejected; a perfect 4-for-4
+    (CP 0.4729) passes.
+
+    Args:
+        wins: Macro wins among the scored holdout trades.
+        trades: Scored holdout trades (tradeable approvals).
+        sl_mult: Stop-loss ATR multiple of the bracket.
+        tp_mult: Take-profit ATR multiple of the bracket.
+        confidence: One-sided confidence level (default HOLDOUT_PF_CONFIDENCE).
+
+    Returns:
+        Lower confidence bound on PF; 0.0 when trades == 0.
+    """
+    if trades <= 0:
+        return 0.0
+    wins = min(max(int(wins), 0), int(trades))
+    if wins == 0:
+        # scipy's beta.ppf is undefined at a=0; the bound on a win rate with
+        # zero observed wins is exactly 0.
+        return 0.0
+    # Beta(1-confidence; wins, losses+1) quantile; exactly 0 at wins == 0.
+    p_lb = float(_scipy_beta.ppf(1.0 - confidence, wins, trades - wins + 1))
+    return (p_lb * tp_mult) / ((1.0 - p_lb) * sl_mult)
+
+
+def _holdout_verdict(
+    scores: dict, sl_mult: float, tp_mult: float
+) -> Tuple[bool, List[str]]:
+    """
+    Apply the artifact holdout bars to an ``_evaluate_holdout`` score dict.
+
+    Returns ``(passed, reasons)``. The PF bar gates on the exact confidence
+    lower bound rather than the point estimate; Brier and EV keep their point
+    bars (both were stable across the audit's windows). The ``not (x <= bar)``
+    forms are deliberate: a zero-trade holdout returns NaN metrics, and NaN
+    comparisons are False -- that shape makes NaN fail loudly instead of
+    passing vacuously.
+    """
+    reasons: List[str] = []
+    pf_lb = _holdout_pf_lower_bound(
+        scores["wins"], scores["trades"], sl_mult, tp_mult
+    )
+    if not (pf_lb >= PROFIT_FACTOR_THRESHOLD):
+        reasons.append(
+            f"Holdout PF point estimate {scores['profit_factor']:.4f} on "
+            f"{scores['trades']} trades, but {HOLDOUT_PF_CONFIDENCE:.0%} lower "
+            f"bound {pf_lb:.4f} < {PROFIT_FACTOR_THRESHOLD} -- the sample cannot "
+            f"support a pass"
+        )
+    if not (scores["brier_score"] <= BRIER_THRESHOLD):
+        reasons.append(
+            f"Holdout Brier {scores['brier_score']:.4f} > {BRIER_THRESHOLD}"
+        )
+    if not (scores["expected_value"] >= EV_THRESHOLD):
+        reasons.append(
+            f"Holdout EV {scores['expected_value']:.6f} < {EV_THRESHOLD}"
+        )
+    return len(reasons) == 0, reasons
+
+
+def _tail_cutoff_by_symbol(raw_df: pl.DataFrame, max_hold: int) -> dict:
+    """
+    Per-symbol timestamp where the unresolvable tail begins.
+
+    A row whose ``max_hold``-bar bracket walk needs bars beyond the frame's
+    end resolves as "timeout -> loss" even though its true outcome is
+    unknowable -- the last ``max_hold`` bars per symbol of a raw slice are
+    systematically wrong labels, not evidence. The cutoff MUST be derived
+    from the RAW series (the walk's true domain, before the chop veto removes
+    rows) and applied AFTER engineering, because the walk itself needs the
+    contiguous price path.
+
+    Returns ``{symbol: first_unresolvable_timestamp}``. Symbols with at most
+    ``max_hold`` bars are absent: every one of their rows is unresolvable,
+    and dropping them wholesale could empty a degenerate frame entirely, so
+    they are kept untouched as the defensive call.
+    """
+    cutoffs: dict = {}
+    for sym in raw_df["symbol"].unique(maintain_order=True).to_list():
+        ts = raw_df.filter(pl.col("symbol") == sym)["timestamp"].sort()
+        if len(ts) > max_hold:
+            cutoffs[sym] = ts[max(0, len(ts) - max_hold)]
+    return cutoffs
+
+
+def _purge_boundary_tail(
+    df: pl.DataFrame, cutoffs: dict
+) -> Tuple[pl.DataFrame, int]:
+    """
+    Drop engineered rows at or after their symbol's tail cutoff.
+
+    Returns ``(frame, n_dropped)``. Symbols without a cutoff are untouched;
+    rows are removed after engineering so the veto, labels, and walks all saw
+    the full contiguous path.
+    """
+    if not cutoffs or df.is_empty():
+        return df, 0
+    kept_parts: List[pl.DataFrame] = []
+    n_dropped = 0
+    for sym in df["symbol"].unique(maintain_order=True).to_list():
+        sub = df.filter(pl.col("symbol") == sym)
+        if sym in cutoffs:
+            before = sub.height
+            sub = sub.filter(pl.col("timestamp") < cutoffs[sym])
+            n_dropped += before - sub.height
+        if not sub.is_empty():
+            kept_parts.append(sub)
+    if not kept_parts:
+        # Every surviving row sat in a purged tail (possible in degenerate
+        # tiny frames): return an empty frame with the same schema rather
+        # than handing back rows the count says were dropped.
+        return df.clear(), n_dropped
+    return pl.concat(kept_parts), n_dropped
+
+
+def _score_artifact_holdout(
+    holdout_raw: pl.DataFrame,
+    angel_model: "lgb.LGBMClassifier",
+    devil_model: "lgb.LGBMClassifier",
+    angel_features: List[str],
+    devil_features: List[str],
+    threshold: float,
+    asset_config: dict,
+    alpha_table: Optional[dict] = None,
+    final_hmm_models: Optional[dict] = None,
+) -> Tuple[dict, int]:
+    """
+    Engineer the holdout slice and score the artifact on it with the frozen
+    production threshold.
+
+    The holdout is engineered separately, with the same parameters as the
+    remainder but no access to it -- no indicator, label, veto, threshold, or
+    model parameter may see across the boundary. The slice's own last
+    ``max_hold`` bars per symbol are purged before scoring: their macro walk
+    runs off the end of the fetched window and would read as guaranteed
+    losses, a pessimistic bias on the gate's own evidence (the mirror image
+    of the remainder purge). The indicator warm-up at the slice head is
+    already consumed by NaN cleaning during engineering.
+
+    Returns ``(scores, n_purged)`` where ``scores`` is the
+    ``_evaluate_holdout`` dict.
+    """
+    sl_mult = asset_config["sl_mult"]
+    tp_mult = asset_config["tp_mult"]
+    holdout_features, _, _ = engineer_features_and_labels(
+        holdout_raw,
+        sl_mult=sl_mult,
+        angel_mult=asset_config["angel_mult"],
+        tp_mult=tp_mult,
+        max_hold=asset_config["max_hold"],
+        survival_bars=asset_config["survival_bars"],
+        htf_timeframe=asset_config.get("htf_timeframe", "5m"),
+        risk_profile=RiskProfile.for_asset_class(asset_config["asset_class"]),
+        alpha_table=alpha_table,
+    )
+    cutoffs = _tail_cutoff_by_symbol(holdout_raw, asset_config["max_hold"])
+    holdout_features, n_purged = _purge_boundary_tail(holdout_features, cutoffs)
+    if n_purged:
+        logger.info(
+            "HOLDOUT TAIL PURGE: dropped %d rows whose %d-bar macro walk ran "
+            "off the end of the fetched window (unresolvable outcome)",
+            n_purged, asset_config["max_hold"],
+        )
+    if USE_HMM_FEATURES and final_hmm_models is not None and not holdout_features.is_empty():
+        holdout_features = predict_regime_probs(holdout_features, final_hmm_models)
+    scores = _evaluate_holdout(
+        holdout_features,
+        angel_model,
+        devil_model,
+        angel_features,
+        devil_features,
+        threshold,
+        sl_mult=sl_mult,
+        tp_mult=tp_mult,
+    )
+    return scores, n_purged
 
 
 def validate_candidate(
@@ -2659,6 +2929,15 @@ def save_models(
             ),
             "trades": ho.trades,
             "angel_proposed_trades": ho.angel_proposed_trades,
+            # The PF verdict rests on the exact confidence bound, not the
+            # point estimate; both are recorded so a served model can be
+            # re-checked against the evidence that actually decided it.
+            "wins": ho.wins,
+            "pf_lower_bound": (
+                round(ho.pf_lower_bound, 4) if ho.pf_lower_bound is not None else None
+            ),
+            "pf_confidence": ho.pf_confidence,
+            "purged_tail_rows": ho.purged_tail_rows,
             "bypass_reason": ho.bypass_reason,
         }
     with open(metadata_temp, "w") as f:
@@ -2867,6 +3146,22 @@ def main() -> int:
             alpha_table=spread_alphas,
         )
 
+        # ─── Phase 3a: Purge the unresolvable tail ─────────────────────────
+        # The remainder's last max_hold bars per symbol can only resolve their
+        # macro labels against bars that now live in the holdout: their walks
+        # ran off the frame and every one of them reads "timeout -> loss".
+        # Those are systematically wrong labels, not evidence (audit finding
+        # 3, ~360 rows). Cutoffs come from the RAW remainder because the walk
+        # runs over the pre-veto series; the drop happens after engineering.
+        tail_cutoffs = _tail_cutoff_by_symbol(remainder_raw, asset_config["max_hold"])
+        features_df, n_purged_tail = _purge_boundary_tail(features_df, tail_cutoffs)
+        if n_purged_tail:
+            logger.info(
+                "BOUNDARY PURGE: dropped %d training rows within %d bars of the "
+                "holdout boundary (unresolvable macro walk)",
+                n_purged_tail, asset_config["max_hold"],
+            )
+
         # ─── Phase 4: Walk-forward validation (3-fold expanding window) ────
         # TEMPORAL BOUNDARY: CV folds and the Profit Factor gate are evaluated
         # strictly OOS on the remainder. The final artifact is trained on the
@@ -2895,10 +3190,27 @@ def main() -> int:
         )
         logger.info(f"Optimal Devil threshold (from Fold 3): {optimal_threshold:.4f}")
 
+        # validate_candidate fits the production HMM only on a fold-gate pass.
+        # The fold-fail diagnostic still needs the same feature space the Fold
+        # 3 models were trained with, so fit it here on the remainder (never
+        # the holdout) when the gate didn't. Diagnostic only: a remainder-fit
+        # HMM behind a fold-failed candidate produces indicative numbers, not
+        # a certifiable score -- the fold verdict stands regardless.
+        if USE_HMM_FEATURES and final_hmm_models is None:
+            logger.info(
+                "Fitting production HMM on remainder for fold-fail holdout diagnostic..."
+            )
+            final_hmm_models = fit_regime_models(features_df)
+
         # ─── Phase 4.5: Artifact-level holdout gate ────────────────────────
         # Passing the fold gate is necessary but not sufficient. The served
         # model has never seen the holdout, so its score here is the honest
-        # estimate of live performance.
+        # estimate of live performance. The PF bar gates on the exact
+        # confidence lower bound (HOLDOUT_PF_CONFIDENCE), not the point
+        # estimate -- see _holdout_pf_lower_bound. When the FOLD gate failed,
+        # the holdout is still scored (Fold 3 models, diagnostic only): the
+        # comparison answers whether the fold gate was too strict or the
+        # model genuinely bad, and the fold verdict stands either way.
         holdout_metrics = HoldoutMetrics(
             used=False,
             fraction=HOLDOUT_FRAC,
@@ -2912,92 +3224,96 @@ def main() -> int:
             angel_proposed_trades=0,
             bypass_reason=None,
         )
-        if HOLDOUT_FRAC > 0.0 and not holdout_raw.is_empty() and report.gate_passed:
+        if HOLDOUT_FRAC > 0.0 and not holdout_raw.is_empty():
             logger.info("=" * 70)
             logger.info("ARTIFACT HOLDOUT EVALUATION")
             logger.info("=" * 70)
 
-            holdout_features, _, _ = engineer_features_and_labels(
-                holdout_raw,
-                sl_mult=asset_config["sl_mult"],
-                angel_mult=asset_config["angel_mult"],
-                tp_mult=asset_config["tp_mult"],
-                max_hold=asset_config["max_hold"],
-                survival_bars=asset_config["survival_bars"],
-                htf_timeframe=asset_config.get("htf_timeframe", "5m"),
-                risk_profile=RiskProfile.for_asset_class(asset_config["asset_class"]),
-                alpha_table=spread_alphas,
-            )
-            if USE_HMM_FEATURES and final_hmm_models is not None:
-                holdout_features = predict_regime_probs(
-                    holdout_features, final_hmm_models
-                )
-
-            holdout_scores = _evaluate_holdout(
-                holdout_features,
-                angel_model,
-                devil_model,
-                angel_feats,
-                devil_feats,
-                optimal_threshold,
-                sl_mult=asset_config["sl_mult"],
-                tp_mult=asset_config["tp_mult"],
-            )
-
-            holdout_trade_floor = (
-                BASELINE_POOLED_OOS_TRADES * HOLDOUT_FRAC * (1.0 - chop_veto_rate)
-            )
-            holdout_passed = (
-                holdout_scores["trades"] >= holdout_trade_floor
-                and holdout_scores["brier_score"] <= BRIER_THRESHOLD
-                and holdout_scores["expected_value"] >= EV_THRESHOLD
-                and holdout_scores["profit_factor"] >= PROFIT_FACTOR_THRESHOLD
-            )
-
-            holdout_metrics = HoldoutMetrics(
-                used=True,
-                fraction=HOLDOUT_FRAC,
-                start_date=holdout_range[0].date().isoformat() if holdout_range else None,
-                end_date=holdout_range[1].date().isoformat() if holdout_range else None,
-                brier_score=holdout_scores["brier_score"],
-                expected_value=holdout_scores["expected_value"],
-                win_rate=holdout_scores["win_rate"],
-                profit_factor=holdout_scores["profit_factor"],
-                trades=holdout_scores["trades"],
-                angel_proposed_trades=holdout_scores["angel_proposed_trades"],
-            )
-            report.holdout = holdout_metrics
-
-            logger.info(
-                "HOLDOUT METRICS: Brier=%.4f | EV=%.6f | WR=%.1f%% | "
-                "PF=%.4f | Trades=%d (floor=%.0f)",
-                holdout_scores["brier_score"],
-                holdout_scores["expected_value"],
-                100.0 * holdout_scores["win_rate"],
-                holdout_scores["profit_factor"],
-                holdout_scores["trades"],
-                holdout_trade_floor,
-            )
-
-            if not holdout_passed:
-                report.gate_passed = False
-                report.rejection_reasons.append(
-                    f"Holdout gate failed: Brier={holdout_scores['brier_score']:.4f} "
-                    f"EV={holdout_scores['expected_value']:.6f} "
-                    f"PF={holdout_scores['profit_factor']:.4f} "
-                    f"Trades={holdout_scores['trades']} (floor={holdout_trade_floor:.0f})"
-                )
+            if angel_model is None or devil_model is None:
+                # Fold 3 never produced models (degenerate empty split) — there
+                # is nothing to score on either side of the fold verdict.
+                holdout_metrics.bypass_reason = "fold models unavailable"
+                report.holdout = holdout_metrics
                 logger.warning(
-                    "🚫 HOLDOUT GATE FAILED — artifact rejected by data it never saw"
+                    "⚠️  HOLDOUT NOT SCORED: no fold models exist to score."
                 )
             else:
-                logger.info("✅ HOLDOUT GATE PASSED")
-        elif HOLDOUT_FRAC > 0.0 and not holdout_raw.is_empty() and not report.gate_passed:
-            holdout_metrics.bypass_reason = "fold gate failed — no artifact to score"
-            report.holdout = holdout_metrics
-            logger.warning(
-                "⚠️  HOLDOUT NOT SCORED: fold gate failed, so no served artifact exists."
-            )
+                holdout_scores, holdout_purged = _score_artifact_holdout(
+                    holdout_raw,
+                    angel_model,
+                    devil_model,
+                    angel_feats,
+                    devil_feats,
+                    optimal_threshold,
+                    asset_config,
+                    alpha_table=spread_alphas,
+                    final_hmm_models=final_hmm_models,
+                )
+                holdout_passed, holdout_reasons = _holdout_verdict(
+                    holdout_scores,
+                    sl_mult=asset_config["sl_mult"],
+                    tp_mult=asset_config["tp_mult"],
+                )
+                pf_lb = _holdout_pf_lower_bound(
+                    holdout_scores["wins"],
+                    holdout_scores["trades"],
+                    asset_config["sl_mult"],
+                    asset_config["tp_mult"],
+                )
+
+                holdout_metrics = HoldoutMetrics(
+                    used=True,
+                    fraction=HOLDOUT_FRAC,
+                    start_date=holdout_range[0].date().isoformat() if holdout_range else None,
+                    end_date=holdout_range[1].date().isoformat() if holdout_range else None,
+                    brier_score=holdout_scores["brier_score"],
+                    expected_value=holdout_scores["expected_value"],
+                    win_rate=holdout_scores["win_rate"],
+                    profit_factor=holdout_scores["profit_factor"],
+                    trades=holdout_scores["trades"],
+                    angel_proposed_trades=holdout_scores["angel_proposed_trades"],
+                    wins=holdout_scores["wins"],
+                    pf_lower_bound=pf_lb,
+                    pf_confidence=HOLDOUT_PF_CONFIDENCE,
+                    purged_tail_rows=holdout_purged,
+                    diagnostic_only=not report.gate_passed,
+                )
+                report.holdout = holdout_metrics
+
+                logger.info(
+                    "HOLDOUT METRICS: Brier=%.4f | EV=%.6f | WR=%.1f%% | "
+                    "PF=%.4f [%.0f%% lower bound %.4f] | Trades=%d "
+                    "(wins=%d, tail purged=%d)",
+                    holdout_scores["brier_score"],
+                    holdout_scores["expected_value"],
+                    100.0 * holdout_scores["win_rate"],
+                    holdout_scores["profit_factor"],
+                    100.0 * HOLDOUT_PF_CONFIDENCE,
+                    pf_lb,
+                    holdout_scores["trades"],
+                    holdout_scores["wins"],
+                    holdout_purged,
+                )
+
+                if not report.gate_passed:
+                    # The models scored are the Fold 3 placeholders, and the
+                    # comparison is diagnostic only: is the fold gate too
+                    # strict, or the model genuinely bad? The fold verdict
+                    # stands and the holdout cannot rescue it.
+                    logger.warning(
+                        "⚠️  FOLD GATE FAILED — holdout scored for diagnostics "
+                        "only (Fold 3 models); the fold verdict stands."
+                    )
+                elif not holdout_passed:
+                    report.gate_passed = False
+                    report.rejection_reasons.append(
+                        "Holdout gate failed: " + "; ".join(holdout_reasons)
+                    )
+                    logger.warning(
+                        "🚫 HOLDOUT GATE FAILED — artifact rejected by data it never saw"
+                    )
+                else:
+                    logger.info("✅ HOLDOUT GATE PASSED")
         elif HOLDOUT_FRAC > 0.0 and holdout_raw.is_empty():
             holdout_metrics.bypass_reason = "empty holdout"
             report.holdout = holdout_metrics

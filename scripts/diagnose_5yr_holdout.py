@@ -6,7 +6,7 @@ report can quantify the overfitting gap for a config the fold gate rejected
 
 Replicates main()'s pipeline exactly, minus the fold gate:
   fetch (pinned window) -> _split_holdout -> engineer remainder ->
-  refit_models (final artifact) -> engineer holdout -> _evaluate_holdout
+  refit_models (final artifact) -> _score_artifact_holdout (tail purge + score)
 with the Fold-3 swept threshold from logs/holdout_5yr.log (0.10).
 
 Env (set by the wrapper): DATA_SOURCE=oanda, RETRAIN_TIMEFRAME_MINUTES=15,
@@ -52,7 +52,7 @@ def main() -> int:
         holdout_raw.height, holdout_range[0], holdout_range[1],
     )
 
-    features_df, feature_cols, chop_veto_rate = R.engineer_features_and_labels(
+    features_df, feature_cols, _ = R.engineer_features_and_labels(
         remainder_raw,
         sl_mult=asset_config["sl_mult"],
         angel_mult=asset_config["angel_mult"],
@@ -63,44 +63,52 @@ def main() -> int:
         risk_profile=R.RiskProfile.for_asset_class(asset_config["asset_class"]),
     )
 
+    # Mirror main()'s Phase 3a: the last max_hold bars per symbol carry
+    # labels the walk could not resolve, and the real pipeline drops them
+    # before training. A diagnostic that keeps them trains on rows the
+    # artifact never saw.
+    tail_cutoffs = R._tail_cutoff_by_symbol(remainder_raw, asset_config["max_hold"])
+    features_df, n_purged = R._purge_boundary_tail(features_df, tail_cutoffs)
+    logger.info("BOUNDARY PURGE: dropped %d training rows (unresolvable tail)", n_purged)
+
     angel, devil, angel_feats, devil_feats = R.refit_models(
         features_df, feature_cols,
         angel_params=angel_params, devil_params=devil_params,
     )
 
-    holdout_features, _, _ = R.engineer_features_and_labels(
+    scores, n_purged = R._score_artifact_holdout(
         holdout_raw,
-        sl_mult=asset_config["sl_mult"],
-        angel_mult=asset_config["angel_mult"],
-        tp_mult=asset_config["tp_mult"],
-        max_hold=asset_config["max_hold"],
-        survival_bars=asset_config["survival_bars"],
-        htf_timeframe=asset_config["htf_timeframe"],
-        risk_profile=R.RiskProfile.for_asset_class(asset_config["asset_class"]),
-    )
-
-    scores = R._evaluate_holdout(
-        holdout_features,
         angel,
         devil,
         angel_feats,
         devil_feats,
         FOLD3_THRESHOLD,
-        sl_mult=asset_config["sl_mult"],
-        tp_mult=asset_config["tp_mult"],
+        asset_config,
+    )
+    pf_lb = R._holdout_pf_lower_bound(
+        scores["wins"], scores["trades"],
+        asset_config["sl_mult"], asset_config["tp_mult"],
+    )
+    passed, reasons = R._holdout_verdict(
+        scores, sl_mult=asset_config["sl_mult"], tp_mult=asset_config["tp_mult"]
     )
 
-    floor = R.BASELINE_POOLED_OOS_TRADES * R.HOLDOUT_FRAC * (1.0 - chop_veto_rate)
     logger.info("=" * 70)
     logger.info("DIAGNOSTIC 5YR ARTIFACT ON HOLDOUT (would-be artifact; gate rejected it)")
     logger.info(
-        "Brier=%.4f | EV=%.6f | WR=%.4f | PF=%.4f | Trades=%d (floor=%.0f) | "
-        "Angel proposed=%d",
+        "Brier=%.4f | EV=%.6f | WR=%.4f | PF=%.4f [%.0f%% lower bound %.4f] | "
+        "Trades=%d (wins=%d, tail purged=%d) | Angel proposed=%d",
         scores["brier_score"], scores["expected_value"], scores["win_rate"],
-        scores["profit_factor"], scores["trades"], floor,
+        scores["profit_factor"], 100.0 * R.HOLDOUT_PF_CONFIDENCE, pf_lb,
+        scores["trades"], scores["wins"], n_purged,
         scores["angel_proposed_trades"],
     )
-    logger.info("Bars: Brier<=%.2f EV>=%.4f PF>=%.2f",
+    logger.info(
+        "Stable-gate verdict: %s%s",
+        "PASS" if passed else "FAIL",
+        "" if passed else " — " + "; ".join(reasons),
+    )
+    logger.info("Bars: Brier<=%.2f EV>=%.4f PF lower bound>=%.2f",
                 R.BRIER_THRESHOLD, R.EV_THRESHOLD, R.PROFIT_FACTOR_THRESHOLD)
     return 0
 

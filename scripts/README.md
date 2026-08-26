@@ -201,9 +201,28 @@ assertions now live in `tests/test_risk_manager.py`.
 Diagnostic, not a gate: trains the would-be 5-year artifact on the
 post-holdout remainder and scores it on the untouched holdout so a rejected
 config's overfitting gap can be quantified. Saves nothing, promotes nothing.
+Scores through `_score_artifact_holdout` (tail purge included) and prints the
+stable-gate verdict (confidence-bound PF) alongside the point estimates.
 Written for the 2026-08-24 artifact-holdout report
 (`llm_reports/refactors/2026-08-24_artifact-holdout-gate.md`).
 
 - **Imports from repo:** `core.retrainer`, `data.factory`.
 - **Reads:** bars via OANDA REST (pinned window env vars). **Writes:** stdout
   only.
+
+### `run_stability_batch.sh`
+The holdout-stability demonstration batch: six full retrainer runs — the
+2-year and 5-year configs, each pinned to `RETRAIN_END_DATE` 2026-08-09,
+2026-08-16, and 2026-08-23 — sequentially, one run at a time, each solo on
+the machine at LightGBM default threads. Sequential is deliberate: this box
+has 6 physical cores, and any two-way overlap collapses fit speed ~100× once
+both jobs are mid-refit (measured 2026-08-24), so one-at-a-time is both
+faster end to end and keeps every pin measured under identical conditions.
+Verdicts land in `logs/stability_<cfg>_<pin>.log`; nothing touches
+`models/forex_m15_wide`. The script exists so the m2m brief's "demonstrate
+across three or more pinned endpoints" requirement is reproducible, not a
+one-off.
+
+- **Imports from repo:** none (shell).
+- **Reads:** `.env`, OANDA REST. **Writes:** `logs/stability_*.log`, side
+  model dirs `models/forex_m15_stability_*` (only on promotion).

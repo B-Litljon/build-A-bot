@@ -24,12 +24,18 @@ drift).
 ### `retrainer.py` (the big one)
 The training pipeline and the promotion gate. Fetches history, carves a
 chronologically last holdout slice **before** any feature engineering, engineers
-features on the remainder, runs a 3-fold expanding walk-forward validation on
-that remainder, trains the final model on the remainder too, and only then
-scores the served artifact on the untouched holdout. The live model files are
-overwritten **only** if the candidate clears both the fold gate and the
-artifact holdout gate. Exit code 2 means "trained but rejected", which is a
-healthy outcome, not a crash.
+features on the remainder, purges the remainder's unresolvable tail (the last
+`max_hold` bars per symbol, whose bracket walk runs off the frame), runs a
+3-fold expanding walk-forward validation on that remainder, trains the final
+model on the remainder too, and only then scores the served artifact on the
+untouched holdout. The live model files are overwritten **only** if the
+candidate clears both the fold gate and the artifact holdout gate. The holdout
+profit-factor bar gates on the exact Clopper-Pearson lower bound of the macro
+win rate (confidence 0.95), not the point estimate — a PF on 55-82 trades flips
+with the clock, and the bound is the fix. When the fold gate fails, the holdout
+is still scored (Fold 3 models, diagnostic only, recorded in the logs and on
+`ValidationReport.holdout.diagnostic_only`); the fold verdict stands. Exit
+code 2 means "trained but rejected", which is a healthy outcome, not a crash.
 
 - **Imports from repo:** `src.data.factory` (`get_market_provider`),
   `src.data.market_provider`, `src.execution.risk_manager` (`RiskProfile`,

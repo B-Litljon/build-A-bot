@@ -1,0 +1,44 @@
+window 2024-08-23 00:00:00+00:00 -> 2026-08-21 20:45:00+00:00
+holdout from 2026-04-12 16:03:18+00:00  (72,115 raw rows)
+
+purged 233 unresolvable tail rows from the remainder
+remainder 247,045 rows | holdout 54,660 rows | 22 features
+
+===============================================================================================
+EXPERIMENTS  (AUC 0.5 = coin flip; gap = how much is memorised)
+variant                          AUC in  AUC oos     gap  trades    win%      PF   PF lb
+-----------------------------------------------------------------------------------------------
+BASELINE (200x63 leaves)          0.725    0.617   0.108     108    53.7   2.320   1.659
+capacity 150x31 minleaf40         0.669    0.623   0.046      46    76.1   6.364   3.485
+capacity 100x15 minleaf80         0.638    0.624   0.014      21    95.2  40.000   7.675
+capacity 100x7 minleaf150         0.627    0.622   0.005       1   100.0     inf   0.105
+BASELINE minus 5 time feats       0.714    0.593   0.120      98    43.9   1.564   1.094
+small + no time feats             0.620    0.599   0.021      25    64.0   3.556   1.677
+
+===============================================================================================
+WHICH FEATURES SURVIVE OUT-OF-SAMPLE
+(in-sample % = what the model splits on; oos drop = AUC lost when shuffled on unseen data)
+feature                   in-sample %  oos AUC drop   verdict
+----------------------------------------------------------------------
+htf_vol_rel                       8.6        0.0008   MEMORISED — used a lot, useless on new data
+htf_bb_pct_b                      8.1        0.0033   carries real signal
+htf_rsi_14                        7.8        0.0008   MEMORISED — used a lot, useless on new data
+natr_14                           7.6        0.0038   carries real signal
+bb_pct_b                          6.3        0.0042   carries real signal
+hour_of_day                       6.2        0.0474   carries real signal
+ppo                               6.0        0.0043   carries real signal
+bb_width_pct                      6.0        0.0051   carries real signal
+vol_rel                           6.0        0.0104   carries real signal
+range_coil_10                     5.7        0.0069   carries real signal
+rsi_14                            5.2        0.0085   carries real signal
+log_return                        4.9        0.0021   minor
+bar_upper_wick_pct                4.6        0.0005   MEMORISED — used a lot, useless on new data
+bar_body_pct                      4.6       -0.0008   MEMORISED — used a lot, useless on new data
+bar_lower_wick_pct                4.3       -0.0003   MEMORISED — used a lot, useless on new data
+price_sma50_ratio                 3.8        0.0013   minor
+dist_sma50                        2.6        0.0010   minor
+session_london                    0.5        0.0005   minor
+session_overlap                   0.4        0.0012   minor
+htf_trend_agreement               0.3       -0.0002   minor
+session_ny                        0.3        0.0010   minor
+session_asia                      0.2       -0.0001   minor
