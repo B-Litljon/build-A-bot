@@ -54,6 +54,33 @@ the rest. `validate_candidate` now warns when the frame's span exceeds it.
 - **Imported by:** `tests/test_behavior_matrix.py`. Driven by hand.
 - **Reads/writes:** nothing directly; the caller supplies the captured ledger.
 
+### `decision_grader.py` — how the SERVED model actually decides
+Grades the live bot's recorded decisions against what price did next. The bot
+writes an `ev="bar"` record to `logs/events-*.jsonl` for **every** bar it scores
+(~500/day); only ~1 a week becomes a fill, so judging the model on fills throws
+away 99.9% of its own evidence. This refetches the following bars, walks the
+same ATR bracket the model was trained against, and joins the outcome back on.
+
+Reports: **calibration** (when it says 0.30, does it win 30%?), a **threshold
+sweep** on live probabilities, and a **per-behavior breakdown**.
+
+First run, 2026-08-24 on 9,183 graded decisions, found the headline: the model's
+confidence is *inverted at the top*. It wins 28-32% in its low bands (random
+entry = 29.3%) but only **6.7% at the 0.40 bar it actually trades on**. The
+Angel's own direction target is hit 33.3% on those bars vs 15.8% baseline — so
+the model is RIGHT about direction and the bracket loses anyway, stopping out
+73.3% of the time versus 56.0% elsewhere.
+
+Two rules it keeps: decisions too recent for the 45-bar walk are **dropped, not
+guessed**, and simulated fills flatter reality by roughly the spread toll, so
+read it as a relative measure.
+
+- **Imports from repo:** none at module level (the caller supplies graded bars).
+- **Imported by:** `tests/test_decision_grader.py`, `run_decision_grader.sh`.
+- **Reads:** `logs/events-*.jsonl`. **Writes:** nothing (the runner writes the
+  report and `logs/graded_decisions.parquet`).
+- **Scheduled:** weekly via cron, Sundays 12:00 PT. Read-only toward the soak.
+
 ### `failure_modes.py`
 Answers **"*how* are the losers losing?"** — stopped out instantly, bled out
 slowly, or timed out flat. The distinction matters because each points at a

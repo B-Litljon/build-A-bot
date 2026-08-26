@@ -1,6 +1,6 @@
 # `tests/`
 
-**200 tests, all passing.** Run with:
+**310 tests, all passing.** Run with:
 
 ```bash
 PYTHONPATH=src:. python -m pytest -q
@@ -49,6 +49,7 @@ See the root [GLOSSARY.md](../GLOSSARY.md) for domain terms.
 | `test_oanda_tick_hook.py` | 5 | The raw tick callback contract |
 | `test_execution_safety.py` | 3 | Rebalance deadband, fill parsing, partial fills |
 | `test_retrainer_output_dir.py` | 3 | `RETRAIN_MODEL_DIR` isolation |
+| `test_holdout_gate.py` | 26 | Holdout split, artifact scoring, metadata recording, the confidence-bound verdict, the boundary-tail purge, and the permanent leak guards |
 | `test_retraining_notification.py` | 9 | The retrain Discord embed: a gate pass is not a deployment |
 | `test_ml_strategy_guards.py` | 5 | The stale-bar guard + threshold.json pinning |
 | `verify_warmup.py` | (1, **not collected**) | Warm-up injection |
@@ -98,6 +99,22 @@ failing isn't evidence.
 is the isolation mechanism for experiments; if it leaked, a side experiment
 would overwrite the promoted model a live bot hot-reloads, silently swapping the
 running strategy's brain for an unvalidated candidate.
+
+**`test_holdout_gate.py`** — the central invariant of the artifact holdout:
+holdout rows are carved first and never enter training, the split is
+chronological and disjoint, and `metadata.json` records either the holdout
+metrics or an explicit bypass reason. Since the 2026-08-24 stability brief it
+also pins the verdict itself: the PF bar gates on the Clopper-Pearson
+lower bound (`TestHoldoutPfConfidenceBound`, `TestHoldoutVerdict` — the
+audit's PASS/FAIL/PASS windows are FAIL/FAIL/FAIL under the bound), the
+boundary tail purge drops exactly the last `max_hold` bars per symbol
+(`TestBoundaryTailPurge`), `TestPermanentLeakGuard` is the audit's
+instrumented leak check made permanent (a recording `refit_models` stand-in
+asserts no validate_candidate training frame contains a holdout timestamp),
+and `TestMainWiringLeakGuard` runs `main()` end to end so a regression in
+Phase 3a/4.5 wiring fails here. The tests use small mocks so they never
+train real models, but they exercise the same indexing paths the production
+gate uses.
 
 **`test_retraining_notification.py`** — the other half of that isolation. The
 files stayed isolated on 2026-08-17, but the *alert* did not: a side experiment

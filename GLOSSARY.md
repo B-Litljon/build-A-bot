@@ -338,6 +338,38 @@ model leans toward current market behaviour.
 live ones. Failing is a *healthy* outcome, not a crash: the retrainer exits 2 and
 the previous weights stay in place.
 
+**holdout** — a chronologically last slice of data carved off before any feature
+engineering, used to score the actual artifact that gets served. Passing the
+fold gate is necessary but not sufficient; the served model must also earn its
+bars on the holdout. Recorded in `metadata.json` so a deployed model can be
+checked against what it actually earned. *(`src/core/retrainer.py`)*
+
+**artifact holdout gate** — the additional pass/fail applied to the final model
+on the holdout, using the same Brier/EV bars as the fold gate, the frozen
+production threshold, and — for profit factor — the Clopper-Pearson **lower
+confidence bound** on the macro win rate rather than the point estimate
+(a PF on 55-82 trades flips with the clock; the bound is the fix). When the
+fold gate fails, the holdout is still scored for diagnostics (Fold 3 models,
+`ValidationReport.holdout.diagnostic_only`); the fold verdict stands either
+way. Disabled by `RETRAIN_HOLDOUT_FRAC=0`; when disabled or empty the metadata
+records the bypass explicitly. *(`src/core/retrainer.py`)*
+
+**Clopper-Pearson bound** — the one-sided lower confidence bound on a binary
+win rate (`Beta(1-confidence; wins, losses+1)` quantile), mapped through
+the profit-factor formula for the holdout gate. Chosen over the Wilson
+approximation because Wilson under-covers below ~40 trades — precisely the
+sample sizes that used to flip the verdict. Exact for independent trades;
+the 45-bar macro walks overlap in price, so in practice the bound is
+conservative rather than a literal coverage guarantee — the safe direction
+for a promotion gate. *(`src/core/retrainer.py`)*
+
+**unresolvable tail** — the last `max_hold` bars per symbol of a raw slice,
+whose bracket walk runs off the end of the frame and resolves "timeout →
+loss" no matter what the price actually did. Those labels are systematically
+wrong, so the engineered remainder and holdout each drop them after
+engineering (the **boundary purge**); the cutoffs are derived from the raw
+series because the walk needs the contiguous pre-veto path. *(`src/core/retrainer.py`)*
+
 **lift over random vs lift over benchmark** — two different questions, and for a
 long time the investor only asked the first. "Better than guessing" is measured
 against the base rate (a top-*quintile* target makes random guessing score 0.20).
@@ -500,7 +532,7 @@ travelling together so a model always matches its assumptions:
 |---|---|
 | `angel_latest.pkl` / `devil_latest.pkl` | The two trained models. |
 | `threshold.json` | The Devil threshold tuned for *this* model, plus (since 2026-07) the pinned Angel bar the pair was trained at. |
-| `metadata.json` | Asset class, timeframe, symbols, training date. Read at boot to confirm the bot trades what the model was trained on. |
+| `metadata.json` | Asset class, timeframe, symbols, training date, and holdout metrics (or bypass reason). Read at boot to confirm the bot trades what the model was trained on and to check what the artifact earned on untouched data. |
 | `feature_stats.json` | Training feature distributions + null calibration, for drift probing. |
 | `spread_alphas.json` | The cost table this model was trained against. |
 | `hmm_latest.pkl` | Per-symbol regime models, when that experiment is on. |

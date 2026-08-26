@@ -182,3 +182,54 @@ class TestBehaviorVetoIsOffByDefault(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHtfTimeframeSymmetry(unittest.TestCase):
+    """
+    The htf_* features are derived from a higher-timeframe resample. If
+    training pairs M15 with 5m while the live bot pairs it with 1h, every
+    htf_ column means something different at inference — silent skew, and the
+    exact failure that produced an unusable 5yr candidate on 2026-08-24.
+    """
+
+    def _cfg(self, tf):
+        with mock.patch.dict(
+            "os.environ",
+            {"DATA_SOURCE": "oanda", "RETRAIN_TIMEFRAME_MINUTES": str(tf)},
+        ):
+            return R.get_asset_config("oanda")
+
+    def test_m15_pairs_with_one_hour(self):
+        self.assertEqual(self._cfg(15)["htf_timeframe"], "1h")
+
+    def test_m1_still_pairs_with_five_minutes(self):
+        self.assertEqual(self._cfg(1)["htf_timeframe"], "5m")
+
+    def test_mapping_matches_the_live_bot_exactly(self):
+        """run_oanda._GRANULARITY_PROFILES is the authority; mirror or fail."""
+        import ast
+
+        src = (Path(__file__).resolve().parents[1] / "run_oanda.py").read_text()
+        tree = ast.parse(src)
+        live = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.AnnAssign) and getattr(node.target, "id", "") == "_GRANULARITY_PROFILES":
+                live = ast.literal_eval(node.value)
+        self.assertIsNotNone(live, "could not read _GRANULARITY_PROFILES")
+        for bars, (htf, _warmup) in live.items():
+            self.assertEqual(
+                R._HTF_FOR_TIMEFRAME.get(bars),
+                htf,
+                f"retrainer disagrees with the live bot for {bars}m bars",
+            )
+
+    def test_env_override_still_wins(self):
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "DATA_SOURCE": "oanda",
+                "RETRAIN_TIMEFRAME_MINUTES": "15",
+                "RETRAIN_HTF_TIMEFRAME": "4h",
+            },
+        ):
+            self.assertEqual(R.get_asset_config("oanda")["htf_timeframe"], "4h")
