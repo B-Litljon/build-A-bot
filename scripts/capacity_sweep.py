@@ -35,6 +35,7 @@ import sys
 import warnings
 from pathlib import Path
 
+sys.path.insert(0, ".")
 sys.path.insert(0, "src")
 logging.basicConfig(level=logging.ERROR, format="%(message)s")
 warnings.filterwarnings("ignore")
