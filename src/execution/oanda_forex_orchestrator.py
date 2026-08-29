@@ -107,6 +107,27 @@ Glossary:
         _close_max_attempts (5, OANDA_CLOSE_MAX_ATTEMPTS) because a failed
         close leaves a live position with no protection.
 
+    ── unknown entry outcomes (added 2026-08-29) ──
+    ENTRY_UNRECONCILED -- position state meaning "an order went out, failed
+        ambiguously, and the broker could not be re-read, so we do not know
+        whether this position exists". Counted by the exposure caps (so the
+        bot stays conservative) but IGNORED by _on_tick, because running a
+        software stop against a position that may not exist could close
+        something the account does not hold.
+    _park_unverified_entry -- records that state instead of discarding the
+        submit as a zero fill. Dropping it is how a live position ends up
+        with nothing enforcing its stop.
+    _reconcile_unverified_entries -- settles every parked record against the
+        broker, on the liveness loop (not a fire-and-forget task, which could
+        be GC'd or swallow an exception). Flat -> drop the record; open ->
+        promote to OPEN with the bracket rebuilt from the stored sl_dist /
+        tp_dist around the price actually filled. A failed sync leaves the
+        record parked for the next pass, never resolved by assumption.
+    sl_dist / tp_dist (position keys) -- the approved bracket DISTANCES, kept
+        on a parked record so the bracket can be rebuilt later. The distances
+        are what the cost gate approved, so re-anchoring them on the real
+        fill price does not reopen that gate.
+
     ── entry guards (added 2026-07-30 after the first multi-fill day) ──
     _reentry_cooldown -- OANDA_REENTRY_COOLDOWN_SECONDS: how long after an
         exit a symbol may not be re-entered. -1 (default) = one bar period,
@@ -882,6 +903,189 @@ class OandaForexOrchestrator:
             ),
         )
 
+    def _park_unverified_entry(
+        self,
+        symbol: str,
+        signal,
+        target_units: int,
+        sl_dist: float,
+        tp_dist: float,
+    ) -> None:
+        """
+        Record an entry whose outcome is UNKNOWN, so it cannot be forgotten.
+
+        The record is parked in ``ENTRY_UNRECONCILED``, which ``_on_tick``
+        deliberately ignores — we must not run a software stop against a
+        position that may not exist. It still carries ``units``, so the
+        exposure caps stay conservative while the outcome is unknown, and it
+        replaces the in-flight reservation in one lock acquisition so the
+        symbol is never briefly invisible to a concurrent cap check.
+
+        ``_reconcile_unverified_entries`` resolves it on the liveness loop.
+        """
+        with self._positions_lock:
+            self._positions[symbol] = {
+                "entry": signal.entry_price,
+                "sl": None,
+                "tp": None,
+                "units": target_units,
+                "state": "ENTRY_UNRECONCILED",
+                "sl_dist": sl_dist,
+                "tp_dist": tp_dist,
+                "dir": signal.direction,
+            }
+            self._pending_entries.pop(symbol, None)
+
+        logger.critical(
+            "[%s] Entry outcome UNKNOWN (order sent, broker unreadable) — "
+            "parked as ENTRY_UNRECONCILED pending reconciliation. No stop is "
+            "being enforced until the broker confirms what is open.",
+            symbol,
+        )
+        events.emit(
+            "entry_unreconciled",
+            sym=symbol,
+            dir=signal.direction,
+            units=target_units,
+            entry=signal.entry_price,
+        )
+        self._emit_status()
+        self._notify(
+            self._notifier.send_system_message,
+            message=(
+                f"🚨 {symbol}: entry order sent but its outcome could not be "
+                f"verified with the broker. Parked as ENTRY_UNRECONCILED "
+                f"({target_units:+d} units). SL/TP are NOT being enforced "
+                f"until it reconciles — check the account if this persists."
+            ),
+        )
+
+    async def _reconcile_unverified_entries(self) -> None:
+        """
+        Settle every ``ENTRY_UNRECONCILED`` record against the broker.
+
+        Runs on the liveness loop rather than a fire-and-forget task, so it
+        cannot be garbage-collected mid-flight and cannot swallow an
+        exception unnoticed. A sync failure is left parked for the next pass —
+        never resolved by assumption.
+        """
+        with self._positions_lock:
+            parked = [
+                (sym, rec.copy())
+                for sym, rec in self._positions.items()
+                if rec.get("state") == "ENTRY_UNRECONCILED"
+            ]
+        if not parked:
+            return
+
+        loop = asyncio.get_running_loop()
+        for symbol, rec in parked:
+            try:
+                synced = await loop.run_in_executor(
+                    None, self._order_manager.sync_position, symbol
+                )
+            except Exception as e:
+                logger.error(
+                    "[%s] Reconcile of parked entry raised: %s",
+                    symbol, e, exc_info=True,
+                )
+                continue
+            if not synced:
+                logger.warning(
+                    "[%s] Parked entry still unreconciled — broker unreadable; "
+                    "retrying next pass",
+                    symbol,
+                )
+                continue
+
+            net = self._order_manager.get_net_position(symbol)
+
+            if net == 0:
+                with self._positions_lock:
+                    current = self._positions.get(symbol)
+                    if (
+                        current is not None
+                        and current.get("state") == "ENTRY_UNRECONCILED"
+                    ):
+                        self._positions.pop(symbol, None)
+                self._mark_exit(symbol)
+                logger.info(
+                    "[%s] Parked entry reconciled: broker is flat, nothing was "
+                    "taken — record dropped",
+                    symbol,
+                )
+                self._emit_status()
+                continue
+
+            # A position really is open. Anchor its bracket on the price we
+            # actually got: the signal price may be stale by however long the
+            # failure took, and a stop measured from it could sit on the
+            # wrong side of the market. The DISTANCES are what the cost gate
+            # approved, and they are preserved exactly.
+            avg = self._order_manager.get_average_entry_price(symbol)
+            sl_dist = rec.get("sl_dist")
+            tp_dist = rec.get("tp_dist")
+            if not avg or sl_dist is None or tp_dist is None:
+                logger.critical(
+                    "[%s] Parked entry is OPEN at the broker (%d units) but "
+                    "its bracket cannot be rebuilt (entry=%s sl_dist=%s "
+                    "tp_dist=%s) — MANUAL INTERVENTION REQUIRED",
+                    symbol, net, avg, sl_dist, tp_dist,
+                )
+                continue
+
+            if net > 0:
+                sl_price = avg - sl_dist
+                tp_price = avg + tp_dist
+            else:
+                sl_price = avg + sl_dist
+                tp_price = avg - tp_dist
+
+            with self._positions_lock:
+                current = self._positions.get(symbol)
+                if (
+                    current is None
+                    or current.get("state") != "ENTRY_UNRECONCILED"
+                ):
+                    continue
+                current.update(
+                    {
+                        "entry": avg,
+                        "sl": sl_price,
+                        "tp": tp_price,
+                        "units": net,
+                        "state": "OPEN",
+                    }
+                )
+
+            logger.critical(
+                "[%s] Parked entry reconciled: broker holds %d units — armed "
+                "at entry=%.5f sl=%.5f tp=%.5f; the stop monitor now owns it",
+                symbol, net, avg, sl_price, tp_price,
+            )
+            events.emit(
+                "entry",
+                sym=symbol,
+                dir=rec.get("dir"),
+                units=net,
+                entry=avg,
+                sl=sl_price,
+                tp=tp_price,
+                reason="reconciled",
+            )
+            self._emit_status()
+            self._notify(
+                self._notifier.send_oanda_trade_alert,
+                symbol=symbol,
+                direction=rec.get("dir"),
+                action="ENTRY",
+                price=avg,
+                units=net,
+                sl_price=sl_price,
+                tp_price=tp_price,
+                reason="reconciled after an unverified submit",
+            )
+
     # ── bar callback (runs on the asyncio loop) ───────────────────────
 
     async def _on_bar(self, bar: dict) -> None:
@@ -1267,6 +1471,15 @@ class OandaForexOrchestrator:
 
         filled = result.get("filled", 0)
         if filled == 0:
+            if result.get("unverified"):
+                # An order went out, failed ambiguously, and the broker could
+                # not be re-read. It may be live. Treating it as a clean miss
+                # would leave a position nothing watches, so park it and let
+                # the reconciler settle it against the broker.
+                self._park_unverified_entry(
+                    symbol, signal, target_units, sl_dist, tp_dist,
+                )
+                return
             logger.warning(
                 "[%s] Order rejected / zero fill — not recording position",
                 symbol,
@@ -1716,6 +1929,12 @@ class OandaForexOrchestrator:
                 await self._check_stream_liveness()
             except Exception as e:
                 logger.error("Liveness check failed: %s", e, exc_info=True)
+            try:
+                await self._reconcile_unverified_entries()
+            except Exception as e:
+                logger.error(
+                    "Unverified-entry reconcile failed: %s", e, exc_info=True
+                )
 
     async def run(self) -> None:
         """Start the orchestrator loop."""

@@ -1,0 +1,38 @@
+
+=== window ending 2026-08-09 ===
+  variant                   AUC in  AUC oos     gap  trades    win%    PF lb   gate
+  ----------------------------------------------------------------------------------
+  shipped (200x63)           0.726    0.615   0.111     110    54.5    1.722   PASS
+  150x31                     0.668    0.620   0.048      60    70.0    2.857   PASS
+  100x15                     0.638    0.623   0.015      25    76.0    2.767   PASS
+  100x15 - dead feats        0.637    0.623   0.014      29    75.9    2.926   PASS
+  shipped - dead feats       0.716    0.616   0.101     112    54.5    1.722   PASS
+
+=== window ending 2026-08-16 ===
+  variant                   AUC in  AUC oos     gap  trades    win%    PF lb   gate
+  ----------------------------------------------------------------------------------
+  shipped (200x63)           0.727    0.620   0.107     103    55.3    1.757   PASS
+  150x31                     0.668    0.622   0.046      61    67.2    2.548   PASS
+  100x15                     0.638    0.624   0.014      42    76.2    3.401   PASS
+  100x15 - dead feats        0.636    0.625   0.012      31    74.2    2.789   PASS
+  shipped - dead feats       0.715    0.619   0.096     123    60.2    2.199   PASS
+
+=== window ending 2026-08-23 ===
+  variant                   AUC in  AUC oos     gap  trades    win%    PF lb   gate
+  ----------------------------------------------------------------------------------
+  shipped (200x63)           0.725    0.617   0.108     108    53.7    1.659   PASS
+  150x31                     0.669    0.623   0.046      46    76.1    3.485   PASS
+  100x15                     0.638    0.624   0.014      21    95.2    7.675   PASS
+  100x15 - dead feats        0.637    0.625   0.012      28    92.9    7.606   PASS
+  shipped - dead feats       0.716    0.619   0.098     100    64.0    2.481   PASS
+
+wrote logs/capacity_sweep.json (15 rows)
+
+=== AVERAGED ACROSS WINDOWS (what actually matters) ===
+variant                   AUC oos     gap  trades    PF lb  passes
+------------------------------------------------------------------
+shipped (200x63)            0.617   0.109     107    1.713    3/3
+150x31                      0.622   0.047      56    2.963    3/3
+100x15                      0.624   0.015      29    4.614    3/3
+100x15 - dead feats         0.624   0.013      29    4.440    3/3
+shipped - dead feats        0.618   0.098     112    2.134    3/3

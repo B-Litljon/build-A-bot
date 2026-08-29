@@ -107,6 +107,16 @@ Things worth knowing:
   reserved in `_pending_entries` so two signals on the same bar cannot both
   pass the cap before either fills. The cooldown does not block *flipping* an
   already-open position; set either knob to 0 to disable it.
+- **Unknown entry outcomes** (added 2026-08-29) — an entry order can go out,
+  fail ambiguously, and leave the broker unreadable, so whether the position
+  exists is genuinely unknown. It is parked as `ENTRY_UNRECONCILED` rather
+  than discarded as a zero fill: counted by the exposure caps, but ignored by
+  `_on_tick`, since running a software stop against a position that may not
+  exist could close something the account doesn't hold.
+  `_reconcile_unverified_entries` settles it on the liveness loop — flat
+  drops the record, open promotes it to `OPEN` with the bracket rebuilt from
+  the stored distances around the price actually filled. A failed sync leaves
+  it parked for the next pass; it is never resolved by assumption.
 - **`_reconcile_on_boot`** — asks the broker what's actually open before
   trading. A restart must adopt reality, not assume it's flat, or a position
   left by a crashed process runs with nothing watching its stop.
@@ -145,8 +155,13 @@ number makes those rules impossible to violate by construction.
 One asymmetry is deliberate: **a failed close leaves local state untouched.**
 Believing you're flat while holding a position is far more dangerous than the
 reverse. `submit_target_position` expresses orders as "end at N units" rather
-than "buy N", which is what makes a retry after an ambiguous network failure
-safe.
+than "buy N", and retries an ambiguous failure (timeout, 5xx, reset) only after
+re-reading the broker position — the re-sync, not the phrasing, is what makes
+the retry safe. Failures split on two questions: any 4xx was rejected before
+execution (so the position cannot have moved), but only a body carrying a
+reject reason is *permanent*. A business reject returns immediately; a bare
+401/403/429 is a transient blip and is retried. The order client carries an
+HTTP timeout so a half-open socket cannot hang the entry path.
 
 - **Imports from repo:** none (oandapyV20 only).
 - **Imported by:** `oanda_forex_orchestrator.py`, `run_oanda.py`,

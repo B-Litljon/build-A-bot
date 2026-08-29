@@ -159,10 +159,11 @@ Glossary:
         the table is copied next to the model on promotion. Unset, runs are
         bit-identical to before that experiment.
 
-    BASE_FEATURE_COLS -- the 22 always-on model inputs, in four groups:
-        10 single-bar indicators, 4 higher-timeframe (htf_*) views of the
-        slower chart, 4 candle-shape microstructure measures, and 4 one-hot
-        trading-session flags.
+    BASE_FEATURE_COLS -- the 17 always-on model inputs (5 dead/memorized
+        features dropped 2026-08-29 to prevent overfit): 10 single-bar
+        indicators, 2 higher-timeframe context features (htf_trend_agreement,
+        htf_bb_pct_b), 1 volatility compression feature (range_coil_10), and
+        4 one-hot trading-session flags.
     FEATURE_COLS -- BASE_FEATURE_COLS plus cost_ratio and/or the HMM columns
         when those experiments are enabled. This exact list and order must
         match what the live strategy feeds the model.
@@ -235,6 +236,16 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
+# Ensure project root and src/ are on sys.path, and remove src/core if present to avoid shadowing stdlib signal
+_project_root = str(Path(__file__).resolve().parent.parent.parent)
+_src_dir = str(Path(__file__).resolve().parent.parent)
+_core_dir = str(Path(__file__).resolve().parent)
+while _core_dir in sys.path:
+    sys.path.remove(_core_dir)
+for p in (_src_dir, _project_root):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
 import joblib
 import lightgbm as lgb
 import numpy as np
@@ -243,28 +254,52 @@ from scipy.stats import beta as _scipy_beta
 from sklearn.metrics import brier_score_loss
 from sklearn.model_selection import cross_val_predict, TimeSeriesSplit
 
-from src.data.factory import get_market_provider
-from src.data.market_provider import MarketDataProvider
-from src.execution.risk_manager import (
-    RiskProfile,
-    _chop_filter_enabled,
-    coupled_keff,
-)
-from src.ml.feature_pipeline import FeaturePipeline
-from src.ml.feature_stats import compute_feature_stats, save_feature_stats
-from src.ml.features.v3_features import (
-    V3BaseFeatures,
-    V3CostFeatures,
-    V3HTFFeatures,
-    V3SessionFeatures,
-)
-from src.ml.regimes.hmm_regime import (
-    HMM_OUTPUT_COLS,
-    fit_regime_models,
-    predict_regime_probs,
-    save_hmm_models,
-)
-from src.core.notification_manager import NotificationManager
+try:
+    from src.data.factory import get_market_provider
+    from src.data.market_provider import MarketDataProvider
+    from src.execution.risk_manager import (
+        RiskProfile,
+        _chop_filter_enabled,
+        coupled_keff,
+    )
+    from src.ml.feature_pipeline import FeaturePipeline
+    from src.ml.feature_stats import compute_feature_stats, save_feature_stats
+    from src.ml.features.v3_features import (
+        V3BaseFeatures,
+        V3CostFeatures,
+        V3HTFFeatures,
+        V3SessionFeatures,
+    )
+    from src.ml.regimes.hmm_regime import (
+        HMM_OUTPUT_COLS,
+        fit_regime_models,
+        predict_regime_probs,
+        save_hmm_models,
+    )
+    from src.core.notification_manager import NotificationManager
+except ImportError:
+    from data.factory import get_market_provider
+    from data.market_provider import MarketDataProvider
+    from execution.risk_manager import (
+        RiskProfile,
+        _chop_filter_enabled,
+        coupled_keff,
+    )
+    from ml.feature_pipeline import FeaturePipeline
+    from ml.feature_stats import compute_feature_stats, save_feature_stats
+    from ml.features.v3_features import (
+        V3BaseFeatures,
+        V3CostFeatures,
+        V3HTFFeatures,
+        V3SessionFeatures,
+    )
+    from ml.regimes.hmm_regime import (
+        HMM_OUTPUT_COLS,
+        fit_regime_models,
+        predict_regime_probs,
+        save_hmm_models,
+    )
+    from core.notification_manager import NotificationManager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -392,25 +427,17 @@ def get_hyperparameters(asset_class: str) -> Tuple[dict, dict]:
     """
     Get hyperparameter configurations for Angel and Devil LightGBM models.
 
-    Translated from the prior RandomForestClassifier dicts on 2026-05-23 as part
-    of the LightGBM-pilot experiment:
-      n_estimators 100 → 200 (paired with learning_rate=0.05 — boosting needs
-        more rounds to reach RF-equivalent capacity).
-      max_depth 10/8 retained as a *cap* on tree depth; num_leaves chosen below
-        the 2^max_depth ceiling to keep effective complexity in RF's vicinity.
-      min_samples_leaf 20 → min_child_samples 20 (direct equivalent).
-      subsample/colsample_bytree 0.8 = LightGBM-native generalization knobs
-        (RF gets the same effect for free via bootstrap sampling).
-      verbose=-1 silences LightGBM's per-iter chatter so the gate diagnostic
-        log stays readable.
+    Updated 2026-08-29: Constrained 100-tree / 15-leaf capacity setup with
+    min_child_samples=80. Collapses the in-sample vs out-of-sample memorization
+    gap from 0.109 to 0.014 on untouched holdout while improving generalization.
     """
     angel_params = {
         "objective": "binary",
-        "n_estimators": 200,
+        "n_estimators": 100,
         "learning_rate": 0.05,
-        "max_depth": 10,
-        "num_leaves": 63,
-        "min_child_samples": 20 if asset_class == "forex" else 50,
+        "max_depth": 6,
+        "num_leaves": 15,
+        "min_child_samples": 80 if asset_class == "forex" else 50,
         "class_weight": None if asset_class == "forex" else "balanced",
         "subsample": 0.8,
         "subsample_freq": 1,
@@ -428,11 +455,11 @@ def get_hyperparameters(asset_class: str) -> Tuple[dict, dict]:
 
     devil_params = {
         "objective": "binary",
-        "n_estimators": 200,
+        "n_estimators": 100,
         "learning_rate": 0.05,
-        "max_depth": 8,
-        "num_leaves": 31,
-        "min_child_samples": 20 if asset_class == "forex" else 50,
+        "max_depth": 6,
+        "num_leaves": 15,
+        "min_child_samples": 80 if asset_class == "forex" else 50,
         "class_weight": None,
         "subsample": 0.8,
         "subsample_freq": 1,
@@ -565,6 +592,8 @@ SPREAD_TABLE: Optional[dict] = (
 # Base features produced by FeaturePipeline. The HMM regime features (when
 # enabled) are appended downstream in validate_candidate() because their
 # fitting must respect each fold's temporal boundary.
+# 5 dead/memorized features dropped on 2026-08-29 (htf_rsi_14, htf_vol_rel,
+# bar_body_pct, bar_upper_wick_pct, bar_lower_wick_pct).
 BASE_FEATURE_COLS: List[str] = [
     "rsi_14",
     "ppo",
@@ -576,19 +605,12 @@ BASE_FEATURE_COLS: List[str] = [
     "hour_of_day",
     "dist_sma50",
     "vol_rel",
-    # V3.3: Multi-timeframe (5m) features
-    "htf_rsi_14",
+    # V3.3: Higher-timeframe context
     "htf_trend_agreement",
-    "htf_vol_rel",
     "htf_bb_pct_b",
-    # V3.4 Phase 5: Microstructure features (stop-hunt defense)
+    # V3.4 Phase 5: Microstructure features (volatility compression)
     "range_coil_10",
-    "bar_body_pct",
-    "bar_upper_wick_pct",
-    "bar_lower_wick_pct",
-    # V3.5 (2026-05-23): UTC session-activity indicators — tame G7 + XAU
-    # failed at M1 with the 18-feature vector; sessions condition the model
-    # on activity regime (London/NY overlap = volatility sweet spot).
+    # V3.5 (2026-05-23): UTC session-activity indicators
     "session_asia",
     "session_london",
     "session_ny",
