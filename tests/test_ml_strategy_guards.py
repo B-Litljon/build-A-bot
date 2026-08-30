@@ -58,8 +58,15 @@ class TestStaleFeatureGuard(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        # Loads the real promoted forex models from models/forex/.
-        cls.strategy = MLStrategy(asset_class="forex", warmup_period=10)
+        # Loads the real served forex models via explicit paths — the
+        # asset_class default (models/forex/) is a transient side dir that
+        # retrains overwrite, so the guard tests must not depend on it.
+        cls.strategy = MLStrategy(
+            asset_class="forex",
+            angel_path="models/forex_m15_wide/angel_latest.pkl",
+            devil_path="models/forex_m15_wide/devil_latest.pkl",
+            warmup_period=10,
+        )
 
     def test_signal_skipped_when_latest_bar_dropped(self):
         """features_df tail older than raw df tail -> None, no prediction."""
