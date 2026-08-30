@@ -109,14 +109,16 @@ the `metadata` dict rather than as named fields.
   `src/core/notification_manager.py`. **Data artifacts:** none.
 
 ### `thresholds.py`
-`ANGEL_THRESHOLD` — the single source of truth for the Angel proposal bar
-(0.40 unless the `ANGEL_THRESHOLD` env var overrides at process start).
+`ANGEL_THRESHOLD` — the fallback and fixed-mode value for the Angel proposal
+bar (0.40 unless the `ANGEL_THRESHOLD` env var overrides at process start).
 Exists because the value was previously hardcoded independently in eight
 files, while the Devil's training population and the bracket fit are both
 conditioned on it — the stages must move together or they silently drift.
-The retrainer pins the value into `threshold.json` at save time, and
-`MLStrategy` prefers that pinned value over this constant, so the env
-override is a train/analysis-time knob, not a live-tuning knob.
+Since 2026-08-29 the retrainer calibrates the bar per model from
+out-of-fold scores (`_find_optimal_angel_threshold`) unless the env var is
+set (fixed mode); the chosen value is pinned into `threshold.json` at save
+time, and `MLStrategy` prefers that pinned value over this constant, so the
+env override is a train/analysis-time knob, not a live-tuning knob.
 
 - **Imports from repo:** none.
 - **Imported by:** `core/retrainer.py`, `execution/live_orchestrator.py`,

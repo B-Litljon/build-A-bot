@@ -98,8 +98,10 @@ tests) or dormant experiments kept for reference.
 ## The two-stage model
 
 **Angel** — stage one. Tuned for *recall*: catch as many real opportunities as
-possible, tolerating false alarms. It **proposes**. Fires above
-`ANGEL_THRESHOLD` (0.40). *(`src/core/retrainer.py`)*
+possible, tolerating false alarms. It **proposes**. Fires above the Angel
+threshold — calibrated per retrain from out-of-fold scores since 2026-08-29
+(`ANGEL_THRESHOLD` env var pins the old fixed bar, default 0.40).
+*(`src/core/retrainer.py`)*
 
 **Devil** — stage two. Tuned for *precision*, and trained only on the bars the
 Angel already liked: of these candidates, which are actually worth taking. It
@@ -114,11 +116,13 @@ the first model's signals rather than the market directly.
 
 **threshold** — the confidence level above which a stage acts. The Devil's is
 not fixed; the retrainer tunes it per model and saves it to `threshold.json`,
-which the live strategy loads at startup and on hot reload. The Angel's is a
-single repo-wide constant (`src/core/thresholds.py`; `ANGEL_THRESHOLD` env
-var overrides at train/analysis time) that the retrainer also pins into
-`threshold.json`, so a deployed pair always runs at the bar its Devil and
-brackets were fitted for.
+which the live strategy loads at startup and on hot reload. The Angel's is
+likewise tuned per model since 2026-08-29: calibrated from out-of-fold
+probabilities (`_find_optimal_angel_threshold`) so the proposal bar tracks
+the model's own score distribution, then pinned into `threshold.json` — a
+deployed pair always runs at the bar its Devil and brackets were fitted for.
+The `ANGEL_THRESHOLD` env var (default 0.40, `src/core/thresholds.py`) is the
+fallback and selects the old fixed-bar mode when explicitly set.
 
 **angel_prob / devil_prob** — each stage's output probability, carried in a
 signal's metadata and shown in Discord alerts.

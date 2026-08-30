@@ -510,13 +510,25 @@ class TestPermanentLeakGuard(unittest.TestCase):
             self.angel = _MockLGBM(class1_prob)
             self.devil = _MockLGBM(class1_prob)
 
-        def __call__(self, df, feature_cols, angel_params=None, devil_params=None):
+        def __call__(
+            self,
+            df,
+            feature_cols,
+            angel_params=None,
+            devil_params=None,
+            sl_mult=None,
+            tp_mult=None,
+        ):
             self.frames.append((df["timestamp"].min(), df["timestamp"].max()))
             return (
                 self.angel,
                 self.devil,
                 list(feature_cols),
                 list(feature_cols) + ["angel_prob"],
+                # refit_models now also returns the Angel proposal bar the
+                # Devil's population was filtered at; 0.4 mirrors the
+                # pre-calibration constant these tests were written against.
+                0.4,
             )
 
     def test_no_training_frame_touches_the_holdout(self):
@@ -583,7 +595,15 @@ class TestMainWiringLeakGuard(unittest.TestCase):
         recorder = TestPermanentLeakGuard._Recorder()
         captured = {}
 
-        def fake_promote(report, angel, devil, threshold, asset_config=None, hmm_models=None):
+        def fake_promote(
+            report,
+            angel,
+            devil,
+            threshold,
+            asset_config=None,
+            hmm_models=None,
+            angel_threshold=None,
+        ):
             captured["report"] = report
             return False
 

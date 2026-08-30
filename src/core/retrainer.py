@@ -89,7 +89,27 @@ Glossary:
     SURVIVAL_BARS -- 5. The horizon for the Devil's survival label, below.
     ANGEL_THRESHOLD -- imported from core.thresholds (0.40 unless the env var
         overrides at process start). Minimum Angel probability for a bar to count as a
-        proposed trade.
+        proposed trade. 2026-08-29: when the env var is NOT set this is now a
+        FALLBACK only — the live value is calibrated per refit from OOF
+        probabilities (_find_optimal_angel_threshold) and pinned into the
+        artifact's threshold.json, which MLStrategy prefers over the
+        constant. Setting the env var selects fixed mode (old behaviour).
+    _FIXED_ANGEL_THRESHOLD -- True when ANGEL_THRESHOLD is explicitly set in
+        the environment; selects the fixed-bar mode above.
+    MIN_ANGEL_PROPOSALS -- 300 (RETRAIN_MIN_ANGEL_PROPOSALS). Floor on
+        proposals the dynamic Angel threshold must yield, guaranteeing the
+        Devil a learnable training population.
+    DEVIL_MIN_CHILD_FIXED -- RETRAIN_DEVIL_MIN_CHILD, unset by default.
+        Pins the Devil's min_child_samples; unset, it auto-scales to a tenth
+        of the Angel-approved population (capped at the Angel-side value,
+        floored at 5) because a split needs >= 2x min_child rows and the
+        Angel-side 80 collapses a Devil trained on dozens of rows into a
+        constant (gate matrix, 2026-08-29).
+    _find_optimal_angel_threshold -- sweeps quantiles of the OOF Angel score
+        distribution for the EV-maximising proposal bar subject to
+        MIN_ANGEL_PROPOSALS. Expressing the bar in the model's own score
+        units fixes the proposal-starvation that a fixed 0.40 caused under
+        score compression.
     DEVIL_THRESHOLD -- 0.50, fallback only. The real threshold is chosen per
         run by _find_optimal_threshold() and saved to threshold.json.
 
@@ -101,13 +121,24 @@ Glossary:
     PROFIT_FACTOR_THRESHOLD -- 1.2, minimum gross-win / gross-loss ratio.
     MIN_OOS_TRADES_FOR_PF -- 100, the legacy single-fold sample-size floor,
         superseded by the pooled floor below but still referenced.
-    BASELINE_POOLED_OOS_TRADES -- 300. Trades are pooled across all folds and
-        the requirement is scaled down by the chop veto's drop rate
-        (effective_floor = 300 x (1 - chop_veto_rate)), so a filter that
-        correctly discards a third of the bars is not punished for the trades
-        it removed. This floor exists because a handful of lucky wins at 6:1
-        payoff can fake a passing profit factor. FOLD gate only -- the
-        artifact holdout no longer borrows it (see HOLDOUT_PF_CONFIDENCE).
+    BASELINE_POOLED_OOS_TRADES -- 30 (was 300 until 2026-08-29). Absolute
+        backstop on pooled fold OOS trades, scaled down by the chop veto's
+        drop rate (effective_floor = 30 x (1 - chop_veto_rate)). This is NOT
+        the evidence bar: that is the Clopper-Pearson PF lower bound computed
+        on the pooled (wins, trades) — the same instrument as the artifact
+        holdout gate — applied at two scales (Fold 3 alone = recency; all
+        folds pooled = evidence). The old flat 300 floor was a cliff the
+        shipped config itself cleared only once in three pins while
+        rejecting strong-evidence low-frequency configs. FOLD gate only --
+        the artifact holdout never borrows it (see HOLDOUT_PF_CONFIDENCE).
+    pooled_pf_lower_bound / fold3_pf_lower_bound -- ValidationReport fields
+        carrying the two CP bounds the fold gate judged; recomputed from the
+        raw (wins, trades) evidence via _holdout_pf_lower_bound.
+    FoldMetrics.macro_wins -- per-fold macro (45-bar bracket) wins among
+        scored approvals; pooled across folds for the CP instrument.
+    production_angel_threshold -- ValidationReport field: the Angel bar the
+        returned models were trained with (calibrated or env-fixed). main()
+        threads it to the holdout scoring, threshold.json, and metadata.json.
     HOLDOUT_FRAC -- fraction of the chronological window carved off before any
         feature engineering (default 0.18; set RETRAIN_HOLDOUT_FRAC=0 to
         disable). The served model trains on the remainder only and is then
@@ -521,17 +552,46 @@ PROFIT_FACTOR_THRESHOLD = 1.2  # Min acceptable Profit Factor
 # "NO SIGNAL." 100 is the minimum sample for any honest PF claim.
 MIN_OOS_TRADES_FOR_PF = 100  # legacy Fold-3-only floor (superseded below)
 
-# Pooled, drop-rate-scaled OOS-trade floor for the FOLD gate. Pool
-# Devil-approved OOS trades across ALL folds, then scale the requirement
-# down by the chop filter's row-drop rate so a high-precision filter that
-# correctly prunes ~30% of bars isn't penalized for the trades it removed:
+# Absolute sanity backstop on pooled fold OOS trades — NOT the evidence bar.
+# 2026-08-29: the old flat floor (300) was the fold gate's de-facto evidence
+# standard, and it was mis-calibrated for every architecture: the shipped
+# 200x63 config cleared it 1 time in 3 (238/230/227 vs ~232), while every
+# capacity-reduced config landed at 18-39% of it — a cliff that rejected
+# configs whose per-trade evidence was strong. The evidential judgement now
+# lives in the Clopper-Pearson PF lower bound applied to the pooled fold
+# trades (same instrument as the artifact holdout gate — see
+# _holdout_pf_lower_bound); this constant is only the backstop that keeps a
+# handful of lucky wins from ever reaching that instrument, scaled down by
+# the chop filter's row-drop rate as before:
 #     effective_floor = BASELINE_POOLED_OOS_TRADES * (1 - chop_veto_rate)
-# The ARTIFACT HOLDOUT no longer borrows this floor: 300 * 0.18 * 0.776 ~= 42
-# demanded less evidence of the decisive test than the fold gate demands of
-# the rehearsal, and a PF on 55-82 trades flipped with the clock (audit
-# 2026-08-24). The holdout's sample-size discipline now lives in the exact
-# confidence bound -- see HOLDOUT_PF_CONFIDENCE / _holdout_pf_lower_bound.
-BASELINE_POOLED_OOS_TRADES = int(os.getenv("RETRAIN_POOLED_TRADE_FLOOR", "300"))
+# The ARTIFACT HOLDOUT never borrows this floor: its sample-size discipline
+# is the confidence bound (HOLDOUT_PF_CONFIDENCE / _holdout_pf_lower_bound).
+BASELINE_POOLED_OOS_TRADES = int(os.getenv("RETRAIN_POOLED_TRADE_FLOOR", "30"))
+
+# Minimum Angel proposals the dynamic Angel threshold must yield on its
+# training frame. The Devil trains ONLY on the Angel-approved subpopulation
+# (Phase 5.5), so this floor is what guarantees the second stage a learnable
+# population: 300 approved rows lets the auto-scaled Devil min_child_samples
+# (n//10) still form real leaves. Only reachable when the ANGEL_THRESHOLD env
+# var is NOT pinning a fixed bar (see _find_optimal_angel_threshold).
+MIN_ANGEL_PROPOSALS = int(os.getenv("RETRAIN_MIN_ANGEL_PROPOSALS", "300"))
+
+# Devil min_child_samples override. LightGBM needs >= 2x min_child_samples
+# rows to split a node; the Angel-side value (80) applied to a Devil
+# population of dozens-to-hundreds collapses the Devil to a constant
+# (separation gap 0.0000, 100% approval — measured 2026-08-29). Unset, the
+# Devil's value auto-scales to its approved population inside refit_models
+# (capped at the configured value, floored at 5). Set to pin a fixed value.
+DEVIL_MIN_CHILD_FIXED = os.getenv("RETRAIN_DEVIL_MIN_CHILD", "").strip()
+
+# Fixed-vs-dynamic Angel threshold mode. core.thresholds reads the
+# ANGEL_THRESHOLD env var with a 0.40 default; when the var is explicitly
+# set we treat that as a deliberate FIXED bar and skip the OOF calibration
+# (old behaviour, bit-for-bit reproducible). Unset: the threshold is
+# calibrated per refit from out-of-fold probabilities and pinned into the
+# artifact's threshold.json, which MLStrategy already prefers over the
+# constant — train/serve symmetry holds by construction.
+_FIXED_ANGEL_THRESHOLD = os.getenv("ANGEL_THRESHOLD", "").strip() != ""
 
 # Toggle for the HMM regime-feature experiment. When enabled, a per-symbol
 # 3-state GaussianHMM is fit on each fold's training window (no leakage) and
@@ -641,6 +701,10 @@ class FoldMetrics:
     angel_proposed_trades: int
     devil_approved_trades: int
     win_rate: float
+    # Macro (45-bar bracket) wins among this fold's scored approvals — the
+    # raw (wins, trades) evidence the pooled Clopper-Pearson PF lower bound
+    # is computed from. 0 on the degenerate worst-case paths.
+    macro_wins: int = 0
 
 
 @dataclass
@@ -690,6 +754,19 @@ class ValidationReport:
     effective_trade_floor: float = 0.0
     rejection_reasons: List[str] = field(default_factory=list)
     holdout: Optional[HoldoutMetrics] = None
+    # Pooled macro wins across folds — with pooled_oos_trades, the evidence
+    # behind pooled_pf_lower_bound.
+    pooled_oos_wins: int = 0
+    # Clopper-Pearson PF lower bounds (see _holdout_pf_lower_bound) on the
+    # pooled fold trades and on Fold 3 alone — the fold gate's evidential
+    # bars, replacing the old flat 300-trade floor and Fold-3 point PF.
+    pooled_pf_lower_bound: float = 0.0
+    fold3_pf_lower_bound: float = 0.0
+    # The Angel proposal bar the returned models were trained with:
+    # calibrated from OOF probabilities unless ANGEL_THRESHOLD pinned a fixed
+    # value. Written into threshold.json on promotion; MLStrategy prefers the
+    # pinned value over the constant, keeping train/serve symmetry.
+    production_angel_threshold: float = 0.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1374,7 +1451,9 @@ def refit_models(
     feature_cols: List[str],
     angel_params: Optional[dict] = None,
     devil_params: Optional[dict] = None,
-) -> Tuple["lgb.LGBMClassifier", "lgb.LGBMClassifier", List[str], List[str]]:
+    sl_mult: float = SL_ATR_MULTIPLIER,
+    tp_mult: float = TP_ATR_MULTIPLIER,
+) -> Tuple["lgb.LGBMClassifier", "lgb.LGBMClassifier", List[str], List[str], float]:
     """
     Refit Angel and Devil models with time-decay weighting.
 
@@ -1388,9 +1467,17 @@ def refit_models(
         feature_cols: List of base feature column names
         angel_params: Hyperparameters for Angel classifier
         devil_params: Hyperparameters for Devil classifier
+        sl_mult: Stop-loss ATR multiplier (Angel threshold EV objective)
+        tp_mult: Take-profit ATR multiplier (Angel threshold EV objective)
 
     Returns:
-        Tuple of (Angel model, Devil model, angel_features, devil_features)
+        Tuple of (Angel model, Devil model, angel_features, devil_features,
+        angel_threshold) — the proposal bar the Devil's training population
+        was filtered at: calibrated from OOF probabilities unless the
+        ANGEL_THRESHOLD env var pinned a fixed value. Callers must use THIS
+        value (not the global constant) for validation masking and artifact
+        pinning, or the served model runs at a different bar than its Devil
+        and brackets were fitted for.
     """
     logger.info("=" * 70)
     logger.info("REFITTING MODELS (META-LABELING)")
@@ -1512,6 +1599,33 @@ def refit_models(
     )
 
     # ═══════════════════════════════════════════════════════════════════
+    # STEP 2.5: Calibrate the Angel proposal bar (unless env-pinned fixed)
+    # ═══════════════════════════════════════════════════════════════════
+    # The bar must be chosen HERE, on train-frame OOF probabilities, because
+    # the next step filters the Devil's training population with it — and the
+    # caller needs the same value for validation masking and artifact pinning.
+    # Chosen on OOF (not in-sample) scores so the bar reflects honest Angel
+    # confidence, the same reason the Devil trains on OOF meta-features.
+    if _FIXED_ANGEL_THRESHOLD:
+        angel_threshold = ANGEL_THRESHOLD
+        logger.info(
+            f"Angel threshold FIXED by ANGEL_THRESHOLD env var: {angel_threshold:.4f}"
+        )
+    else:
+        angel_threshold, angel_thr_ev, angel_thr_n = _find_optimal_angel_threshold(
+            angel_probs_oof,
+            df["devil_target_macro"].to_numpy(),
+            sl_mult=sl_mult,
+            tp_mult=tp_mult,
+        )
+        logger.info(
+            f"Dynamic Angel threshold: {angel_threshold:.4f} "
+            f"(OOF-calibrated: EV {angel_thr_ev:+.4f}, {angel_thr_n:,} proposals "
+            f"= {angel_thr_n / len(angel_probs_oof):.2%} of train rows; "
+            f"set ANGEL_THRESHOLD to pin a fixed bar)"
+        )
+
+    # ═══════════════════════════════════════════════════════════════════
     # STEP 3: Train the Devil (Meta Model - Conviction)
     # Phase 5.5: Train ONLY on Angel-approved subpopulation.
     # ═══════════════════════════════════════════════════════════════════
@@ -1521,13 +1635,14 @@ def refit_models(
     X_devil_full = df[devil_features].to_numpy()
 
     # Phase 5.5 — Population Fix:
-    # The Devil is deployed exclusively on rows where angel_prob >= ANGEL_THRESHOLD.
-    # Training on the full global population (all ~117k rows) violates meta-labeling
-    # semantics: the Devil learns to discriminate across all market conditions, not
-    # within the Angel-approved subset where it actually operates.
+    # The Devil is deployed exclusively on rows where angel_prob >= the
+    # proposal bar. Training on the full global population (all ~117k rows)
+    # violates meta-labeling semantics: the Devil learns to discriminate
+    # across all market conditions, not within the Angel-approved subset
+    # where it actually operates.
     # Solution: filter training data to only Angel-approved rows using the OOF
     # angel_probs (already computed in Step 2 — zero leakage).
-    angel_approved_mask = angel_probs_oof >= ANGEL_THRESHOLD
+    angel_approved_mask = angel_probs_oof >= angel_threshold
     n_approved = int(angel_approved_mask.sum())
     n_total = len(X_devil_full)
     logger.info(
@@ -1547,7 +1662,31 @@ def refit_models(
     )
     logger.info(f"Devil feature space: {devil_features}")
 
-    devil_model = lgb.LGBMClassifier(**d_params)
+    # Devil min_child_samples must scale to the APPROVED population, not the
+    # Angel's: min_child_samples is a per-leaf minimum, so a split needs
+    # >= 2x that many rows, and the 2026-08-29 gate matrix showed the
+    # Angel-side value (80) against approved populations of 69-158 rows
+    # collapses the Devil to a constant function (separation gap 0.0000,
+    # 100% approval — a two-stage architecture silently running on one
+    # stage). Auto scale: a tenth of the population, capped at the
+    # configured value (large populations reproduce the old behaviour
+    # exactly), floored at 5. RETRAIN_DEVIL_MIN_CHILD pins a fixed value.
+    if DEVIL_MIN_CHILD_FIXED:
+        devil_min_child = int(DEVIL_MIN_CHILD_FIXED)
+    else:
+        devil_min_child = max(
+            5, min(int(d_params["min_child_samples"]), n_approved // 10)
+        )
+    if devil_min_child != d_params["min_child_samples"]:
+        logger.info(
+            f"Devil min_child_samples auto-scaled: "
+            f"{d_params['min_child_samples']} -> {devil_min_child} "
+            f"(approved population n={n_approved:,}; a split needs "
+            f">= {2 * devil_min_child} rows)"
+        )
+    d_params_fit = {**d_params, "min_child_samples": devil_min_child}
+
+    devil_model = lgb.LGBMClassifier(**d_params_fit)
     df_devil = pl.DataFrame(X_devil, schema=devil_features).to_pandas()
     devil_model.fit(df_devil, y_devil_train, sample_weight=devil_weights)
     logger.info(
@@ -1574,7 +1713,7 @@ def refit_models(
     logger.info(f"Devil training accuracy: {devil_acc:.3f} (precision-focused)")
     logger.info(f"Devil can now veto Angel when angel_prob is misleading")
 
-    return angel_model, devil_model, feature_cols, devil_features
+    return angel_model, devil_model, feature_cols, devil_features, angel_threshold
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1647,6 +1786,97 @@ def _find_optimal_threshold(
             best_threshold = float(t)
 
     return best_threshold, float(best_ev)
+
+
+def _find_optimal_angel_threshold(
+    angel_probs: np.ndarray,
+    macro_targets: np.ndarray,
+    sl_mult: float = SL_ATR_MULTIPLIER,
+    tp_mult: float = TP_ATR_MULTIPLIER,
+    min_proposals: int = MIN_ANGEL_PROPOSALS,
+) -> Tuple[float, float, int]:
+    """
+    Calibrate the Angel's proposal bar from out-of-fold probabilities.
+
+    Why this exists: the Angel threshold was a global constant (0.40) while
+    model capacity changes the score distribution underneath it. The trim
+    100x15/min_child=80 architecture compresses predicted probabilities so
+    severely that a fixed 0.40 bar passed 11/3/11 proposals per ~103k-row
+    fold (2026-08-29 matrix) — starving both the Devil's training population
+    and the fold gate's trade count. Expressing the bar in the model's OWN
+    score units (quantiles of its OOF distribution) makes the proposal rate
+    a property of the evidence, not of an arbitrary constant.
+
+    Discipline mirrors _find_optimal_threshold (Devil), with one role
+    difference: the Angel is the RECALL stage, so the sweep maximizes EV
+    subject to a minimum proposal count that keeps the Devil's training
+    population learnable — precision is the Devil's job downstream.
+
+    Candidates are quantiles of the OOF scores (median through max), so the
+    grid adapts to any distribution shape, including compressed ones. The
+    sweep runs on TRAIN-frame OOF probabilities only; the chosen value is
+    then applied frozen to validation/holdout/live scoring, so no validation
+    information leaks into the parameter (same discipline as the Devil's
+    frozen calibration_threshold).
+
+    Args:
+        angel_probs:   OOF Angel probabilities on the training frame.
+        macro_targets: 45-bar bracket outcome ground truth (0/1), aligned
+                       with angel_probs. Used for the EV objective.
+        sl_mult:       Stop-loss ATR multiplier.
+        tp_mult:       Take-profit ATR multiplier.
+        min_proposals: Minimum proposal count for a candidate to be valid
+                       (guarantees the Devil a training population).
+
+    Returns:
+        Tuple of (threshold, ev_at_threshold, n_proposals). When no candidate
+        yields min_proposals (frame smaller than min_proposals), returns the
+        observed minimum score — propose everything and let the gate judge.
+    """
+    n = len(angel_probs)
+    if n == 0:
+        return 0.5, -float("inf"), 0
+
+    # Quantile grid from the median up to the observed max; dedupe guards a
+    # distribution compressed to (near-)constant scores.
+    grid_q = np.linspace(0.50, 1.0 - 1.0 / n, 400)
+    candidates = np.unique(np.quantile(angel_probs, grid_q))
+
+    rr_ratio = tp_mult / sl_mult
+    best_threshold = float(candidates[0])
+    best_ev = -float("inf")
+    best_n = 0
+
+    for t in candidates:
+        mask = angel_probs >= t
+        n_approved = int(mask.sum())
+        if n_approved < min_proposals:
+            continue
+        win_rate = float(macro_targets[mask].mean())
+        ev = win_rate * rr_ratio - (1.0 - win_rate)
+        if ev > best_ev:
+            best_ev = ev
+            best_threshold = float(t)
+            best_n = n_approved
+
+    if best_ev == -float("inf"):
+        # No candidate met the proposal floor (frame smaller than
+        # min_proposals): propose EVERYTHING — the frame is degenerate
+        # anyway, and starving the Devil of the little data that exists
+        # only makes it worse. The fold gate judges the result.
+        best_threshold = float(angel_probs.min())
+        mask = angel_probs >= best_threshold
+        best_n = int(mask.sum())
+        win_rate = float(macro_targets[mask].mean()) if best_n else 0.0
+        best_ev = win_rate * rr_ratio - (1.0 - win_rate)
+        logger.warning(
+            "Angel threshold sweep: no candidate reached min_proposals=%d "
+            "(frame n=%d) — falling back to propose-everything %.4f "
+            "(%d proposals)",
+            min_proposals, n, best_threshold, best_n,
+        )
+
+    return best_threshold, float(best_ev), best_n
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1739,14 +1969,19 @@ def _evaluate_holdout(
     threshold: float,
     sl_mult: float,
     tp_mult: float,
+    angel_threshold: Optional[float] = None,
 ) -> dict:
     """
     Score the final served artifact on the held-out chronologically last slice.
 
-    Uses the FROZEN production threshold returned by validate_candidate — no
-    parameter is chosen or tuned on the holdout. Scoring is restricted to
-    tradeable instruments for the same reason the fold gate does: the metric is
-    a prediction about live results.
+    Uses the FROZEN production thresholds returned by validate_candidate — no
+    parameter is chosen or tuned on the holdout. ``threshold`` is the Devil
+    bar; ``angel_threshold`` is the proposal bar the Angel/Devil pair was
+    trained with (OOF-calibrated unless env-pinned). When None it falls back
+    to the global ANGEL_THRESHOLD constant — the pre-2026-08-29 behaviour,
+    kept for older tooling that predates calibrated Angel bars. Scoring is
+    restricted to tradeable instruments for the same reason the fold gate
+    does: the metric is a prediction about live results.
 
     Returns a dict with the holdout metrics and an ``approved_mask`` aligned to
     the Angel-proposed subset, mirroring the fold computation.
@@ -1771,11 +2006,14 @@ def _evaluate_holdout(
     y_devil = holdout_df["devil_target"].to_numpy()
     y_devil_macro = holdout_df["devil_target_macro"].to_numpy()
 
+    if angel_threshold is None:
+        angel_threshold = ANGEL_THRESHOLD
+
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
         angel_probs = angel_model.predict_proba(X_base)[:, 1]
 
-    signal_mask = angel_probs >= ANGEL_THRESHOLD
+    signal_mask = angel_probs >= angel_threshold
     n_angel_proposed = int(signal_mask.sum())
 
     if n_angel_proposed == 0:
@@ -2016,6 +2254,7 @@ def _score_artifact_holdout(
     asset_config: dict,
     alpha_table: Optional[dict] = None,
     final_hmm_models: Optional[dict] = None,
+    angel_threshold: Optional[float] = None,
 ) -> Tuple[dict, int]:
     """
     Engineer the holdout slice and score the artifact on it with the frozen
@@ -2065,6 +2304,7 @@ def _score_artifact_holdout(
         threshold,
         sl_mult=sl_mult,
         tp_mult=tp_mult,
+        angel_threshold=angel_threshold,
     )
     return scores, n_purged
 
@@ -2121,13 +2361,25 @@ def validate_candidate(
     Promotion thresholds:
         Mean Brier Score   ≤ 0.30   (across all folds)
         Mean EV            ≥ 0.0005 (across all folds)
-        Profit Factor      ≥ 1.20   (Fold 3 val set only)
+        Fold 3 PF lb       ≥ 1.20   (Clopper-Pearson bound, most recent fold)
+        Pooled PF lb       ≥ 1.20   (Clopper-Pearson bound, all folds pooled)
+        Pooled trades      ≥ backstop (BASELINE_POOLED_OOS_TRADES, veto-scaled)
+    The two PF bars replaced the old Fold-3 point PF and the flat 300-trade
+    floor on 2026-08-29 — one exact instrument (_holdout_pf_lower_bound),
+    applied at two scales, so small samples widen the interval and fail on
+    their own instead of flipping with the clock.
 
-    Dynamic threshold:
+    Dynamic thresholds:
         With class_weight=None, Devil probabilities reflect the true ~20% base
         rate. Per-fold, _find_optimal_threshold() sweeps 0.10–0.64 and selects
         the threshold maximizing EV. The Fold 3 threshold is returned as the
         production threshold.
+        The ANGEL proposal bar is likewise calibrated per refit from that
+        frame's OOF probabilities (_find_optimal_angel_threshold) unless the
+        ANGEL_THRESHOLD env var pins a fixed value; the fold's own calibrated
+        bar masks its validation window (strictly OOS), and the final
+        artifact's bar is pinned into threshold.json via the report's
+        production_angel_threshold.
 
     Args:
         df: Feature-engineered DataFrame (output of
@@ -2206,12 +2458,14 @@ def validate_candidate(
     fold3_devil: Optional["lgb.LGBMClassifier"] = None
     fold3_angel_feats: Optional[List[str]] = None
     fold3_devil_feats: Optional[List[str]] = None
+    fold3_angel_threshold: float = ANGEL_THRESHOLD  # fallback; overwritten per fold
     # Production HMM dict (fit on full data after the gate passes; persisted
     # alongside Angel/Devil and consumed at inference by MLStrategy).
     final_hmm_models: Optional[dict] = None
     profit_factor: float = 0.0
     final_win_rate: float = 0.0
     final_total_trades: int = 0
+    fold3_macro_wins: int = 0
     production_threshold: float = 0.20  # fallback; overwritten by Fold 3
     # Fold n_folds-1 (the "calibration" fold) sweeps for an optimal threshold;
     # that threshold is frozen and applied to Fold n_folds for strict OOS gate
@@ -2266,10 +2520,25 @@ def validate_candidate(
             continue
 
         # ─────────────────────────────────────────────────────────────
-        # Train on this fold's training window
+        # Train on this fold's training window. The fold's Angel proposal
+        # bar comes back calibrated from ITS train-frame OOF probabilities
+        # (unless env-pinned fixed) — applying it to the val window is
+        # strictly OOS, the same discipline as the Devil's frozen
+        # calibration_threshold.
         # ─────────────────────────────────────────────────────────────
-        angel_model, devil_model, angel_feats, devil_feats = refit_models(
-            train_df, feature_cols, angel_params=angel_params, devil_params=devil_params
+        (
+            angel_model,
+            devil_model,
+            angel_feats,
+            devil_feats,
+            fold_angel_threshold,
+        ) = refit_models(
+            train_df,
+            feature_cols,
+            angel_params=angel_params,
+            devil_params=devil_params,
+            sl_mult=sl_mult,
+            tp_mult=tp_mult,
         )
 
         # ─────────────────────────────────────────────────────────────
@@ -2285,11 +2554,12 @@ def validate_candidate(
             warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
             angel_probs_val = angel_model.predict_proba(X_val_base)[:, 1]
 
-        signal_mask = angel_probs_val >= ANGEL_THRESHOLD
+        signal_mask = angel_probs_val >= fold_angel_threshold
         n_angel_proposed = int(signal_mask.sum())
         logger.info(
             f"[Fold {fold_number}] Angel proposed {n_angel_proposed} trades "
-            f"({n_angel_proposed / len(val_df):.1%} of val rows)"
+            f"({n_angel_proposed / len(val_df):.1%} of val rows) "
+            f"@ threshold {fold_angel_threshold:.4f}"
         )
 
         if n_angel_proposed == 0:
@@ -2312,6 +2582,7 @@ def validate_candidate(
             if fold_number == n_folds:
                 fold3_angel, fold3_devil = angel_model, devil_model
                 fold3_angel_feats, fold3_devil_feats = angel_feats, devil_feats
+                fold3_angel_threshold = fold_angel_threshold
             continue
 
         # Stage 2: Devil inference on Angel-proposed rows
@@ -2494,6 +2765,7 @@ def validate_candidate(
             if fold_number == n_folds:
                 fold3_angel, fold3_devil = angel_model, devil_model
                 fold3_angel_feats, fold3_devil_feats = angel_feats, devil_feats
+                fold3_angel_threshold = fold_angel_threshold
             continue
 
         # Opt-in per-trade OOS capture for offline analysis (behavior matrix).
@@ -2550,11 +2822,18 @@ def validate_candidate(
             if fold_number == n_folds:
                 fold3_angel, fold3_devil = angel_model, devil_model
                 fold3_angel_feats, fold3_devil_feats = angel_feats, devil_feats
+                fold3_angel_threshold = fold_angel_threshold
             continue
 
         # From here on the gate sees only tradeable approvals.
         approved_mask = scored_mask
         n_devil_approved = n_scored
+
+        # Macro (45-bar bracket) outcomes of the scored approvals — the
+        # (wins, trades) evidence the pooled Clopper-Pearson PF lower bound
+        # pools across EVERY fold, not just Fold 3.
+        approved_macro_targets = proposed_devil_targets_macro[approved_mask]
+        fold_macro_wins = int(approved_macro_targets.sum())
 
         # ─────────────────────────────────────────────────────────────
         # Compute fold metrics on Devil-approved trades
@@ -2587,6 +2866,7 @@ def validate_candidate(
             angel_proposed_trades=n_angel_proposed,
             devil_approved_trades=n_devil_approved,
             win_rate=win_rate,
+            macro_wins=fold_macro_wins,
         )
         fold_metrics.append(fm)
 
@@ -2601,15 +2881,15 @@ def validate_candidate(
             fold3_devil = devil_model
             fold3_angel_feats = angel_feats
             fold3_devil_feats = devil_feats
+            fold3_angel_threshold = fold_angel_threshold
 
             # Phase 5.5: Profit Factor and win rate computed from MACRO
             # outcomes (45-bar bracket) on Devil-approved trades.
             # approved_targets (survival) is used for Brier only — the PF
             # gate must reflect actual bracket R:R, not survival rate.
-            approved_macro_targets = proposed_devil_targets_macro[approved_mask]
-            macro_wins = int(approved_macro_targets.sum())
-            macro_losses = n_devil_approved - macro_wins
-            gross_profit = macro_wins * tp_mult
+            fold3_macro_wins = fold_macro_wins
+            macro_losses = n_devil_approved - fold3_macro_wins
+            gross_profit = fold3_macro_wins * tp_mult
             gross_loss = macro_losses * sl_mult
             profit_factor = (
                 gross_profit / gross_loss if gross_loss > 0 else float("inf")
@@ -2631,11 +2911,26 @@ def validate_candidate(
     mean_brier = float(np.mean([fm.brier_score for fm in fold_metrics]))
     mean_ev = float(np.mean([fm.expected_value for fm in fold_metrics]))
 
-    # Pooled, drop-rate-scaled OOS-trade floor. Pool Devil-approved trades
-    # across ALL folds and lower the requirement by the chop filter's row-drop
-    # rate, so a high-precision filter isn't penalized for the bars it pruned.
+    # Fold-gate evidence, judged with the same exact instrument as the
+    # artifact holdout gate: Clopper-Pearson lower bound on the macro win
+    # rate mapped through PF (_holdout_pf_lower_bound). This replaces two
+    # predecessors the 2026-08-29 gate matrix showed were broken: the flat
+    # 300-trade floor (a cliff the shipped 200x63 config itself cleared only
+    # once in three pins) and the Fold-3 POINT PF (a coin-flip on 11 trades).
+    # One instrument, applied at two scales:
+    #   Fold 3  — the recency check: does the LATEST regime beat break-even?
+    #   Pooled  — the evidence check: does the WHOLE walk-forward prove it?
+    # plus an absolute backstop count so a handful of lucky wins can never
+    # reach the instrument at all.
     pooled_oos_trades = int(sum(fm.devil_approved_trades for fm in fold_metrics))
+    pooled_oos_wins = int(sum(fm.macro_wins for fm in fold_metrics))
     effective_trade_floor = BASELINE_POOLED_OOS_TRADES * (1.0 - chop_veto_rate)
+    pooled_pf_lb = _holdout_pf_lower_bound(
+        pooled_oos_wins, pooled_oos_trades, sl_mult, tp_mult
+    )
+    fold3_pf_lb = _holdout_pf_lower_bound(
+        fold3_macro_wins, final_total_trades, sl_mult, tp_mult
+    )
 
     rejection_reasons: List[str] = []
     if mean_brier > BRIER_THRESHOLD:
@@ -2644,16 +2939,26 @@ def validate_candidate(
         )
     if mean_ev < EV_THRESHOLD:
         rejection_reasons.append(f"EV {mean_ev:.6f} < {EV_THRESHOLD} threshold")
-    if profit_factor < PROFIT_FACTOR_THRESHOLD:
+    if not (fold3_pf_lb >= PROFIT_FACTOR_THRESHOLD):
         rejection_reasons.append(
-            f"Profit Factor {profit_factor:.4f} < {PROFIT_FACTOR_THRESHOLD} threshold"
+            f"Fold {n_folds} PF point estimate {profit_factor:.4f} on "
+            f"{final_total_trades} trades, but {HOLDOUT_PF_CONFIDENCE:.0%} lower "
+            f"bound {fold3_pf_lb:.4f} < {PROFIT_FACTOR_THRESHOLD} — the most "
+            f"recent regime cannot prove it beats break-even"
+        )
+    if not (pooled_pf_lb >= PROFIT_FACTOR_THRESHOLD):
+        rejection_reasons.append(
+            f"Pooled fold PF {HOLDOUT_PF_CONFIDENCE:.0%} lower bound "
+            f"{pooled_pf_lb:.4f} < {PROFIT_FACTOR_THRESHOLD} "
+            f"(evidence: {pooled_oos_wins} wins / {pooled_oos_trades} trades "
+            f"across {n_folds} folds)"
         )
     if pooled_oos_trades < effective_trade_floor:
         rejection_reasons.append(
-            f"Pooled OOS trades {pooled_oos_trades} < effective floor "
+            f"Pooled OOS trades {pooled_oos_trades} < backstop floor "
             f"{effective_trade_floor:.0f} "
             f"(= {BASELINE_POOLED_OOS_TRADES} × (1 − chop_veto_rate {chop_veto_rate:.1%})) "
-            f"— sample too small to trust PF={profit_factor:.4f}"
+            f"— too few trades for any statistical claim"
         )
 
     gate_passed = len(rejection_reasons) == 0
@@ -2664,14 +2969,19 @@ def validate_candidate(
     logger.info(f"Mean Brier Score : {mean_brier:.4f} (threshold ≤ {BRIER_THRESHOLD})")
     logger.info(f"Mean EV          : {mean_ev:.6f} (threshold ≥ {EV_THRESHOLD})")
     logger.info(
-        f"Profit Factor    : {profit_factor:.4f} "
-        f"(threshold ≥ {PROFIT_FACTOR_THRESHOLD}, Fold {n_folds} OOS)"
+        f"Fold {n_folds} PF     : {profit_factor:.4f} point | "
+        f"{HOLDOUT_PF_CONFIDENCE:.0%} lower bound {fold3_pf_lb:.4f} "
+        f"(bar ≥ {PROFIT_FACTOR_THRESHOLD}; {fold3_macro_wins}/{final_total_trades} wins)"
     )
     logger.info(
-        f"Pooled OOS Trades: {pooled_oos_trades} across {n_folds} folds "
-        f"(dynamic floor ≥ {effective_trade_floor:.0f} = "
-        f"{BASELINE_POOLED_OOS_TRADES}×(1−{chop_veto_rate:.1%}) | "
-        f"Fold {n_folds} PF trades={final_total_trades})"
+        f"Pooled PF (folds): {HOLDOUT_PF_CONFIDENCE:.0%} lower bound "
+        f"{pooled_pf_lb:.4f} (bar ≥ {PROFIT_FACTOR_THRESHOLD}; "
+        f"{pooled_oos_wins} wins / {pooled_oos_trades} trades)"
+    )
+    logger.info(
+        f"Pooled OOS Trades: {pooled_oos_trades} "
+        f"(backstop ≥ {effective_trade_floor:.0f} = "
+        f"{BASELINE_POOLED_OOS_TRADES}×(1−{chop_veto_rate:.1%}))"
     )
     logger.info(f"Gate Result      : {'PASSED ✅' if gate_passed else 'FAILED 🚫'}")
 
@@ -2689,8 +2999,19 @@ def validate_candidate(
             logger.info("Fitting production HMM on full retraining window...")
             final_hmm_models = fit_regime_models(df)
             df = predict_regime_probs(df, final_hmm_models)
-        final_angel, final_devil, final_angel_feats, final_devil_feats = refit_models(
-            df, feature_cols, angel_params=angel_params, devil_params=devil_params
+        (
+            final_angel,
+            final_devil,
+            final_angel_feats,
+            final_devil_feats,
+            production_angel_threshold,
+        ) = refit_models(
+            df,
+            feature_cols,
+            angel_params=angel_params,
+            devil_params=devil_params,
+            sl_mult=sl_mult,
+            tp_mult=tp_mult,
         )
     else:
         logger.info(
@@ -2700,6 +3021,7 @@ def validate_candidate(
         final_devil = fold3_devil
         final_angel_feats = fold3_angel_feats
         final_devil_feats = fold3_devil_feats
+        production_angel_threshold = fold3_angel_threshold
 
     report = ValidationReport(
         fold_metrics=fold_metrics,
@@ -2713,6 +3035,10 @@ def validate_candidate(
         chop_veto_rate=chop_veto_rate,
         effective_trade_floor=effective_trade_floor,
         rejection_reasons=rejection_reasons,
+        pooled_oos_wins=pooled_oos_wins,
+        pooled_pf_lower_bound=pooled_pf_lb,
+        fold3_pf_lower_bound=fold3_pf_lb,
+        production_angel_threshold=production_angel_threshold,
     )
 
     return (
@@ -2764,6 +3090,7 @@ def promote_or_reject(
     threshold: float = 0.20,
     asset_config: dict = None,
     hmm_models: Optional[dict] = None,
+    angel_threshold: Optional[float] = None,
 ) -> bool:
     """
     Promote or reject candidate models based on the validation report.
@@ -2797,7 +3124,7 @@ def promote_or_reject(
             asset_config = {}
 
         save_models(angel_model, devil_model, asset_config, report=report)
-        save_threshold(threshold, asset_config)
+        save_threshold(threshold, asset_config, angel_threshold=angel_threshold)
         if SPREAD_TABLE is not None:
             save_spread_table(_SPREAD_TABLE_PATH, asset_config)
         if hmm_models is not None:
@@ -2904,6 +3231,12 @@ def save_models(
     # ═══════════════════════════════════════════════════════════════════
     metadata_path = model_dir / "metadata.json"
     metadata_temp = model_dir / "metadata_temp.json"
+    # The Angel bar the pair was actually trained at: the OOF-calibrated
+    # value when the report carries one (dynamic mode), else the global
+    # constant (fixed mode or reports that predate calibration).
+    meta_angel_threshold = ANGEL_THRESHOLD
+    if report is not None and getattr(report, "production_angel_threshold", 0.0):
+        meta_angel_threshold = report.production_angel_threshold
     metadata = {
         "asset_class": asset_class,
         "timeframe_minutes": asset_config.get("timeframe_minutes", 1),
@@ -2911,7 +3244,7 @@ def save_models(
         "trained_at": datetime.now(timezone.utc).isoformat(),
         "trained_on_symbols": asset_config.get("tickers", []),
         "data_source": os.getenv("DATA_SOURCE", "alpaca").strip().lower(),
-        "angel_threshold": ANGEL_THRESHOLD,
+        "angel_threshold": meta_angel_threshold,
         # The brackets this model's labels were built from. Serving it under
         # different multiples is train/serve skew, and until now the artifact
         # carried no record of them — so a candidate could not be checked
@@ -2972,7 +3305,11 @@ def save_models(
     )
 
 
-def save_threshold(threshold: float, asset_config: dict) -> None:
+def save_threshold(
+    threshold: float,
+    asset_config: dict,
+    angel_threshold: Optional[float] = None,
+) -> None:
     """
     Save the optimal Devil threshold to disk as a JSON sidecar file.
 
@@ -2983,7 +3320,12 @@ def save_threshold(threshold: float, asset_config: dict) -> None:
     Args:
         threshold: The optimal Devil probability threshold (e.g., 0.28)
         asset_config: Asset configuration dictionary.
+        angel_threshold: The Angel proposal bar the pair was trained with
+            (OOF-calibrated unless env-pinned). None falls back to the
+            global ANGEL_THRESHOLD constant — the pre-2026-08-29 behaviour.
     """
+    if angel_threshold is None:
+        angel_threshold = ANGEL_THRESHOLD
     asset_class = asset_config.get("asset_class", "equities")
     model_dir = Path(asset_config.get("model_dir") or f"models/{asset_class}")
     model_dir.mkdir(parents=True, exist_ok=True)
@@ -2995,7 +3337,7 @@ def save_threshold(threshold: float, asset_config: dict) -> None:
         # population and the bracket fit are conditioned on it, so the live
         # strategy must run the model at this value (MLStrategy overrides
         # its default with this key when present).
-        "angel_threshold": round(ANGEL_THRESHOLD, 4),
+        "angel_threshold": round(angel_threshold, 4),
         "updated_at": datetime.now().isoformat(),
     }
 
@@ -3270,6 +3612,7 @@ def main() -> int:
                     asset_config,
                     alpha_table=spread_alphas,
                     final_hmm_models=final_hmm_models,
+                    angel_threshold=report.production_angel_threshold or None,
                 )
                 holdout_passed, holdout_reasons = _holdout_verdict(
                     holdout_scores,
@@ -3362,6 +3705,7 @@ def main() -> int:
             optimal_threshold,
             asset_config,
             hmm_models=final_hmm_models,
+            angel_threshold=report.production_angel_threshold or None,
         )
 
         if promoted:

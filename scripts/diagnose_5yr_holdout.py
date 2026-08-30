@@ -71,9 +71,10 @@ def main() -> int:
     features_df, n_purged = R._purge_boundary_tail(features_df, tail_cutoffs)
     logger.info("BOUNDARY PURGE: dropped %d training rows (unresolvable tail)", n_purged)
 
-    angel, devil, angel_feats, devil_feats = R.refit_models(
+    angel, devil, angel_feats, devil_feats, angel_thr = R.refit_models(
         features_df, feature_cols,
         angel_params=angel_params, devil_params=devil_params,
+        sl_mult=asset_config["sl_mult"], tp_mult=asset_config["tp_mult"],
     )
 
     scores, n_purged = R._score_artifact_holdout(
@@ -84,6 +85,7 @@ def main() -> int:
         devil_feats,
         FOLD3_THRESHOLD,
         asset_config,
+        angel_threshold=angel_thr,
     )
     pf_lb = R._holdout_pf_lower_bound(
         scores["wins"], scores["trades"],
