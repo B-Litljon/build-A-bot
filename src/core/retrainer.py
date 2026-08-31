@@ -1662,20 +1662,13 @@ def refit_models(
     )
     logger.info(f"Devil feature space: {devil_features}")
 
-    # Devil min_child_samples must scale to the APPROVED population, not the
-    # Angel's: min_child_samples is a per-leaf minimum, so a split needs
-    # >= 2x that many rows, and the 2026-08-29 gate matrix showed the
-    # Angel-side value (80) against approved populations of 69-158 rows
-    # collapses the Devil to a constant function (separation gap 0.0000,
-    # 100% approval — a two-stage architecture silently running on one
-    # stage). Auto scale: a tenth of the population, capped at the
-    # configured value (large populations reproduce the old behaviour
-    # exactly), floored at 5. RETRAIN_DEVIL_MIN_CHILD pins a fixed value.
+    # Devil-scale min_child to the APPROVED population, not the Angel's —
+    # see _devil_min_child for why; RETRAIN_DEVIL_MIN_CHILD pins a fixed value.
     if DEVIL_MIN_CHILD_FIXED:
         devil_min_child = int(DEVIL_MIN_CHILD_FIXED)
     else:
-        devil_min_child = max(
-            5, min(int(d_params["min_child_samples"]), n_approved // 10)
+        devil_min_child = _devil_min_child(
+            int(d_params["min_child_samples"]), n_approved
         )
     if devil_min_child != d_params["min_child_samples"]:
         logger.info(
@@ -1714,6 +1707,22 @@ def refit_models(
     logger.info(f"Devil can now veto Angel when angel_prob is misleading")
 
     return angel_model, devil_model, feature_cols, devil_features, angel_threshold
+
+
+def _devil_min_child(configured: int, n_approved: int) -> int:
+    """
+    Scale the Devil's min_child_samples to its actual training population.
+
+    min_child_samples is a per-LEAF minimum: splitting a node needs at least
+    2x that many rows. The Angel-side value (80) applied to an Angel-approved
+    subpopulation of dozens-to-hundreds makes every split impossible, and the
+    Devil degenerates to a constant (2026-08-29 gate matrix: separation gap
+    0.0000, 100% approval — a two-stage architecture on one stage). A tenth
+    of the population keeps leaves meaningful at any scale; the cap preserves
+    the configured value when the population is large (old behaviour
+    unchanged); the floor keeps LightGBM off degenerate 1-row leaves.
+    """
+    return max(5, min(int(configured), n_approved // 10))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
