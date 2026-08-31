@@ -269,6 +269,13 @@ def _make_inference_orch(
     orch._feature_engineer.run.return_value = features_df
 
     orch._strategy = MagicMock()
+    # The inference path reads the model's own feature schema off the
+    # strategy (2026-08-30 — no more hardcoded feature list), so the mock
+    # must expose one. Derived from the fixture frame's model columns so it
+    # tracks _make_features_df automatically.
+    orch._strategy.feature_names = [
+        c for c in features_df.columns if c not in ("timestamp", "close")
+    ]
     orch._strategy.angel_model.predict_proba.return_value = np.array(
         [[1.0 - angel_prob, angel_prob]]
     )
