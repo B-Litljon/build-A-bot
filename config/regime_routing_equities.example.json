@@ -1,0 +1,12 @@
+{
+  "_WARNING": "TEMPLATE ONLY -- NOT DERIVED FROM MEASUREMENT. Authored by hand on 2026-09-02, 12 seconds after the backtester it was supposedly based on, and before any matrix run existed. Every assignment below is a textbook prior, not a finding. Regenerate with src/analysis/build_strategy_matrix.py and only then point --routing-config at the result.",
+  "mixed_high": null,
+  "mixed_low": null,
+  "mixed_normal": "donchian_breakout",
+  "range_high": null,
+  "range_low": null,
+  "range_normal": "rsi_mean_reversion",
+  "trend_high": null,
+  "trend_low": "sma_crossover",
+  "trend_normal": null
+}
