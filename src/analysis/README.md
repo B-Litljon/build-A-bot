@@ -151,5 +151,108 @@ distributions against a saved training snapshot and needs no replay data.
 - **Reads:** `data/evaluation_results.parquet`, `data/signal_ledger.parquet`,
   `data/oos_bars.parquet`. **Writes:** `data/drift_report.json`.
 
+### `strategy_backtester.py`
+The strategy-agnostic scorer, added 2026-09-02. Everything else offline in this
+repo is welded to the Angel/Devil model path; this takes any `BaseStrategy`,
+walks it bar by bar over a Polars frame, and emits a trade ledger that
+`behavior_matrix.score_ledger` can consume.
+
+Two conventions that will mislead you if skipped:
+
+- **`macro_win` is bracket resolution, not profitability.** It is 1 only when
+  the target was reached. A timeout is 0 no matter where price ended, matching
+  `retrainer._compute_devil_targets_atr`.
+- **`gross_r` / `net_r` are the realised move** over the stop distance. So a
+  trade that timed out slightly up has `macro_win = 0` and a small positive
+  `gross_r`. The two columns answer different questions and are *meant* to
+  disagree on timeouts.
+
+Execution realism, all three from the 2026-09-02 review:
+
+- a bar that **gapped** past a level fills at the open, not the level
+  (`sl_gap` / `tp_gap`) — filling at the level books a price that never traded;
+- a **timeout** pays its realised move, not the bracket's nominal payoff. The
+  original booked ±payoff on sign alone, which inflated win rate by 10–12 points
+  on every library strategy;
+- when a `RiskManager` is passed, the **live gates run** (C time, B regime,
+  A cost) and vetoed signals land in `gate_rejections` rather than being traded.
+  Gate B alone vetoes the bottom 20% of the volatility window — roughly 60% of
+  the tagger's `*_low` band — so a gateless run scores a population the live bot
+  would never take.
+
+`spread_alphas` gives a per-instrument toll mirroring Gate A's own proxy; the
+shipped alphas span 0.072–0.903, a 12.6× range one flat constant cannot cover.
+
+It deliberately does **not** import `core.retrainer`, keeping LightGBM, scipy
+and the model artifacts out of its import graph — that is also what makes it
+safe to run beside the live soak.
+
+- **Imports from repo:** `strategies.base`, `analysis.behavior_matrix`
+  (`DEFAULT_TOLL_R`, `_profit_factor`). `execution.risk_manager` is a
+  `TYPE_CHECKING`-only annotation — the instance is passed in by the caller.
+- **Imported by:** `walk_forward_tuner.py`, `build_strategy_matrix.py`, tests.
+- **Reads/writes:** nothing directly; the caller owns the frame and the ledger.
+
+### `walk_forward_tuner.py`
+Grid search over strategy parameters, scored strictly out-of-sample across
+expanding chronological folds. The point is to resist "tune until it fits" —
+parameters are chosen on train windows and judged on windows they never saw.
+
+- Validation slices are **prefixed with warmup bars** of prior history. Slicing
+  at exactly `val_start` meant the backtester spent each fold's whole warmup
+  window unable to trade, silently discarding those bars and resetting trailing
+  state that live never resets.
+- A **fresh strategy instance per fold**, so no fitted state can cross a fold
+  boundary.
+- `robust` requires the **Clopper-Pearson lower bound** on the pooled OOS win
+  rate to clear the bracket's break-even rate, `1 / (1 + payoff)`. It previously
+  computed that bound and ignored it, so a lucky 31-trade run read as robust on
+  its point estimate alone.
+
+- **Imports from repo:** `analysis.strategy_backtester`,
+  `analysis.behavior_matrix`, `strategies.base`.
+- **Imported by:** `build_strategy_matrix.py`, tests.
+- **Reads:** a bars frame from the caller. **Writes:** JSON/CSV when run as a
+  CLI.
+
+### `build_strategy_matrix.py`
+Scores the strategy library per market behavior and emits a routing table.
+**This is the only legitimate source of a routing table** — the files in
+`config/` named `*.example.json` are hand-authored templates, and the real one
+carries `_generated_by` / `_generated_at` / `_basket` provenance fields so the
+two can never again be confused.
+
+Runs over a **basket**, not one symbol: nine behavior tags × five strategies
+needs far more trades than one pair produces, and a cell built from a single
+pair measures that pair rather than that regime. It defaults to the six
+tradeable crosses and deliberately excludes XAU/XAG, which are broker-dead yet
+made up 38–60% of prior model picks.
+
+Three things it does that the first version did not, each of which changes the
+answer:
+
+- runs the **live gates** and reports the veto funnel per strategy;
+- charges **measured per-instrument spread costs**;
+- scores cells from the ledger's **realised R** rather than re-deriving them
+  from a binary win flag times a flat toll — which had made every metric in a
+  cell an affine transform of the win rate.
+
+It also trims every frame to the window they all cover. A legacy parquet in
+`data/raw` spanned a different two years from a fresh fetch, and pooling those
+would have put two market eras in one cell.
+
+`--sl-mult` / `--tp-mult` / `--max-hold` expose bracket geometry as a swept
+axis; comparing two geometries is how you separate "no edge" from "cut off too
+early" (see `llm_reports/recons/2026-09-02_strategy-library-behavior-matrix.md`,
+finding 7).
+
+- **Imports from repo:** `analysis.strategy_backtester`,
+  `analysis.behavior_matrix`, `ml.regimes.behavior_tagger`, the strategy
+  registry, and `execution.risk_manager` (only when gates are on).
+- **Reads:** `config/spread_alphas_m15.json`, cached bars under
+  `analysis_cache/strategy_matrix/`, else fetches via `data.factory`.
+- **Writes:** a routing JSON at `--output`, a matrix CSV at `--matrix-out`, and
+  the bar cache.
+
 ### `__init__.py`
 Empty package marker.

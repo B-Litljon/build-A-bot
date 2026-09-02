@@ -462,9 +462,67 @@ factor. Answers "which configuration earns its keep in *this* kind of market".
 Its output is a hypothesis to test, not a promotion decision — per-cell samples
 are thin and the scoring is in-sample unless walk-forward.
 
-**candidate** — one evaluation configuration in the behavior matrix: a model
-directory, a threshold pair, bracket widths, and a chop-gate config. Not new
+**candidate** — one evaluation configuration in the behavior matrix: a name,
+the bracket multiples (`sl_mult` / `tp_mult`) and a training lookback. Not new
 strategy code — every candidate runs the same strategy with different settings.
+
+*(Corrected 2026-09-02: this entry previously described a model directory,
+threshold pair and chop-gate config, none of which `behavior_matrix.Candidate`
+has ever carried.)*
+
+## The strategy library and the router
+
+**lazy strategy registry** — `STRATEGIES` in
+`src/strategies/concrete_strategies/__init__.py`. Maps a config name to a
+strategy class, but resolves on lookup rather than at import: listing the names
+loads nothing, so the live bot's import graph contains only the strategy it
+actually serves. An eagerly-importing registry meant a typo in an unused
+research strategy could stop the bot booting.
+
+**strategy library** — the set of ordinary, non-ML strategies in
+`src/strategies/concrete_strategies/`: moving-average cross, RSI mean
+reversion, Bollinger breakout, Donchian breakout, momentum. Each is bars in,
+a trade or a decline out. They exist to be compared *against each other per
+behavior tag*. ⚠️ As of 2026-09-02 **none has a measured edge** — all five
+scored negative net expectancy on GBP_JPY M15.
+
+**regime router** — the "master" strategy (`regime_router.py`). Tags the
+current bar's behavior, looks the label up in a routing table, and delegates to
+the named strategy or declines. It is a third meta stage above Angel/Devil:
+Angel proposes, Devil vetoes, the router decides *which proposer to listen to*.
+
+**routing table** — the router's whole intelligence: a JSON map from behavior
+tag to strategy name, or to `null`. ⚠️ The tables in `config/` are
+**hand-authored templates** (`*.example.json`) with no empirical basis; only
+`build_strategy_matrix.py` produces a real one, and `run_oanda.py` refuses to
+run the router without an explicit `--routing-config`.
+
+**stand down** — the router returning `None`: no trade, deliberately. Three
+causes, all intended: the trailing window is `cold`, the tag maps to `null`, or
+the named strategy is unknown. Standing down is the router's most important
+output — one that always picks something will trade into regimes where nothing
+has an edge.
+
+**R** — a trade's result expressed in multiples of its own stop distance. A
+2:1 bracket that reaches its target pays +2R; one that stops out pays −1R. The
+unit the whole repo reports expectancy in, because it is comparable across
+instruments and price levels.
+
+**realised R** — R computed from the price actually filled at, rather than from
+the bracket's nominal payoff. Matters at the two edges: a trade that **timed
+out** pays only the small distance it actually moved (booking it at ±full
+payoff on the sign of the move inflated win rate by 10–12 points until
+2026-09-02), and a trade that **gapped** through its stop loses more than 1R,
+which is a real loss the nominal convention hid.
+
+**gap fill** — an exit where the bar *opened* beyond the bracket level rather
+than trading through it. The fill is the open, not the level; booking the level
+credits a price that never traded. Recorded as `sl_gap` / `tp_gap`.
+
+**gate funnel** — the count of signals a strategy proposed versus the count the
+live gates actually admitted, per gate. A result in its own right: a regime
+whose picks are mostly gate-vetoed is not reachable live, however good the
+surviving trades look.
 
 ## Live operation
 
