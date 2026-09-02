@@ -52,7 +52,80 @@ hardcodes a count at all.
 - **Imported by:** the Factory orchestrator path (imported directly, not via
   the registry). **Data artifacts:** whatever `MLStrategy` reads.
 
+### The non-ML strategy library
+
+Five ordinary rule-based strategies, added 2026-09-02. Each is a small
+`BaseStrategy` subclass: bars in, a `Signal` or `None` out, no broker, no
+sizing. They exist to be *compared against each other per market regime*, which
+is what the regime router routes over.
+
+> ⚠️ **None of them has a measured edge.** Scored on GBP_JPY M15 through
+> `analysis.strategy_backtester`, all five returned negative net expectancy
+> (profit factor 0.69–0.81) once timeouts were booked honestly. They are
+> research inputs, not candidates for live trading. `run_oanda.py` logs a
+> warning if you select one.
+
+| File | Class | Entry rule |
+|---|---|---|
+| `sma_crossover.py` | `SMACrossoverStrategy` | fast SMA crosses slow SMA |
+| `rsi_mean_reversion.py` | `RSIMeanReversionStrategy` | RSI leaves an extreme |
+| `bollinger_breakout.py` | `BollingerBreakoutStrategy` | close breaks a band |
+| `donchian_breakout.py` | `DonchianBreakoutStrategy` | close breaks an N-bar extreme |
+| `momentum.py` | `MomentumStrategy` | sign flip of an N-bar return |
+
+Each emits **both directions**, unlike `MLStrategy` which only ever goes long.
+All size `raw_sl_distance` as raw ATR, matching `MLStrategy`, because the
+`RiskManager` — not the strategy — owns the bracket multipliers.
+
+- **Imports from repo:** `strategies.base`; TA-Lib for indicators.
+- **Imported by:** `__init__.py`, `regime_router.py`, `src/analysis/` tooling,
+  and tests. **Reads/writes:** nothing.
+
+### `regime_router.py`
+`RegimeRouterStrategy` — the "master" strategy. Each bar it tags the current
+market behaviour with `ml.regimes.behavior_tagger.tag_bar` (causal, trailing
+window only), looks the label up in a **routing table**, and delegates to the
+named sub-strategy — or returns `None`.
+
+Three ways it stands down, all deliberate:
+
+1. the trailing window is **cold** (too few samples) — absence of evidence,
+2. the label maps to **`null`** — no strategy has an edge in this regime,
+3. the named strategy is **unknown** — a typo must not silently trade.
+
+> ⚠️ **The routing tables in `config/` are hand-authored templates, not
+> measurements** (`*.example.json`). They were written before any matrix run
+> existed and every assignment in them is a textbook prior. `run_oanda.py`
+> therefore has **no default routing config** and refuses to start
+> `--strategy regime_router` without an explicit one. Generate a real table
+> with `src/analysis/build_strategy_matrix.py` first.
+
+Sub-strategies are registered under **one canonical snake_case key each**. A
+`ClassName` spelling in a table still resolves, via `_resolve_name`, but is not
+a second registry entry — two names for one object invites config drift.
+
+- **Imports from repo:** `strategies.base`, `ml.regimes.behavior_tagger`, and
+  the five library strategies (lazily, inside `_default_strategy_library`).
+- **Imported by:** `__init__.py`, `run_oanda.py`, tests.
+- **Reads:** a routing table JSON. **Writes:** nothing.
+
 ### `__init__.py`
-Exports `MLStrategy` and defines `STRATEGIES`, a name→class registry for
-selecting a strategy by config string. Only `"ml_strategy"` is registered;
-`MLFactoryStrategy` is intentionally absent.
+Defines `STRATEGIES`, the name→class registry that `run_oanda.py --strategy`
+selects from, plus `build_strategy(name, **params)`. `MLFactoryStrategy` is
+intentionally absent.
+
+**The registry resolves lazily.** `STRATEGIES` is a `Mapping`, not a dict:
+iterating names and calling `keys()` import nothing, while a lookup imports that
+one module and caches it. `MLStrategy` is the sole eager import, because it is
+what the soak serves and every live module imports it directly anyway.
+
+This matters for a specific failure: `run_oanda.py` reads this registry to build
+its `--strategy` choices. When all seven were imported eagerly, a typo in an
+unused research strategy would stop the live bot booting, and the watchdog's
+crash-loop brake would then hold it down for 15 minutes. Now the live path loads
+`ml_strategy` and nothing else — pinned by
+`tests/test_strategy_library.py::test_selecting_one_strategy_does_not_import_the_others`.
+
+A PEP 562 `__getattr__` keeps `from strategies.concrete_strategies import
+MomentumStrategy` working for tests and analysis tooling, importing only that
+module.
