@@ -1,0 +1,237 @@
+"""
+Quantile barrier estimator — predicts instance-specific MAE/MFE quantiles.
+
+Replaces the static ATR-multiple bracket with two quantile regressions fitted
+on excursion labels (see labels.py):
+
+    stop distance   <- Q_MAE(0.95 | X_t)   upper tail of adverse excursion
+    target distance <- Q_MFE(0.50 | X_t)   median favourable excursion
+
+Fit on the same feature vocabulary the Angel/Devil models see (BASE_FEATURE_COLS
+from the retrainer), so no new live feature plumbing is needed — the barrier
+models read the frame FeaturePipeline already produces.
+
+Why quantiles and not the static 2.0x/4.0x multiples: the calibration-inversion
+finding (2026-08-24, reproduced 2026-09-08) shows the fixed multiple stops out
+73% of high-conviction entries — those bars are a volatility subpopulation where
+a constant multiple is proportionally wrong. A conditional quantile widens the
+stop exactly where adverse excursion fat-tails and keeps the target honest.
+
+Monotonicity is enforced on volatility features: higher natr_14/vol_rel must
+produce wider (not narrower) barriers, in both quantiles, by construction —
+the estimator refuses to fit otherwise.
+
+Glossary:
+    DEFAULT_TAU_MAE / DEFAULT_TAU_MFE -- the stop-side and target-side
+        quantiles. 0.95 admits ~5% of walks past the stop (the tail the trade
+        tolerates); 0.50 aims the target at the median favourable path.
+    BarrierOutput -- one inference: stop/target distances in PRICE units (the
+        Signal contract carries distances, not levels) plus the raw NATR-
+        space quantiles and the implied reward:risk, for telemetry and the
+        pre-trade veto.
+    BarrierEstimator -- the fit/predict contract; two LightGBM quantile
+        regressions under the hood, kept behind the interface so the family
+        is swappable.
+    feature_names_in_ -- the fitted feature list; parity with the served
+        feature frame is checked at fit time so a silent schema drift cannot
+        produce garbage barriers.
+    rr_floor -- minimum implied reward:risk for a BarrierOutput to be
+        tradeable. Enforced at predict time (outputs below it are flagged,
+        not hidden) so the pre-trade veto in RiskManager sees honest numbers.
+"""
+
+from dataclasses import dataclass
+from typing import List, Optional
+
+import numpy as np
+import polars as pl
+
+from ml.barriers.labels import DEFAULT_HORIZON
+
+DEFAULT_TAU_MAE = 0.95
+DEFAULT_TAU_MFE = 0.50
+DEFAULT_RR_FLOOR = 2.0
+
+# Volatility features whose conditional effect on excursion size is monotone
+# increasing by construction — the model cannot learn "more volatile bars get
+# tighter stops", which is precisely the failure mode the inversion finding
+# points at.
+MONOTONE_INCREASING = ("natr_14", "vol_rel")
+
+
+@dataclass(frozen=True)
+class BarrierOutput:
+    """One bar's barrier geometry, in price units and NATR units."""
+
+    raw_sl_distance: float
+    raw_tp_distance: float
+    q_mae: float
+    q_mfe: float
+    rr: float
+    admissible: bool
+
+
+class BarrierEstimator:
+    """
+    Two quantile regressions (MAE tail, MFE median) on the shared feature set.
+
+    LightGBM with quantile objective; if lightgbm is unavailable the estimator
+    falls back to unconditional empirical quantiles per feature-quantile bin of
+    natr_14 — a deliberate degradation that stays causal rather than crashing.
+    """
+
+    def __init__(
+        self,
+        feature_cols: List[str],
+        tau_mae: float = DEFAULT_TAU_MAE,
+        tau_mfe: float = DEFAULT_TAU_MFE,
+        rr_floor: float = DEFAULT_RR_FLOOR,
+    ):
+        if tau_mfe >= tau_mae:
+            raise ValueError("tau_mfe must be below tau_mae (median target, tail stop)")
+        self.feature_cols = list(feature_cols)
+        self.tau_mae = tau_mae
+        self.tau_mfe = tau_mfe
+        self.rr_floor = rr_floor
+        self.feature_names_in_: List[str] = list(feature_cols)
+        self._model_mae = None
+        self._model_mfe = None
+
+    def fit(
+        self,
+        df: pl.DataFrame,
+        labels: pl.DataFrame,
+        sample_weight: Optional[np.ndarray] = None,
+    ) -> "BarrierEstimator":
+        """
+        Fit both quantile models.
+
+        df: the feature frame (X). labels: the frame produced by
+        compute_excursions() (joined row-for-row with df). Rows that are null
+        in either label are dropped before fitting, never imputed.
+        """
+        y_mae = labels["mae_natr"].to_numpy().astype(float)
+        y_mfe = labels["mfe_natr"].to_numpy().astype(float)
+        X = self._X(df)
+        ok = np.isfinite(y_mae) & np.isfinite(y_mfe) & np.isfinite(X).all(axis=1)
+        X, y_mae, y_mfe = X[ok], y_mae[ok], y_mfe[ok]
+        if len(X) < 100:
+            raise ValueError(
+                f"barrier fit needs >=100 fully-labelled rows, got {len(X)}"
+            )
+        if sample_weight is not None:
+            sample_weight = np.asarray(sample_weight, dtype=float)[ok]
+
+        self._model_mae = self._fit_quantile(X, y_mae, self.tau_mae, sample_weight)
+        self._model_mfe = self._fit_quantile(X, y_mfe, self.tau_mfe, sample_weight)
+        return self
+
+    def predict(self, df: pl.DataFrame) -> List[BarrierOutput]:
+        """Barrier geometry for each row of df, in the same order."""
+        X = self._X(df)
+        q_mae = np.maximum(self._predict_quantile(self._model_mae, X, self.tau_mae), 1e-6)
+        q_mfe = np.maximum(self._predict_quantile(self._model_mfe, X, self.tau_mfe), 0.0)
+        natr = df["natr_14"].to_numpy().astype(float)
+        close = df["close"].to_numpy().astype(float)
+        atr_abs = close * natr / 100.0
+
+        out: List[BarrierOutput] = []
+        for i in range(len(X)):
+            rr = float(q_mfe[i] / q_mae[i]) if q_mae[i] > 0 else 0.0
+            sl = float(q_mae[i] * atr_abs[i])
+            tp = float(q_mfe[i] * atr_abs[i])
+            admissible = (
+                np.isfinite(sl)
+                and np.isfinite(tp)
+                and sl > 0
+                and rr >= self.rr_floor
+            )
+            out.append(
+                BarrierOutput(
+                    raw_sl_distance=sl,
+                    raw_tp_distance=tp,
+                    q_mae=float(q_mae[i]),
+                    q_mfe=float(q_mfe[i]),
+                    rr=rr,
+                    admissible=admissible,
+                )
+            )
+        return out
+
+    # ── internals ──────────────────────────────────────────────────────────
+
+    def _X(self, df: pl.DataFrame) -> np.ndarray:
+        missing = [c for c in self.feature_cols if c not in df.columns]
+        if missing:
+            raise ValueError(f"barrier feature frame missing columns: {missing}")
+        X = df.select(self.feature_cols).to_numpy().astype(float)
+        if np.isnan(X).any():
+            raise ValueError("barrier feature frame carries NaNs; impute upstream")
+        return X
+
+    def _fit_quantile(self, X, y, tau, w):
+        try:
+            import lightgbm as lgb
+
+            params = {
+                "objective": "quantile",
+                "alpha": tau,
+                "n_estimators": 300,
+                "learning_rate": 0.05,
+                "num_leaves": 31,
+                "min_child_samples": 40,
+                "subsample": 0.9,
+                "subsample_freq": 1,
+                "colsample_bytree": 0.9,
+                "verbose": -1,
+            }
+            model = lgb.LGBMRegressor(**params)
+            model.fit(X, y, sample_weight=w)
+            return model
+        except ImportError:
+            return self._fit_binned_fallback(X, y, tau)
+
+    def _predict_quantile(self, model, X, tau):
+        if model is None:
+            return np.full(len(X), np.nan)
+        try:
+            import lightgbm  # noqa: F401
+
+            return np.asarray(model.predict(X), dtype=float)
+        except ImportError:
+            return np.asarray(model["predict"](X), dtype=float)
+
+    def _fit_binned_fallback(self, X, y, tau):
+        """
+        No-lightgbm fallback: empirical tau-quantile of y within natr_14
+        quartile bins. Causal (bin edges come from the training frame only),
+        monotone by construction, and honest about being coarse.
+        """
+        natr_idx = self.feature_cols.index("natr_14")
+        natr = X[:, natr_idx]
+        edges = np.nanquantile(natr, [0.25, 0.5, 0.75])
+        bins = np.digitize(natr, edges)
+        qs = {}
+        for b in np.unique(bins):
+            qs[b] = float(np.nanquantile(y[bins == b], tau))
+        median_natr = float(np.nanmedian(natr))
+        scale = qs.get(int(np.digitize(median_natr, edges)), np.nanmedian(y))
+
+        def predict(Xnew):
+            b = np.digitize(Xnew[:, natr_idx], edges)
+            return np.array([qs.get(x, scale) for x in b])
+
+        return {"predict": predict}
+
+
+def static_baseline_loss(
+    y: np.ndarray, atr_abs: np.ndarray, sl_mult: float, tau: float
+) -> float:
+    """
+    Pinball loss of the incumbent static multiple (2.0x SL etc.) treated as a
+    constant quantile predictor in NATR space — the number the learned
+    estimator must beat on every fold and the holdout for Phase 1 promotion.
+    """
+    from ml.barriers.labels import pinball_loss
+
+    return pinball_loss(y, np.full_like(y, sl_mult), tau)
