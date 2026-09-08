@@ -19,7 +19,11 @@ the long's favorable excursion and vice versa (short MAE ≡ long MFE, short MFE
 identity is load-bearing for the estimator design — see ml/barriers/README.md.
 
 Labels for the last ``horizon`` bars are null: their walk runs off the end of
-the frame. Those rows must be dropped before fitting (the same unresolvable-
+the frame. So are labels whose forward window contains even one null high or
+low: ``nanmin``/``nanmax`` would silently skip the gap bar and return a finite
+minimum from fewer than ``horizon`` observations, marking the row resolvable
+with an understated excursion. A partial window is unresolvable, never
+best-effort. Those rows must be dropped before fitting (the same unresolvable-
 tail principle as the retrainer's boundary purge), never zero-filled — a
 timeout is not the same as "no excursion", and inventing 0s would teach the
 quantile model that the tail is thinner than it is.
@@ -51,9 +55,10 @@ def compute_excursions(df: pl.DataFrame, horizon: int = DEFAULT_HORIZON) -> pl.D
     frame.
 
     Requires columns: open, high, low, close, natr_14. Rows whose forward
-    window is incomplete get null labels (resolvable=False), as do rows with a
-    null or non-positive natr_14 — a bracket cannot be sized off a missing
-    volatility estimate.
+    window is incomplete — including windows that contain a single null high
+    or low — get null labels (resolvable=False), as do rows with a null or
+    non-positive natr_14 — a bracket cannot be sized off a missing volatility
+    estimate.
     """
     for col in ("high", "low", "close", "natr_14"):
         if col not in df.columns:
@@ -72,11 +77,23 @@ def compute_excursions(df: pl.DataFrame, horizon: int = DEFAULT_HORIZON) -> pl.D
         win_high = np.lib.stride_tricks.sliding_window_view(fwd_high, horizon)
         fmin = np.full(n, np.nan)
         fmax = np.full(n, np.nan)
-        fmin[: n - horizon] = np.nanmin(win_low[: n - horizon], axis=1)
-        fmax[: n - horizon] = np.nanmax(win_high[: n - horizon], axis=1)
+        # A window may extend past the tail padding only via the
+        # index-bounded slice below, but a NaN *inside* low/high (a gap bar)
+        # must poison every window containing it — otherwise nanmin/nanmax
+        # quietly compute the excursion from a shortened window and the row
+        # looks resolvable.
+        win_ok = np.full(n, False)
+        m = n - horizon  # slice [:m] covers exactly the all-resolvable rows
+        win_ok[:m] = (
+            np.isfinite(win_low[:m]).all(axis=1)
+            & np.isfinite(win_high[:m]).all(axis=1)
+        )
+        fmin[:m] = np.where(win_ok[:m], np.min(win_low[:m], axis=1), np.nan)
+        fmax[:m] = np.where(win_ok[:m], np.max(win_high[:m], axis=1), np.nan)
     else:
         fmin = np.full(n, np.nan)
         fmax = np.full(n, np.nan)
+        win_ok = np.zeros(n, dtype=bool)
 
     atr_abs = close * natr / 100.0
     with np.errstate(invalid="ignore"):
@@ -87,8 +104,7 @@ def compute_excursions(df: pl.DataFrame, horizon: int = DEFAULT_HORIZON) -> pl.D
         (np.arange(n) + horizon <= n - 1)
         & np.isfinite(atr_abs)
         & (atr_abs > 0)
-        & np.isfinite(fmin)
-        & np.isfinite(fmax)
+        & win_ok
     )
     mae = np.where(resolvable, mae, np.nan)
     mfe = np.where(resolvable, mfe, np.nan)

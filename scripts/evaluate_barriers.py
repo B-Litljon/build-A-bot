@@ -19,8 +19,10 @@ a verdict, and exits 0 (pass) / 2 (fail) in the retrainer's convention.
 
 Glossary:
     folds -- expanding walk-forward slices (3 folds, matching the retrainer's
-        discipline); each fold trains on the past and scores the slice after
-        it, never the reverse.
+        discipline) over the pooled, globally timestamp-sorted frame; each
+        fold trains on the past and scores the slice after it, never the
+        reverse. Excursion labels are computed per symbol BEFORE pooling, so
+        a forward window never crosses a symbol boundary.
     static_baseline -- the incumbent 2.0x/4.0x NATR constants scored as
         constant quantile predictors in pinball units.
     coverage -- fraction of labelled bars whose realised MAE stayed at or
@@ -86,20 +88,24 @@ def main() -> int:
         granularity=15,
         cache_dir=Path("analysis_cache/strategy_matrix"),
     )
-    tagged = pl.concat(
-        [prepare_tagged_frame(df, sym) for sym, df in frames.items()],
+    tagged_by_symbol = [prepare_tagged_frame(df, sym) for sym, df in frames.items()]
+    # Excursion labels are computed PER SYMBOL and then pooled. Computing them
+    # on the vertically-concatenated frame lets the last `horizon` bars of one
+    # symbol's block look forward into the next symbol's bars — a cross-symbol
+    # label leak the old single-frame path had.
+    labelled = pl.concat(
+        [compute_excursions(df, horizon=DEFAULT_HORIZON) for df in tagged_by_symbol],
         how="vertical_relaxed",
     )
-    labelled = compute_excursions(tagged, horizon=DEFAULT_HORIZON).filter(
-        pl.col("resolvable")
-    )
-    # One pooled frame: folds walk chronology, symbols share the frame. The
-    # excursion labels are per-symbol by construction (walk never crosses a
-    # symbol boundary because symbols are contiguous blocks — assert that).
+    labelled = labelled.filter(pl.col("resolvable")).sort("timestamp", "symbol")
+
+    # One pooled frame: folds walk chronology. Symbols are only pooled AFTER
+    # labelling, and the global timestamp sort makes "expanding" mean
+    # chronological, not block-order — the per-symbol row indices interleave
+    # in time, so a raw row-index fold would train on the future of pairs
+    # whose blocks end later.
     syms = labelled["symbol"].to_numpy()
-    boundaries = np.where(syms[1:] != syms[:-1])[0]
-    print(f"rows: {labelled.height}  symbols: {sorted(set(syms))}  "
-          f"symbol blocks: {len(boundaries) + 1}")
+    print(f"rows: {labelled.height}  symbols: {sorted(set(syms))}")
 
     ok = _augment(labelled).with_columns(
         pl.col("ppo").fill_nan(None).forward_fill()
@@ -108,7 +114,11 @@ def main() -> int:
     )
     n = ok.height
     folds = expanding_folds(n)
-    print(f"scoring {n} labelled rows over {len(folds)} expanding folds\n")
+    ts = ok["timestamp"].to_numpy()
+    assert (np.diff(ts.astype("datetime64[us]").astype(np.int64)) >= 0).all(), \
+        "pooled frame must be globally timestamp-ordered for folds to be chronological"
+    print(f"scoring {n} labelled rows over {len(folds)} expanding folds "
+          f"({ts[0]} -> {ts[-1]})\n")
 
     all_pass = True
     y_mae = ok["mae_natr"].to_numpy()
@@ -125,7 +135,7 @@ def main() -> int:
         q = np.array([p.q_mae for p in preds])
         y = test["mae_natr"].to_numpy()
         learned_pl = pinball_loss(y, q, TAU_MAE)
-        static_pl = static_baseline_loss(y, None, sl_mult=2.0, tau=TAU_MAE)
+        static_pl = static_baseline_loss(y, sl_mult=2.0, tau=TAU_MAE)
         coverage = float((y <= q).mean())
         beat = learned_pl < static_pl
         covered = coverage >= COVERAGE_FLOOR

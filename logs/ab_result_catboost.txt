@@ -1,0 +1,15 @@
+family=catboost
+  gate_passed=False  reasons=['Fold 3 PF point estimate 2.0000 on 10 trades, but 95% lower bound 0.5722 < 1.2 — the most recent regime cannot prove it beats break-even', 'Pooled fold PF 95% lower bound 0.2227 < 1.2 (evidence: 10 wins / 56 trades across 3 folds)']
+  mean_brier=0.2837  mean_ev=+0.824031
+  pooled PF lb=0.2227 (wins=10/trades=56)
+  fold3  PF lb=0.5722
+  angel bar=0.3137 devil bar(F3 calibration froze into report)
+  fold1: brier=0.1797 ev=+1.372093 win=0.791 trades=43 macro_wins=4
+  fold2: brier=0.4401 ev=-0.000000 win=0.333 trades=3 macro_wins=1
+  fold3: brier=0.2312 ev=+1.100000 win=0.700 trades=10 macro_wins=5
+  band 0.20-0.30: win=0.133 n=15
+  band 0.30-0.35: win=0.226 n=31
+  band 0.35-0.40: win=0.143 n=7
+  band 0.40-0.50: win=0.000 n=3
+  band 0.50-1.01: win=nan n=0
+  band >=0.40: win=0.000 n=3

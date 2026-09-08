@@ -17,9 +17,13 @@ finding (2026-08-24, reproduced 2026-09-08) shows the fixed multiple stops out
 a constant multiple is proportionally wrong. A conditional quantile widens the
 stop exactly where adverse excursion fat-tails and keeps the target honest.
 
-Monotonicity is enforced on volatility features: higher natr_14/vol_rel must
-produce wider (not narrower) barriers, in both quantiles, by construction —
-the estimator refuses to fit otherwise.
+Monotonicity on volatility features is enforced by AUDIT, not construction:
+LightGBM's quantile objective rejects monotone_constraints outright ("Cannot
+use ``monotone_constraints`` in quantile objective"), so the fitted model is
+checked on the natr_14/vol_rel decile ladder at fit time and the estimator
+raises rather than return a geometry where higher volatility yields a tighter
+excursion quantile. The no-lightgbm binned fallback is monotone by
+construction instead (bin ladder is isotonised at fit).
 
 Glossary:
     DEFAULT_TAU_MAE / DEFAULT_TAU_MFE -- the stop-side and target-side
@@ -38,6 +42,13 @@ Glossary:
     rr_floor -- minimum implied reward:risk for a BarrierOutput to be
         tradeable. Enforced at predict time (outputs below it are flagged,
         not hidden) so the pre-trade veto in RiskManager sees honest numbers.
+    _AUDIT_TOL_ATR -- materiality floor of the fit-time monotonicity audit,
+        in ATR units. A response curve may wiggle below its running peak by
+        up to this much before the fit is refused; brackets quantize far
+        coarser, so smaller dips are untradeable noise.
+    used_lightgbm_ -- set by fit(): True when the LightGBM path was fitted
+        and audited, False when the estimator degraded to the binned
+        fallback. Telemetry for which backend produced the served geometry.
 """
 
 from dataclasses import dataclass
@@ -51,6 +62,12 @@ from ml.barriers.labels import DEFAULT_HORIZON
 DEFAULT_TAU_MAE = 0.95
 DEFAULT_TAU_MFE = 0.50
 DEFAULT_RR_FLOOR = 2.0
+
+# Materiality floor for the monotonicity audit: a fitted model is refused only
+# if its stop/target response to rising volatility dips by more than this many
+# ATRs below the running peak. Set well above bracket price quantization noise
+# but far below the 73%-stop-out kind of inversion the audit exists to catch.
+_AUDIT_TOL_ATR = 0.05
 
 # Volatility features whose conditional effect on excursion size is monotone
 # increasing by construction — the model cannot learn "more volatile bars get
@@ -96,6 +113,9 @@ class BarrierEstimator:
         self.feature_names_in_: List[str] = list(feature_cols)
         self._model_mae = None
         self._model_mfe = None
+        # Set by fit(): True when the LightGBM path was used, False when the
+        # estimator degraded to the binned fallback (no lightgbm installed).
+        self.used_lightgbm_: Optional[bool] = None
 
     def fit(
         self,
@@ -187,9 +207,64 @@ class BarrierEstimator:
             }
             model = lgb.LGBMRegressor(**params)
             model.fit(X, y, sample_weight=w)
+            # LightGBM explicitly rejects monotone_constraints under the
+            # quantile objective ("Cannot use ``monotone_constraints`` in
+            # quantile objective"). Enforcement-by-construction is unavailable
+            # there, so the constraint is enforced by AUDIT instead: the
+            # fitted model's response on the natr_14 ladder must not drop
+            # materially below its running peak, and this estimator refuses
+            # to return it otherwise. Binned fallback is monotone by
+            # construction.
+            self._audit_monotone(model, X)
+            self.used_lightgbm_ = True
             return model
         except ImportError:
+            self.used_lightgbm_ = False
             return self._fit_binned_fallback(X, y, tau)
+
+    def _monotone_constraints(self):
+        """
+        Retained for introspection/tests: the +1/0/… vector the LightGBM path
+        WOULD pass if the quantile objective accepted monotone_constraints.
+        The quantile objective does not, so this vector is informational only —
+        enforcement happens in ``_audit_monotone``.
+        """
+        vec = [1 if c in MONOTONE_INCREASING else 0 for c in self.feature_cols]
+        return vec if any(vec) else None
+
+    def _audit_monotone(self, model, X):
+        """
+        Refuse a fitted model whose response to rising volatility is a tighter
+        excursion quantile. Sweeps each MONOTONE_INCREASING feature over its
+        observed decile ladder with all other features held at their medians,
+        and raises when predictions drop materially below the running peak.
+
+        "Materially" = more than ``_AUDIT_TOL_ATR`` of one ATR across the
+        whole ladder. Smaller wiggles are noise on plateaus (LightGBM quantile
+        fits can drift a few hundredths of an ATR on a flat relationship) and
+        carry no tradeable meaning — bracket prices quantize far coarser than
+        that. A genuine inversion (higher natr -> tighter stop, the failure
+        mode from the 2026-08 calibration finding) is far larger than the
+        tolerance and is refused.
+        """
+        med = np.nanmedian(X, axis=0)
+        for name in MONOTONE_INCREASING:
+            if name not in self.feature_cols:
+                continue
+            idx = self.feature_cols.index(name)
+            col = X[:, idx]
+            ladder = np.nanquantile(col, np.linspace(0.05, 0.95, 19))
+            probe = np.repeat(med[None, :], len(ladder), axis=0)
+            probe[:, idx] = ladder
+            preds = np.asarray(model.predict(probe), dtype=float)
+            peak = np.maximum.accumulate(preds)
+            if (preds < peak - _AUDIT_TOL_ATR).any():
+                raise ValueError(
+                    f"barrier fit violated monotonicity on '{name}': rising "
+                    f"volatility produced a tighter quantile by more than "
+                    f"{_AUDIT_TOL_ATR} ATR — refit or drop the feature before "
+                    f"this geometry reaches a bracket."
+                )
 
     def _predict_quantile(self, model, X, tau):
         if model is None:
@@ -204,8 +279,15 @@ class BarrierEstimator:
     def _fit_binned_fallback(self, X, y, tau):
         """
         No-lightgbm fallback: empirical tau-quantile of y within natr_14
-        quartile bins. Causal (bin edges come from the training frame only),
-        monotone by construction, and honest about being coarse.
+        quartile bins. Causal (bin edges come from the training frame only)
+        and honest about being coarse.
+
+        Raw per-bin quantiles are NOT monotone — adjacent bins can invert on
+        sampling noise, which is exactly the "more volatile bars get tighter
+        stops" failure the monotone constraint exists to prevent. The bin
+        ladder is therefore forced isotone with maximum.accumulate; empty
+        leading bins seed from the global quantile so the ladder always has
+        four rungs.
         """
         natr_idx = self.feature_cols.index("natr_14")
         natr = X[:, natr_idx]
@@ -214,23 +296,32 @@ class BarrierEstimator:
         qs = {}
         for b in np.unique(bins):
             qs[b] = float(np.nanquantile(y[bins == b], tau))
-        median_natr = float(np.nanmedian(natr))
-        scale = qs.get(int(np.digitize(median_natr, edges)), np.nanmedian(y))
+        global_q = float(np.nanquantile(y, tau))
+
+        # Dense ladder over all 4 bins; forward-fill empty bins from the
+        # previous rung (or the global quantile before the first real rung).
+        rung = global_q
+        ladder = []
+        for b in range(len(edges) + 1):
+            rung = qs.get(b, rung)
+            ladder.append(rung)
+        ladder = np.maximum.accumulate(np.asarray(ladder, dtype=float))
 
         def predict(Xnew):
             b = np.digitize(Xnew[:, natr_idx], edges)
-            return np.array([qs.get(x, scale) for x in b])
+            return ladder[b]
 
         return {"predict": predict}
 
 
 def static_baseline_loss(
-    y: np.ndarray, atr_abs: np.ndarray, sl_mult: float, tau: float
+    y: np.ndarray, sl_mult: float, tau: float
 ) -> float:
     """
     Pinball loss of the incumbent static multiple (2.0x SL etc.) treated as a
     constant quantile predictor in NATR space — the number the learned
     estimator must beat on every fold and the holdout for Phase 1 promotion.
+    The constant is already in NATR units, so no ATR vector is needed.
     """
     from ml.barriers.labels import pinball_loss
 

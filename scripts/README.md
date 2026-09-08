@@ -177,6 +177,20 @@ model never saw, and manufactures drift that was never there.
   `execution.risk_manager`.
 - **Writes:** `feature_stats.json` into the given model dir.
 
+### `run_catboost_ab.py`
+Stage-2 A/B: retrains the Angel/Devil pair twice — once per `MODEL_FAMILY`
+(`lightgbm` incumbent, `catboost` candidate) — on an identical holdout-carved,
+per-symbol-labelled frame, so the estimator family is the only variable that
+changes. Nothing is written under `models/`; a promoted result would need a
+separate, deliberate step. Exit 0 = CatBoost strictly beat the incumbent on
+every promotion-bar metric; exit 2 = incumbent stands.
+
+- **Imports from repo:** `core.retrainer` (`make_classifier`, `MODEL_FAMILY`,
+  `validate_candidate`), `data.factory`.
+- **Reads:** bars via the provider (cache-backed). **Writes:** two CSVs
+  (`logs/ab_result_<family>.txt`) and two OOS ledger parquets
+  (`logs/ab_ledger_<family>.parquet`).
+
 ---
 
 ## 3. Factory launchers

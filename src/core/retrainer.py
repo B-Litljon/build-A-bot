@@ -252,6 +252,17 @@ Glossary:
         the artifacts listed above.
     Exit codes -- 0 promoted, 1 execution error, 2 trained but rejected. Note
         that 2 is not a failure of this script; it means the gate did its job.
+    MODEL_FAMILY -- which estimator class refit_models/validate_candidate build:
+        "lightgbm" (default, incumbent) or "catboost" (Stage-2 A/B candidate).
+        Override with the env var MODEL_FAMILY directly (no RETRAIN_ prefix,
+        unlike the rest of this module's env knobs).
+    make_classifier -- returns an unfitted Angel/Devil classifier for the
+        active MODEL_FAMILY; every LGBMClassifier(**params) construction site
+        routes through it so the family is a single seam, not four.
+    _catboost_params -- translates a LightGBM param dict into CatBoost's
+        vocabulary (iterations/depth/min_data_in_leaf/rsm/random_seed),
+        dropping LightGBM-only keys by name and intersecting monotone
+        constraints with the features actually present.
 """
 
 from __future__ import annotations
@@ -510,6 +521,96 @@ def get_hyperparameters(asset_class: str) -> Tuple[dict, dict]:
 
 # Fallback constants for backward compatibility
 ANGEL_PARAMS, DEVIL_PARAMS = get_hyperparameters("equities")
+
+
+# ─── Trainer family seam (Stage 2 CatBoost experiment) ──────────────────────
+# MODEL_FAMILY selects the estimator class behind refit_models/validate_candidate.
+# LightGBM is the incumbent; the CatBoost arm is the Stage-2 A/B candidate ordered
+# boosting with monotone constraints where LightGBM's objective would not take
+# them. The interface both sides satisfy is identical: fit(X, y,
+# sample_weight=w), predict_proba(X)[:,1]. The served artifact hot-reload path in
+# MLStrategy unpickles whatever object lands there, so a promoted CatBoost model
+# only requires catboost importable at inference time (it is, in the venv).
+#
+# The CatBoost arm translates LightGBM's parameter vocabulary rather than
+# duplicating a parallel param block: one variable changed, the family. Anything
+# CatBoost has no analogue for is dropped explicitly below so the mapping is
+# auditable (never silently lost).
+MODEL_FAMILY = os.environ.get("MODEL_FAMILY", "lightgbm").strip().lower()
+
+# Ordered boosting must never see subsample < 1.0 — Bayesian bootstrap is the
+# only mode Ordered supports, and subsample is not meaningful there. These keys
+# have no CatBoost analogue and are dropped in translation, by name, so the
+# audit trail says what changed.
+_CATBOOST_DROPPED_KEYS = {
+    "objective",          # CatBoost infers Logloss for binary labels
+    "num_leaves",         # oblivious trees use symmetric depth, no leaf cap
+    "class_weight",       # forex path already None; equities "balanced" is
+                          # a data-cook, not the variable under test
+    "deterministic",      # CatBoost reproducibility comes from random_seed
+    "force_row_wise",     # LightGBM histogram-ordering knob, N/A
+    "subsample_freq",     # LightGBM bagging schedule, N/A
+    "n_jobs",             # translated to thread_count
+}
+
+
+def _catboost_params(params: dict, feature_cols: List[str]) -> dict:
+    """
+    Translate a LightGBM Angel/Devil param dict into CatBoost's vocabulary.
+
+    Mappings:
+      n_estimators      -> iterations
+      num_leaves/max_depth -> depth (oblivious trees take one depth)
+      min_child_samples -> min_data_in_leaf
+      subsample         -> dropped on Ordered boosting (Bayesian bootstrap
+                           governs averaging; subsample is invalid there)
+      colsample_bytree  -> rsm
+      random_state      -> random_seed
+      verbose/n_jobs    -> verbose/thread_count
+
+    Monotone constraints (the point of the change): cost_ratio is
+    monotone-DECREASING on acceptance probability — higher spread cost must
+    never buy a higher score. Constraints are intersected with
+    ``feature_cols``: cost_ratio exists only when the spread table is on, and
+    CatBoost hard-errors on a constraint naming a column that is not present
+    ("Unknown feature name: cost_ratio").
+    """
+    iterations = params.get("n_estimators", 100)
+    depth = min(params.get("max_depth", 6), 16)
+    l2 = None  # CatBoost default l2_leaf_reg=3 is fine; not an LGBM param.
+    _MONO_BY_NAME = {"cost_ratio": -1}
+    monotone = {c: _MONO_BY_NAME[c] for c in feature_cols if c in _MONO_BY_NAME}
+    out = {
+        "iterations": iterations,
+        "learning_rate": params.get("learning_rate", 0.05),
+        "depth": depth,
+        "min_data_in_leaf": params.get("min_child_samples", 50),
+        "rsm": params.get("colsample_bytree", 0.8),
+        "boosting_type": "Ordered",
+        "random_seed": params.get("random_state", 42),
+        "monotone_constraints": monotone,
+        "thread_count": -1,
+        "verbose": 0,
+        "allow_writing_files": False,
+    }
+    if l2 is not None:
+        out["l2_leaf_reg"] = l2
+    # subsample is valid on Plain only; Ordered forbids it. Dropped by name.
+    dropped = sorted(
+        (set(params) | {"subsample"}) & (_CATBOOST_DROPPED_KEYS | {"subsample"})
+    )
+    if dropped:
+        logger.info(f"CatBoost param translation dropped LGBM-only keys: {dropped}")
+    return out
+
+
+def make_classifier(params: dict, feature_cols: List[str]):
+    """Return an unfitted Angel/Devil classifier of the active MODEL_FAMILY."""
+    if MODEL_FAMILY == "catboost":
+        from catboost import CatBoostClassifier
+
+        return CatBoostClassifier(**_catboost_params(params, feature_cols))
+    return lgb.LGBMClassifier(**params)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1511,10 +1612,13 @@ def refit_models(
     # STEP 1: Train the Angel (Primary Model - Direction)
     # ═══════════════════════════════════════════════════════════════════
     logger.info("\n[Step 1/4] Training Angel model (Direction)...")
-    angel_model = lgb.LGBMClassifier(**a_params)
+    angel_model = make_classifier(a_params, feature_cols)
     df_base = pl.DataFrame(X_base, schema=feature_cols).to_pandas()
     angel_model.fit(df_base, y_angel, sample_weight=sample_weights)
-    logger.info(f"✓ Angel model trained on {len(feature_cols)} features")
+    logger.info(
+        f"✓ Angel model trained on {len(feature_cols)} features "
+        f"(family={MODEL_FAMILY})"
+    )
 
     # ═══════════════════════════════════════════════════════════════════
     # STEP 2: Generate Out-Of-Fold Meta-Features (Angel's Probabilities)
@@ -1550,14 +1654,20 @@ def refit_models(
 
         for fold_train_idx, fold_val_idx in tss.split(X_base):
             fold_weights = sample_weights[fold_train_idx]
-            fold_angel = lgb.LGBMClassifier(**a_params)
+            fold_angel = make_classifier(a_params, feature_cols)
+            df_fold_train = pl.DataFrame(
+                X_base[fold_train_idx], schema=feature_cols
+            ).to_pandas()
+            df_fold_val = pl.DataFrame(
+                X_base[fold_val_idx], schema=feature_cols
+            ).to_pandas()
             fold_angel.fit(
-                X_base[fold_train_idx],
+                df_fold_train,
                 y_angel[fold_train_idx],
                 sample_weight=fold_weights,
             )
             angel_probs_oof[fold_val_idx] = fold_angel.predict_proba(
-                X_base[fold_val_idx]
+                df_fold_val
             )[:, 1]
 
         # Fill train-only head (first ~1/n_splits rows never appear in val)
@@ -1565,14 +1675,14 @@ def refit_models(
         head_missing = np.isnan(angel_probs_oof)
         if head_missing.sum() > 0:
             first_train_idx, _ = next(iter(tss.split(X_base)))
-            head_angel = lgb.LGBMClassifier(**a_params)
+            head_angel = make_classifier(a_params, feature_cols)
             head_angel.fit(
-                X_base[first_train_idx],
+                pl.DataFrame(X_base[first_train_idx], schema=feature_cols).to_pandas(),
                 y_angel[first_train_idx],
                 sample_weight=sample_weights[first_train_idx],
             )
             angel_probs_oof[head_missing] = head_angel.predict_proba(
-                X_base[head_missing]
+                pl.DataFrame(X_base[head_missing], schema=feature_cols).to_pandas()
             )[:, 1]
             logger.info(
                 f"  Head fill: {head_missing.sum()} train-only rows scored by "
@@ -1679,7 +1789,7 @@ def refit_models(
         )
     d_params_fit = {**d_params, "min_child_samples": devil_min_child}
 
-    devil_model = lgb.LGBMClassifier(**d_params_fit)
+    devil_model = make_classifier(d_params_fit, devil_features)
     df_devil = pl.DataFrame(X_devil, schema=devil_features).to_pandas()
     devil_model.fit(df_devil, y_devil_train, sample_weight=devil_weights)
     logger.info(
@@ -1694,10 +1804,17 @@ def refit_models(
 
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
-        angel_acc = angel_model.score(X_base, y_angel, sample_weight=sample_weights)
-        devil_acc = devil_model.score(
-            X_devil, y_devil_train, sample_weight=devil_weights
-        )
+        # CatBoost's score() takes no sample_weight; its training-accuracy line
+        # is summary telemetry only, so skip the weighting for that family
+        # rather than fake the metric.
+        if MODEL_FAMILY == "catboost":
+            angel_acc = angel_model.score(df_base, y_angel)
+            devil_acc = devil_model.score(df_devil, y_devil_train)
+        else:
+            angel_acc = angel_model.score(X_base, y_angel, sample_weight=sample_weights)
+            devil_acc = devil_model.score(
+                X_devil, y_devil_train, sample_weight=devil_weights
+            )
 
     logger.info(f"\n{'=' * 70}")
     logger.info("META-LABELING TRAINING COMPLETE")

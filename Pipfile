@@ -24,6 +24,7 @@ lightgbm = "*"
 simfin = "*"
 oandapyv20 = "*"
 hmmlearn = "*"
+catboost = "*"
 
 [dev-packages]
 pytest = "*"
