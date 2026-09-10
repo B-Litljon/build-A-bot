@@ -28,6 +28,7 @@ from __future__ import annotations
 import numpy as np
 import polars as pl
 import pytest
+from datetime import datetime, timezone
 
 from ml.feature_pipeline import FeaturePipeline
 from ml.features.v3_features import V3BaseFeatures, V3CostFeatures
@@ -170,6 +171,58 @@ class TestVetoMaskAsymmetry:
             alpha_table={"XAU_USD": profile.spread_atr_alpha},
         )
         np.testing.assert_array_equal(flat, tabled_at_flat)
+
+
+class TestGateCMirror:
+    """The training-side chop mask must veto the same NY-rollover bars the
+    live Gate C drops (added 2026-09-09; previously the mask had no Gate C and
+    the Devil trained on entries live never executes)."""
+
+    def _mask_with_only_gate_c(self, df):
+        from src.core.retrainer import _compute_chop_veto_mask
+        from src.execution.risk_manager import RiskProfile
+
+        profile = RiskProfile.for_asset_class("forex")
+        return _compute_chop_veto_mask(df, profile, sl_mult=1.0)
+
+    def _frame(self, timestamps):
+        n = len(timestamps)
+        return pl.DataFrame(
+            {
+                "timestamp": timestamps,
+                "symbol": ["GBP_JPY"] * n,
+                "close": [150.0] * n,
+                "natr_14": [0.3] * n,
+            }
+        )
+
+    def test_winter_blackout_bars_vetoed(self, monkeypatch):
+        monkeypatch.setenv("RISK_SPREAD_GATE_ENABLED", "0")
+        monkeypatch.setenv("RISK_REGIME_GATE_ENABLED", "0")
+        df = self._frame(
+            [
+                datetime(2026, 1, 13, 20, 0, tzinfo=timezone.utc),   # 15:00 NY — before
+                datetime(2026, 1, 13, 22, 0, tzinfo=timezone.utc),   # 17:00 NY — INSIDE
+                datetime(2026, 1, 13, 22, 30, tzinfo=timezone.utc),  # 17:30 NY — end exclusive
+                datetime(2026, 1, 13, 23, 0, tzinfo=timezone.utc),   # 18:00 NY — after
+            ]
+        )
+        veto = self._mask_with_only_gate_c(df)
+        np.testing.assert_array_equal(veto, [False, True, False, False])
+
+    def test_summer_blackout_tracks_dst(self, monkeypatch):
+        monkeypatch.setenv("RISK_SPREAD_GATE_ENABLED", "0")
+        monkeypatch.setenv("RISK_REGIME_GATE_ENABLED", "0")
+        # Aug 18 is EDT (UTC-4): 16:55 NY == 20:55 UTC.
+        df = self._frame(
+            [
+                datetime(2026, 8, 18, 20, 0, tzinfo=timezone.utc),   # 16:00 NY — before
+                datetime(2026, 8, 18, 21, 0, tzinfo=timezone.utc),   # 17:00 NY — INSIDE
+                datetime(2026, 8, 18, 21, 30, tzinfo=timezone.utc),  # 17:30 NY — end exclusive
+            ]
+        )
+        veto = self._mask_with_only_gate_c(df)
+        np.testing.assert_array_equal(veto, [False, True, False])
 
 
 class TestCleanDataInterplay:

@@ -182,6 +182,8 @@ class OandaMarketProvider(MarketDataProvider):
 
         # Liveness state (C3 hardening)
         self._last_stream_msg: Optional[float] = None  # time.monotonic()
+        self._last_price_msg: Optional[float] = None  # PRICE msgs only
+        self._stream_down_since: Optional[float] = None  # set in run_stream's finally
         self._active_stream_req: Optional[v20_pricing.PricingStream] = None
 
         # Per-symbol tick accumulator: symbol → bar state dict
@@ -241,9 +243,13 @@ class OandaMarketProvider(MarketDataProvider):
             state = self._tick_bars.get(instrument)
 
             if state is None or state["epoch"] != bar_epoch:
-                if state is not None:
-                    self._flush_bar(instrument, state)
-                self._tick_bars[instrument] = {
+                # Build the new state BEFORE flushing the old one. If
+                # _flush_bar raises (e.g. the loop is closing and the
+                # call_soon_threadsafe future rejects), the old code path
+                # never stored the new state, so _tick_bars kept the old
+                # epoch and every later tick re-triggered the failing flush —
+                # the instrument was wedged out of the bar pipeline for good.
+                new_state = {
                     "epoch": bar_epoch,
                     "bar_start": bar_start,
                     "open": mid,
@@ -255,6 +261,9 @@ class OandaMarketProvider(MarketDataProvider):
                     # live vol_rel vs. the training distribution.
                     "volume": 1,
                 }
+                if state is not None:
+                    self._flush_bar(instrument, state)
+                self._tick_bars[instrument] = new_state
             else:
                 state["high"] = max(state["high"], mid)
                 state["low"] = min(state["low"], mid)
@@ -444,17 +453,23 @@ class OandaMarketProvider(MarketDataProvider):
                 # Any message — PRICE or HEARTBEAT — proves the stream is
                 # alive; track it for the orchestrator's liveness watchdog.
                 self._last_stream_msg = time.monotonic()
+                self._stream_down_since = None  # we are up
                 if self._stop_event.is_set():
                     break
                 if msg.get("type") == "PRICE":
+                    self._last_price_msg = time.monotonic()
                     self._handle_tick(msg)
         except KeyboardInterrupt:
             logger.info("OandaMarketProvider stream stopped by user.")
         except StreamTerminated as e:
             logger.warning("OandaMarketProvider stream terminated: %s", e)
         finally:
-            # Stream is down — stale-age is meaningless until it restarts.
+            # Stream is down — the message-age is meaningless until it
+            # restarts, but the DOWN age must keep counting: that is what
+            # lets the orchestrator flatten during an outage that REST
+            # cannot repair either (see stream_down_seconds).
             self._last_stream_msg = None
+            self._stream_down_since = time.monotonic()
             self._active_stream_req = None
 
     @property
@@ -467,6 +482,40 @@ class OandaMarketProvider(MarketDataProvider):
         if last is None:
             return None
         return time.monotonic() - last
+
+    @property
+    def seconds_since_last_price(self) -> Optional[float]:
+        """
+        Age of the most recent PRICE message, or None before the first one.
+
+        Added 2026-09-09: heartbeats prove the CONNECTION is alive, not that
+        prices are moving. The software stops run on prices, so the liveness
+        watchdog must measure price silence, not message silence — an
+        OANDA-side "connection alive, prices missing" condition used to keep
+        this age at ~0 forever and the flatten could never fire.
+        """
+        last = self._last_price_msg
+        if last is None:
+            return None
+        return time.monotonic() - last
+
+    @property
+    def stream_down_seconds(self) -> Optional[float]:
+        """
+        Seconds since the stream THREAD exited, or None while it has never
+        run (or is currently running).
+
+        Added 2026-09-09: the old liveness check read `seconds_since_last_message`
+        and returned on None — which is exactly the state during every real
+        outage, because run_stream's finally nulls the age. That made the
+        flatten backstop unreachable precisely when it mattered (disconnect
+        + REST down ⇒ backoff loop forever, no ticks, no alert, watchdog
+        sees a live process). This age stays defined across the outage.
+        """
+        down = self._stream_down_since
+        if down is None:
+            return None
+        return time.monotonic() - down
 
     def force_disconnect(self, reason: str = "forced disconnect") -> None:
         """

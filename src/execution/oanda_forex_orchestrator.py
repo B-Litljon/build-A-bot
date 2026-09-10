@@ -323,6 +323,13 @@ class OandaForexOrchestrator:
             os.getenv("OANDA_RECONNECT_HEALTHY_SECONDS", "120")
         )
 
+        # History prime retry (2026-09-09). The provider returns EMPTY for
+        # any REST error, and an empty prime after a reconnect clears the
+        # buffers — silently trading nothing for a whole warm-up window.
+        # Bounded retries with backoff turn a transient blip into a repair.
+        self._prime_attempts = int(os.getenv("OANDA_PRIME_ATTEMPTS", "3"))
+        self._prime_backoff = float(os.getenv("OANDA_PRIME_BACKOFF", "2"))
+
         # Position state: symbol -> {entry, sl, tp, units, state}
         self._positions: Dict[str, dict] = {}
         self._positions_lock = threading.Lock()
@@ -451,6 +458,9 @@ class OandaForexOrchestrator:
             os.getenv("OANDA_STREAM_STALE_SECONDS", "60")
         )
         self._liveness_task: Optional[asyncio.Task] = None
+        # One-shot alert per liveness incident (the probe runs every 10s and
+        # an hours-long outage must not spam Discord). Re-armed when healthy.
+        self._liveness_alert_fired = False
 
     # ── notifications ─────────────────────────────────────────────────
 
@@ -821,7 +831,7 @@ class OandaForexOrchestrator:
         last_error: Optional[Exception] = None
         for attempt in range(1, self._close_max_attempts + 1):
             try:
-                await loop.run_in_executor(
+                closed = await loop.run_in_executor(
                     None, self._order_manager.close_position, symbol
                 )
             except Exception as e:  # OrderCloseError or executor failure
@@ -832,6 +842,21 @@ class OandaForexOrchestrator:
                     attempt,
                     self._close_max_attempts,
                     e,
+                )
+                if attempt < self._close_max_attempts:
+                    await asyncio.sleep(2 ** (attempt - 1))
+                continue
+
+            # close_position now returns True only when the broker has been
+            # VERIFIED flat (2026-09-09). False means "verified still open"
+            # (partial fill) — retry rather than popping the record.
+            if not closed:
+                logger.warning(
+                    "[%s] Watchdog close attempt %d/%d: broker verified "
+                    "still open (partial fill?) — retrying",
+                    symbol,
+                    attempt,
+                    self._close_max_attempts,
                 )
                 if attempt < self._close_max_attempts:
                     await asyncio.sleep(2 ** (attempt - 1))
@@ -1090,7 +1115,25 @@ class OandaForexOrchestrator:
 
     async def _on_bar(self, bar: dict) -> None:
         """Process a completed bar: update buffer, generate signal, trade."""
+        # Shutdown guard: stop_stream() flushes the part-built bar after
+        # _flatten_all has snapshotted the positions it will close. Accepting
+        # that bar here could submit a NEW entry that resolves after the
+        # flatten and exits the process unwatched. Never evaluate during
+        # shutdown.
+        if self._shutdown_event.is_set():
+            return
+
         symbol = bar["symbol"]
+
+        # Ignore bars for instruments outside the configured basket: the
+        # regime-NATR state is keyed by normalized basket symbol
+        # (_to_oanda_symbol), and feeding an unknown instrument in would
+        # raise KeyError inside the unawaited loop future, silently dropping
+        # the bar (and wedging nothing visibly). The basket itself is stored
+        # raw (may be slash-form from the constructor), so test membership
+        # against the normalized keys actually used everywhere else.
+        if _to_oanda_symbol(symbol) not in self._regime_natr:
+            return
 
         # ── history/stream seam: drop overlap and partial seam bar ──
         last_ts = self._last_hist_ts.get(symbol)
@@ -1390,6 +1433,34 @@ class OandaForexOrchestrator:
         # so the tick watchdog cannot fire on its stale SL/TP mid-submit.
         reversing = False
         with self._positions_lock:
+            # Post-exit cooldown re-check (2026-09-09): the earlier cooldown
+            # decision read an `existing` snapshot from the first lock block.
+            # If a stop-out landed in between (the tick watchdog races bar
+            # processing), the position record is now gone but `existing` was
+            # non-None, so the earlier check skipped the cooldown — and the
+            # symbol could re-enter on the very bar that stopped it out, the
+            # exact 2026-07-30 NZD_JPY double-loss this guard exists for.
+            existing_now = self._positions.get(symbol)
+            if existing_now is None and existing is not None:
+                remaining = self._cooldown_remaining(symbol)
+                if remaining > 0:
+                    self._cooldown_rejections += 1
+                    logger.info(
+                        "[%s] Entry blocked by post-exit cooldown (stop-out "
+                        "landed mid-evaluation) — %.0fs left (%d blocked so far)",
+                        symbol,
+                        remaining,
+                        self._cooldown_rejections,
+                    )
+                    events.emit(
+                        "guard_block",
+                        sym=symbol,
+                        guard="cooldown",
+                        remaining_s=round(remaining, 1),
+                        total=self._cooldown_rejections,
+                    )
+                    return
+
             # Correlated-exposure cap, checked and RESERVED under one lock
             # acquisition so two same-bar entries cannot both pass it.
             conflict = self._exposure_conflict(symbol, target_units)
@@ -1506,6 +1577,41 @@ class OandaForexOrchestrator:
                 self._positions.pop(symbol, None)
                 self._pending_entries.pop(symbol, None)
             return
+        # Units verification (2026-09-09): the submit expressed a DELTA from
+        # the cached net, and a flatten racing this entry (close between the
+        # delta computation and the fill) leaves the broker at a different
+        # net than requested — e.g. +2× units on a flip. Recording that as a
+        # normal OPEN position would mis-track size and mis-reserve the
+        # exposure cap. Park it; the reconciler settles against the broker.
+        if actual_units != target_units:
+            logger.critical(
+                "[%s] Resulting net (%d) != requested target (%d) — a close "
+                "raced this entry. Parking ENTRY_UNRECONCILED for the "
+                "reconciler instead of recording a wrong-sized position.",
+                symbol,
+                actual_units,
+                target_units,
+            )
+            self._park_unverified_entry(
+                symbol, signal, target_units, sl_dist, tp_dist,
+            )
+            return
+
+        # ── re-anchor brackets on the REAL fill (2026-09-09) ────────────
+        # The bracket was computed from the signal's bar-close price. On
+        # catch-up/backfill entries the fill can be a full bar's move away,
+        # so anchoring the stop to a price that never traded can put it on
+        # the wrong side of the market — the exact case
+        # _reconcile_unverified_entries already fixes for parked entries.
+        # Preserve the approved DISTANCES; re-center them on the fill.
+        if avg_price and sl_dist is not None and tp_dist is not None:
+            if signal.direction == "long":
+                sl_price = avg_price - sl_dist
+                tp_price = avg_price + tp_dist
+            else:
+                sl_price = avg_price + sl_dist
+                tp_price = avg_price - tp_dist
+
         # Record the position and hand the exposure over to _positions in ONE
         # lock acquisition, so the symbol is never briefly invisible to a
         # concurrent cap check.
@@ -1614,9 +1720,15 @@ class OandaForexOrchestrator:
                 entry,
             )
             try:
-                await loop.run_in_executor(
+                closed = await loop.run_in_executor(
                     None, self._order_manager.close_position, norm_sym
                 )
+                if not closed:
+                    # Verified-still-open (partial fill): same as failure —
+                    # refuse to run unwatched.
+                    raise OrderCloseError(
+                        f"close_position({norm_sym}) verified still open"
+                    )
             except OrderCloseError as e:
                 raise RuntimeError(
                     f"[{norm_sym}] Boot reconciliation: failed to flatten "
@@ -1690,30 +1802,55 @@ class OandaForexOrchestrator:
         self._symbols = keep
 
     async def _prime_history(self) -> None:
-        """Prime bar buffers with historical REST data to bypass cold warm-up."""
+        """Prime bar buffers with historical REST data to bypass cold warm-up.
+
+        Never raises: a failed/empty prime for one symbol degrades to a
+        critical log (and catch-up can still repair a partial buffer), because
+        an exception here propagates through _stream_with_retry and kills the
+        reconnect loop permanently — a blind zombie the watchdog cannot see.
+        """
         for symbol in self._symbols:
             norm_sym = _to_oanda_symbol(symbol)
             gran_min = getattr(self._provider, "_stream_gran", 1)
             start = datetime.now(timezone.utc) - timedelta(days=5)
             end = datetime.now(timezone.utc)
 
-            try:
-                df = await asyncio.get_running_loop().run_in_executor(
-                    None,
-                    self._provider.get_historical_bars,
-                    symbol,
-                    gran_min,
-                    start,
-                    end,
-                )
-            except Exception as e:
-                logger.warning(
-                    "[%s] Historical bars fetch failed: %s", norm_sym, e
-                )
-                continue
+            df = None
+            last_err: Optional[Exception] = None
+            for attempt in range(self._prime_attempts):
+                try:
+                    df = await asyncio.get_running_loop().run_in_executor(
+                        None,
+                        self._provider.get_historical_bars,
+                        symbol,
+                        gran_min,
+                        start,
+                        end,
+                    )
+                    if df is not None and not df.is_empty():
+                        break
+                    last_err = None  # empty-but-not-raising is its own case
+                except Exception as e:
+                    last_err = e
+                    logger.warning(
+                        "[%s] Historical bars fetch failed (attempt %d/%d): %s",
+                        norm_sym, attempt + 1, self._prime_attempts, e,
+                    )
+                if attempt + 1 < self._prime_attempts:
+                    await asyncio.sleep(self._prime_backoff * (attempt + 1))
 
-            if df.is_empty():
-                logger.warning("[%s] Historical bars returned empty", norm_sym)
+            if df is None or df.is_empty():
+                # The provider returns EMPTY for API errors too, so this is
+                # indistinguishable from "no bars" — but after a reconnect
+                # the buffers were just cleared, so an empty prime means the
+                # symbol will trade nothing for the whole warm-up window
+                # while every liveness signal stays green. Log like it matters.
+                logger.critical(
+                    "[%s] PRIME FAILED after %d attempts (last error: %s) — "
+                    "buffer empty; symbol will be silent for ~%d bars "
+                    "(2.75 days at M15) unless catch-up repairs it",
+                    norm_sym, self._prime_attempts, last_err, self._warmup,
+                )
                 continue
 
             # Keep enough tail to both warm the strategy and fully seed the
@@ -1721,14 +1858,31 @@ class OandaForexOrchestrator:
             keep = max(self._warmup, self._regime_window) + self._natr_period + 5
             df = df.tail(keep)
 
-            hist_bars = []
-            for row in df.iter_rows(named=True):
-                if row["timestamp"].tzinfo is None:
-                    raise ValueError(
-                        f"[{norm_sym}] Historical bar at {row['timestamp']} "
-                        "is timezone-naive — seam dedup would misbehave"
-                    )
-                hist_bars.append({**row, "symbol": norm_sym})
+            try:
+                hist_bars = []
+                for row in df.iter_rows(named=True):
+                    if row["timestamp"].tzinfo is None:
+                        # Skip the symbol rather than raise: a raise here
+                        # escapes _stream_with_retry (which calls this
+                        # unguarded) and kills the reconnect loop for good.
+                        logger.critical(
+                            "[%s] PRIME ABORTED: historical bar at %s is "
+                            "timezone-naive — seam dedup would misbehave. "
+                            "Skipping symbol.",
+                            norm_sym, row["timestamp"],
+                        )
+                        hist_bars = []
+                        df = df.clear()
+                        break
+                    hist_bars.append({**row, "symbol": norm_sym})
+            except Exception as e:
+                logger.critical(
+                    "[%s] PRIME ABORTED while parsing bars: %s", norm_sym, e
+                )
+                continue
+
+            if df.is_empty():
+                continue
 
             self._bar_buffers[norm_sym].extend(hist_bars)
             self._seed_regime(norm_sym, df)
@@ -1884,38 +2038,126 @@ class OandaForexOrchestrator:
 
     async def _check_stream_liveness(self) -> None:
         """
-        One liveness probe: if the stream has delivered nothing (not even
-        heartbeats) for longer than the stale threshold, flatten exposure
-        and force a reconnect.
+        One liveness probe with two failure windows (2026-09-09):
+
+        1. Stream DOWN — the stream thread has exited. The old code returned
+           on ``age is None``, which is exactly the state during every real
+           outage (run_stream's finally nulls the age), so the flatten
+           backstop was unreachable precisely when it mattered: disconnect +
+           REST down meant a forever backoff loop with no ticks, no flatten,
+           no alert, and a watchdog that saw a live process. If positions
+           exist and the stream has been down past the threshold, flatten.
+        2. Stream up but PRICE-silent — heartbeats used to count as liveness,
+           so "connection alive, prices missing" could never flatten. The
+           stops run on prices; measure price silence.
 
         REST and the pricing stream are separate connections, so the
         flatten very likely still works even when the stream is wedged.
         """
-        age = self._provider.seconds_since_last_message
-        if age is None or age <= self._stream_stale_seconds:
-            return
-
-        logger.critical(
-            "Pricing stream stale: no message for %.0fs (threshold %.0fs) — "
-            "flattening exposure and forcing reconnect",
-            age,
-            self._stream_stale_seconds,
-        )
-        self._notify(
-            self._notifier.send_system_message,
-            message=(
-                f"🚨 Pricing stream stale for {age:.0f}s — flattening open "
-                "positions and forcing a reconnect (SL/TP enforcement is "
-                "software-only and was blind during the stall)."
-            ),
-        )
+        down_secs = self._provider.stream_down_seconds
+        price_age = self._provider.seconds_since_last_price
+        message_age = self._provider.seconds_since_last_message
 
         with self._positions_lock:
             has_positions = bool(self._positions)
+
+        trigger: Optional[str] = None
+        if down_secs is not None and down_secs > self._stream_stale_seconds:
+            trigger = (
+                f"Pricing stream DOWN for {down_secs:.0f}s (threshold "
+                f"{self._stream_stale_seconds:.0f}s)"
+            )
+        elif price_age is not None and price_age > self._stream_stale_seconds:
+            trigger = (
+                f"No PRICE for {price_age:.0f}s (threshold "
+                f"{self._stream_stale_seconds:.0f}s) — stream alive but silent"
+            )
+        elif message_age is not None and message_age > self._stream_stale_seconds:
+            # Legacy window (pre-price-tracking providers): total silence
+            # while the thread is up.
+            trigger = (
+                f"Pricing stream stale: no message for {message_age:.0f}s "
+                f"(threshold {self._stream_stale_seconds:.0f}s)"
+            )
+
+        if trigger is None:
+            # Healthy: re-arm the one-shot alert for the next incident.
+            self._liveness_alert_fired = False
+            return
+
+        logger.critical(
+            "%s — %s", trigger,
+            "flattening exposure and forcing reconnect"
+            if has_positions else "no positions held; forcing reconnect",
+        )
+        if not self._liveness_alert_fired:
+            # One alert per incident — the liveness loop ticks every 10s and
+            # an hours-long outage must not spam the notification channel.
+            self._liveness_alert_fired = True
+            self._notify(
+                self._notifier.send_system_message,
+                message=(
+                    f"🚨 {trigger} — "
+                    + (
+                        "flattening open positions (SL/TP enforcement is "
+                        "software-only and was blind during the outage)."
+                        if has_positions
+                        else "no positions held; forcing a reconnect."
+                    )
+                ),
+            )
+
         if has_positions:
             await self._flatten_all()
 
         self._provider.force_disconnect("liveness watchdog: stream stale")
+
+    async def _retry_failed_closes(self) -> None:
+        """Retry CLOSE_FAILED positions every liveness pass (2026-09-09).
+
+        A failed stop-exit used to be terminal for the whole run: the
+        position stayed open at the broker with no SL/TP enforcement for the
+        remaining life of the process (days, on a soak) while the bot kept
+        trading other symbols. One ~30s OANDA blip during a breach was
+        enough. Now every 10s liveness pass re-attempts the verified close;
+        success pops the record and marks the exit like any other close.
+        """
+        with self._positions_lock:
+            failed_syms = [
+                s for s, p in self._positions.items()
+                if p.get("state") == "CLOSE_FAILED"
+            ]
+        for sym in failed_syms:
+            try:
+                closed = await asyncio.get_running_loop().run_in_executor(
+                    None, self._order_manager.close_position, sym
+                )
+            except Exception as e:
+                logger.error(
+                    "[%s] CLOSE_FAILED retry attempt failed: %s", sym, e
+                )
+                continue
+            if closed:
+                with self._positions_lock:
+                    snap = self._positions.pop(sym, {})
+                self._mark_exit(sym)
+                logger.info(
+                    "[%s] CLOSE_FAILED position recovered — broker verified flat",
+                    sym,
+                )
+                units = snap.get("units", 0)
+                events.emit(
+                    "exit",
+                    sym=sym,
+                    units=units,
+                    dir="long" if units > 0 else "short",
+                    entry=snap.get("entry"),
+                    sl=snap.get("sl"),
+                    tp=snap.get("tp"),
+                    exit_price=None,
+                    hit_level=None,
+                    reason="close_failed_retry",
+                )
 
     async def _liveness_watchdog(self) -> None:
         """Periodic stream-liveness checks until shutdown."""
@@ -1935,6 +2177,10 @@ class OandaForexOrchestrator:
                 logger.error(
                     "Unverified-entry reconcile failed: %s", e, exc_info=True
                 )
+            try:
+                await self._retry_failed_closes()
+            except Exception as e:
+                logger.error("CLOSE_FAILED retry pass failed: %s", e, exc_info=True)
 
     async def run(self) -> None:
         """Start the orchestrator loop."""
@@ -2022,7 +2268,23 @@ class OandaForexOrchestrator:
                 self._stream_task.cancel()
                 try:
                     await self._stream_task
-                except asyncio.CancelledError:
+                except (asyncio.CancelledError, Exception):
+                    pass
+            except Exception as e:
+                # The stream task died with an exception (e.g. an unguarded
+                # prime failure in an older build). Do NOT let it propagate:
+                # flatten below is the last safety net for open positions,
+                # and skipping it on a teardown error is how a stopped bot
+                # leaves a live position unwatched.
+                logger.error(
+                    "Stream task raised during shutdown (%s) — continuing "
+                    "to flatten",
+                    e,
+                )
+                self._stream_task.cancel()
+                try:
+                    await self._stream_task
+                except (asyncio.CancelledError, Exception):
                     pass
 
         if self._flatten_on_exit:
@@ -2031,34 +2293,51 @@ class OandaForexOrchestrator:
         logger.info("OandaForexOrchestrator shutdown complete.")
 
     async def _flatten_all(self) -> None:
-        """Close all open positions on exit."""
-        with self._positions_lock:
-            symbols = list(self._positions.keys())
-            # Copy the bracket facts out before the close: a flatten is a
-            # real exit and its event record has to describe the whole trade,
-            # not just name the instrument.
-            snapshots = {s: dict(p) for s, p in self._positions.items()}
+        """Close all open positions on exit.
 
-        if not symbols:
+        2026-09-09: only records whose close was VERIFIED flat are cleared.
+        Failures (and verified-still-open partials) are parked CLOSE_FAILED
+        instead of deleted — the old unconditional ``_positions.clear()``
+        deleted the tracking record of a position that was still open at the
+        broker, leaving nothing watching it while the bot kept trading (or,
+        on shutdown, nothing at all). ENTRY_UNRECONCILED records stay parked
+        for the reconciler, and symbols with an in-flight entry are skipped:
+        closing the old position mid-delta could double the fill.
+        """
+        with self._positions_lock:
+            pending = set(self._pending_entries.keys())
+            targets = [
+                (sym, dict(p))
+                for sym, p in self._positions.items()
+                if p.get("state") != "ENTRY_UNRECONCILED" and sym not in pending
+            ]
+
+        if not targets:
             return
 
-        logger.info("Flattening %d position(s) on exit", len(symbols))
+        logger.info("Flattening %d position(s) on exit", len(targets))
 
         tasks = [
             asyncio.get_running_loop().run_in_executor(
                 None, self._order_manager.close_position, sym
             )
-            for sym in symbols
+            for sym, _snap in targets
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         failed: List[str] = []
-        for sym, result in zip(symbols, results):
-            if isinstance(result, Exception):
+        for (sym, snap), result in zip(targets, results):
+            if isinstance(result, Exception) or result is False:
                 failed.append(sym)
+                # Park, never clear: the position may still be open at the
+                # broker and its record is the only thing tracking it.
+                with self._positions_lock:
+                    current = self._positions.get(sym)
+                    if current is not None:
+                        current["state"] = "CLOSE_FAILED"
                 logger.critical(
                     "[%s] Flatten close failed on exit — position may "
-                    "remain open at broker: %s",
+                    "remain open at broker (record parked CLOSE_FAILED): %s",
                     sym,
                     result,
                 )
@@ -2066,9 +2345,10 @@ class OandaForexOrchestrator:
                 # Also reached by the liveness watchdog mid-run, where the
                 # process keeps trading: a flatten is a real exit and starts
                 # the cooldown like any other.
+                with self._positions_lock:
+                    self._positions.pop(sym, None)
                 self._mark_exit(sym)
                 logger.info("[%s] Flattened on exit", sym)
-                snap = snapshots.get(sym, {})
                 flat_units = snap.get("units", 0)
                 events.emit(
                     "exit",
@@ -2093,6 +2373,3 @@ class OandaForexOrchestrator:
                 )
             except Exception as e:
                 logger.error("Failed to send flatten-failure alert: %s", e)
-
-        with self._positions_lock:
-            self._positions.clear()

@@ -35,8 +35,10 @@ WorkingDirectory=/mnt/storage/mystuf/development/build-A-bot
 # multiples, so a model trained on one bracket and served under another is
 # train/serve skew. As of 2026-08-08 the tree runs 2.0x/4.0x
 # (RiskProfile.for_asset_class("forex")) and the matching model is
-# models/forex_m15_wide. The older models/forex_m15 was trained on 1.0x/2.0x
-# and MUST NOT be served against the current tree.
+# models/forex_m15_wide. The 1.0x/2.0x-era models/forex_m15 no longer exists on
+# disk; the live danger is COPYING an old (or differently-bracketed) pair INTO
+# forex_m15_wide — the bracket check in MLStrategy._validate_metadata
+# (sl_atr_multiplier/tp_atr_multiplier vs RiskProfile) now raises on that.
 Environment=OANDA_MODEL_DIR=models/forex_m15_wide
 Environment=SOAK_GRANULARITY=15
 

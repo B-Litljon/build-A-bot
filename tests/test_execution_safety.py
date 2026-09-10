@@ -26,7 +26,7 @@ sys.path.insert(0, str(project_root / "src"))
 sys.path.insert(0, str(project_root)) # for scripts
 
 from scripts.portfolio_orchestrator import execute_rebalance
-from src.execution.oanda_order_manager import OandaOrderManager
+from src.execution.oanda_order_manager import OandaOrderManager, OrderCloseError
 
 class TestExecutionSafety(unittest.TestCase):
 
@@ -71,7 +71,12 @@ class TestExecutionSafety(unittest.TestCase):
 
     @patch("oandapyV20.API")
     def test_oanda_close_position_fill_parsing(self, mock_api):
-        """Fix 1.7: Verify units_filled parsing in close_position."""
+        """Fix 1.7: Verify units_filled parsing in close_position.
+
+        Verification-first contract (2026-09-09): True is only returned once
+        a follow-up sync confirms the broker is flat — a submitted-but-
+        unconfirmed close is a failure for tracking purposes.
+        """
         manager = OandaOrderManager(api_key="fake", account_id="123")
         
         # Setup initial state
@@ -87,7 +92,12 @@ class TestExecutionSafety(unittest.TestCase):
         mock_req = MagicMock()
         mock_req.response = mock_response
         
-        with patch("oandapyV20.endpoints.positions.PositionClose", return_value=mock_req):
+        # The follow-up sync (PositionDetails) verifies flat.
+        mock_details = MagicMock()
+        mock_details.response = {"position": {}}
+
+        with patch("oandapyV20.endpoints.positions.PositionClose", return_value=mock_req), \
+             patch("oandapyV20.endpoints.positions.PositionDetails", return_value=mock_details):
             success = manager.close_position("EUR_USD")
             
         self.assertTrue(success)
@@ -96,7 +106,11 @@ class TestExecutionSafety(unittest.TestCase):
 
     @patch("oandapyV20.API")
     def test_oanda_partial_fill_behavior(self, mock_api):
-        """Fix 1.7: Verify partial fill doesn't blindly zero state."""
+        """Fix 1.7: Verify partial fill doesn't blindly zero state.
+
+        Under the 2026-09-09 contract a partial fill is verified-still-open:
+        close_position returns False (callers retry the remainder) and the
+        net stays at the remaining units."""
         manager = OandaOrderManager(api_key="fake", account_id="123")
         
         # Setup initial state
@@ -111,13 +125,53 @@ class TestExecutionSafety(unittest.TestCase):
         
         mock_req = MagicMock()
         mock_req.response = mock_response
+
+        # The follow-up sync confirms 60 remain at the broker.
+        mock_details = MagicMock()
+        mock_details.response = {
+            "position": {"long": {"units": "60", "averagePrice": "1.10"}}
+        }
         
-        with patch("oandapyV20.endpoints.positions.PositionClose", return_value=mock_req):
+        with patch("oandapyV20.endpoints.positions.PositionClose", return_value=mock_req), \
+             patch("oandapyV20.endpoints.positions.PositionDetails", return_value=mock_details):
             success = manager.close_position("EUR_USD")
             
-        self.assertTrue(success)
+        self.assertFalse(success)  # verified still open — caller retries
         self.assertEqual(manager.get_net_position("EUR_USD"), 60)
         self.assertEqual(manager.get_average_entry_price("EUR_USD"), 1.10)
+
+    @patch("oandapyV20.API")
+    def test_close_unverifiable_sync_raises(self, mock_api):
+        """2026-09-09: a close whose follow-up sync fails must NOT read as
+        closed — raise so callers park/retry instead of popping records."""
+        manager = OandaOrderManager(api_key="fake", account_id="123")
+        manager._net_positions["EUR_USD"] = 100
+        manager._avg_entry_prices["EUR_USD"] = 1.10
+
+        mock_req = MagicMock()
+        mock_req.response = {
+            "longOrderFillTransaction": {"units": "-100"},
+            "shortOrderFillTransaction": None,
+        }
+        # PositionDetails raises inside sync_position -> sync returns False.
+        with patch("oandapyV20.endpoints.positions.PositionClose", return_value=mock_req), \
+             patch("oandapyV20.endpoints.positions.PositionDetails",
+                   side_effect=RuntimeError("sync down")):
+            with self.assertRaises(OrderCloseError):
+                manager.close_position("EUR_USD")
+
+    @patch("oandapyV20.API")
+    def test_cache_flat_but_unverifiable_raises(self, mock_api):
+        """2026-09-09: the cache-flat no-op must verify before no-op'ing —
+        after an ambiguous submit the cache can read 0 while the broker
+        holds the fill."""
+        manager = OandaOrderManager(api_key="fake", account_id="123")
+        manager._net_positions["EUR_USD"] = 0
+
+        with patch("oandapyV20.endpoints.positions.PositionDetails",
+                   side_effect=RuntimeError("sync down")):
+            with self.assertRaises(OrderCloseError):
+                manager.close_position("EUR_USD")
 
 if __name__ == "__main__":
     unittest.main()

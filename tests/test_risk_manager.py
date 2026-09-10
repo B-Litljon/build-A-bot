@@ -1,5 +1,6 @@
 import unittest
 import sys
+from datetime import datetime, time, timezone
 from pathlib import Path
 
 """
@@ -310,6 +311,65 @@ class TestProductionForexProfile(unittest.TestCase):
         p = RiskProfile.for_asset_class("equities")
         self.assertEqual(p.sl_atr_multiplier, 0.5)
         self.assertEqual(p.tp_atr_multiplier, 3.0)
+
+
+class TestGateCBlackout(unittest.TestCase):
+    """Gate C — the NY-rollover blackout window, DST-correct.
+
+    Added 2026-09-09: this was the one timezone-sensitive gate with zero test
+    coverage (a regression here silently admits trades into the 10x-spread
+    rollover window). Pins: the window tracks America/New_York across DST
+    (20:55Z summer / 21:55Z winter), start-inclusive/end-exclusive boundaries,
+    midnight wrap, naive-timestamp-assumed-UTC, disabled-profile no-op, and
+    the production default window.
+    """
+
+    def _rm(self, **overrides):
+        return RiskManager(
+            _forex_profile(blackout_start=time(16, 55), blackout_end=time(17, 30), **overrides)
+        )
+
+    def test_summer_window_edt(self):
+        """Aug 18 2026: NY on EDT (UTC-4) → 16:55 NY == 20:55 UTC."""
+        rm = self._rm()
+        self.assertTrue(rm._in_blackout(datetime(2026, 8, 18, 20, 55, tzinfo=timezone.utc)))  # start inclusive
+        self.assertTrue(rm._in_blackout(datetime(2026, 8, 18, 21, 0, tzinfo=timezone.utc)))
+        self.assertTrue(rm._in_blackout(datetime(2026, 8, 18, 21, 29, tzinfo=timezone.utc)))
+        self.assertFalse(rm._in_blackout(datetime(2026, 8, 18, 21, 30, tzinfo=timezone.utc)))  # end exclusive
+        self.assertFalse(rm._in_blackout(datetime(2026, 8, 18, 15, 0, tzinfo=timezone.utc)))
+
+    def test_winter_window_est(self):
+        """Jan 13 2026: NY on EST (UTC-5) → 16:55 NY == 21:55 UTC."""
+        rm = self._rm()
+        self.assertTrue(rm._in_blackout(datetime(2026, 1, 13, 21, 55, tzinfo=timezone.utc)))
+        self.assertTrue(rm._in_blackout(datetime(2026, 1, 13, 22, 29, tzinfo=timezone.utc)))
+        self.assertFalse(rm._in_blackout(datetime(2026, 1, 13, 22, 30, tzinfo=timezone.utc)))
+        # The summer edge must NOT read as in-window in winter: the window
+        # tracks NY local time, so it shifts an hour across DST.
+        self.assertFalse(rm._in_blackout(datetime(2026, 1, 13, 20, 55, tzinfo=timezone.utc)))
+
+    def test_naive_timestamp_assumed_utc(self):
+        rm = self._rm()
+        self.assertTrue(rm._in_blackout(datetime(2026, 8, 18, 20, 55)))
+        self.assertFalse(rm._in_blackout(datetime(2026, 8, 18, 21, 30)))
+
+    def test_disabled_profile_never_blackouts(self):
+        rm = RiskManager(_forex_profile(blackout_start=None, blackout_end=None))
+        self.assertFalse(rm._in_blackout(datetime(2026, 8, 18, 21, 0, tzinfo=timezone.utc)))
+
+    def test_midnight_wrap_window(self):
+        rm = RiskManager(
+            _forex_profile(blackout_start=time(23, 0), blackout_end=time(1, 0))
+        )
+        self.assertTrue(rm._in_blackout(datetime(2026, 8, 19, 3, 0, tzinfo=timezone.utc)))    # 23:00 NY
+        self.assertTrue(rm._in_blackout(datetime(2026, 8, 19, 4, 59, tzinfo=timezone.utc)))   # 00:59 NY
+        self.assertFalse(rm._in_blackout(datetime(2026, 8, 19, 5, 0, tzinfo=timezone.utc)))   # 01:00 NY
+        self.assertFalse(rm._in_blackout(datetime(2026, 8, 19, 16, 0, tzinfo=timezone.utc)))  # 12:00 NY
+
+    def test_production_profile_has_default_window(self):
+        p = RiskProfile.for_asset_class("forex")
+        self.assertEqual(p.blackout_start, time(16, 55))
+        self.assertEqual(p.blackout_end, time(17, 30))
 
 
 if __name__ == "__main__":

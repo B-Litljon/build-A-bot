@@ -211,7 +211,12 @@ behind it. *(`V3CostFeatures`)*
 (`max_notional_cap`), and floored at \$50 so no dust position is opened.
 
 **risk per trade** — 2% of account equity. Position size is derived from this
-and the stop distance, not set as a fixed quantity.
+and the stop distance, not set as a fixed quantity. ⚠️ **Not enforced on the
+live forex path** (verified 2026-09-09): `run_oanda.py` drives the OANDA
+orchestrator with a fixed `units_per_trade = 1000`
+(`oanda_forex_orchestrator.py:28-29`), and `RiskManager.calculate_quantity`
+(where the \$50 floor lives) is never called by it. The equity-derived sizing
+and the notional floor apply to the Alpaca/Factory paths only.
 
 ## The gates (the "chop filter")
 
@@ -307,8 +312,11 @@ pass a cap they jointly breach.
 
 ## Training
 
-**feature** — one input column the model sees. The live set is 22 columns, or 23
-with `cost_ratio`. *(`src/ml/features/v3_features.py`)*
+**feature** — one input column the model sees. As of the 2026-08-29 trim the
+served pair is **17 columns** (`BASE_FEATURE_COLS`; the Devil gets 18, +`angel_prob`).
+The 22/23-column count from earlier generations was cut to 17 when 5 features
+were dropped in the trim retrain — read `retrainer.BASE_FEATURE_COLS`, not this
+paragraph. *(`src/ml/features/v3_features.py`)*
 
 **target / label** — the "right answer" a model is trained to predict. Two
 exist here:

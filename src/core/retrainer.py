@@ -1187,12 +1187,12 @@ def _compute_chop_veto_mask(
     still sees the full contiguous price path (so this must run AFTER target
     generation, not before).
 
-    TODO(symmetry): Gate C (time-of-day blackout, ``RiskManager._in_blackout``)
-    is NOT yet mirrored here. Live drops NY-rollover signals (≈16:55–17:30 ET);
-    training still labels them. Add a vectorized blackout mask on
-    ``df["timestamp"]`` (converted to America/New_York) next retrain so training
-    matches live. Until then the model may train on a few un-executable rollover
-    entries (small population, but breaks strict live↔training symmetry).
+    Gate C (time-of-day blackout) is mirrored here since 2026-09-09: the same
+    America/New_York window as ``RiskManager._in_blackout`` (DST-correct,
+    start-inclusive / end-exclusive, midnight wrap), applied to the rows' UTC
+    timestamps (naive timestamps are assumed UTC, matching the live gate). The
+    live bot drops NY-rollover entries (≈16:55–17:30 ET); training now vetoes
+    the same bars instead of labelling un-executable rollover entries.
     """
     from numpy.lib.stride_tricks import sliding_window_view
 
@@ -1200,6 +1200,33 @@ def _compute_chop_veto_mask(
     veto = np.zeros(n_total, dtype=bool)
     if not _chop_filter_enabled() or n_total == 0:
         return veto
+
+    # Gate C (time-of-day blackout) — vectorized mirror of
+    # RiskManager._in_blackout, DST-correct via America/New_York conversion.
+    # Naive timestamps are assumed UTC (the live gate does the same).
+    if (
+        profile.time_gate_enabled
+        and profile.blackout_start is not None
+        and profile.blackout_end is not None
+        and "timestamp" in df.columns
+    ):
+        ts = df["timestamp"]
+        if getattr(ts.dtype, "time_zone", None) is None:
+            ts = ts.dt.replace_time_zone("UTC")
+        ny = ts.dt.convert_time_zone("America/New_York")
+        # .dt.hour() is Int8 — cast before multiplying or 22*3600 overflows.
+        secs = (
+            ny.dt.hour().cast(pl.Int64) * 3600
+            + ny.dt.minute().cast(pl.Int64) * 60
+            + ny.dt.second().cast(pl.Int64)
+        )
+        start_s = profile.blackout_start.hour * 3600 + profile.blackout_start.minute * 60
+        end_s = profile.blackout_end.hour * 3600 + profile.blackout_end.minute * 60
+        if start_s <= end_s:
+            gate_c = (secs >= start_s) & (secs < end_s)
+        else:
+            gate_c = (secs >= start_s) | (secs < end_s)  # window wraps midnight
+        veto |= gate_c.to_numpy()
 
     w = int(profile.regime_window)
     mins = int(profile.regime_min_samples)
@@ -1256,14 +1283,17 @@ def _compute_chop_veto_mask(
                 gate_a = (sl_mult * natr) < (k_eff * alpha * baseline)
             gate_a &= np.isfinite(baseline)
 
-        veto[idx] = gate_a | gate_b
+        # OR into the existing veto (Gate C may already have marked rows):
+        # assigning here would silently clobber the blackout mask.
+        veto[idx] |= gate_a | gate_b
         # Per-symbol diagnostics — critical when alpha_table is active: an
         # expensive instrument (GBP_NZD ~0.90) should thin dramatically.
         logger.info(
-            "  Chop veto [%s]: alpha=%.4f | gate_a=%d gate_b=%d | vetoed %d/%d (%.1f%%)",
+            "  Chop veto [%s]: alpha=%.4f | gate_a=%d gate_b=%d gate_c=%d | vetoed %d/%d (%.1f%%)",
             sym, alpha, int(gate_a.sum()), int(gate_b.sum()),
-            int((gate_a | gate_b).sum()), m,
-            100.0 * (gate_a | gate_b).mean() if m else 0.0,
+            int(veto[idx].sum() - (gate_a | gate_b).sum()),
+            int(veto[idx].sum()), m,
+            100.0 * veto[idx].mean() if m else 0.0,
         )
 
     return veto
@@ -1515,7 +1545,9 @@ def engineer_features_and_labels(
 
 
 def generate_time_decay_weights(
-    n_samples: int, decay_factor: float = 0.95
+    n_samples: int,
+    decay_factor: float = 0.95,
+    timestamps: Optional["pl.Series"] = None,
 ) -> np.ndarray:
     """
     Generate time-decay sample weights.
@@ -1523,18 +1555,34 @@ def generate_time_decay_weights(
     More recent samples get higher weights to prevent catastrophic forgetting.
     Weights decay exponentially from 1.0 (most recent) to 0.1 (oldest).
 
+    ``timestamps`` (2026-09-09): the training frame is symbol-blocked
+    (sorted ["symbol","timestamp"]), so row INDEX encodes basket position,
+    not recency — the old row-index weighting silently upweighted the
+    last-listed instruments (verified: symbol 0's newest bar got weight 0.1,
+    symbol N's newest got 1.0) and reordering RETRAIN_SYMBOLS changed the
+    model. When timestamps are passed, weight by dense rank of the timestamp
+    instead.
+
     Args:
         n_samples: Number of samples in dataset
         decay_factor: Decay rate per time step (default: 0.95)
+        timestamps: Optional polars Series of per-row timestamps
 
     Returns:
         NumPy array of sample weights
     """
-    # Generate exponential decay from oldest to newest
-    weights = np.power(decay_factor, np.arange(n_samples))
+    if timestamps is not None and n_samples > 0:
+        # Dense rank: 1..n in chronological order, ties share a rank.
+        ranks = timestamps.rank("dense").to_numpy().astype(float)
+    else:
+        ranks = np.arange(1, n_samples + 1, dtype=float)
 
-    # Reverse so newest has highest weight
-    weights = weights[::-1]
+    # Exponential decay from the newest rank down to the oldest.
+    weights = np.power(decay_factor, ranks.max() - ranks)
+
+    if weights.max() - weights.min() < 1e-12:
+        # Degenerate (all rows same rank / single sample): uniform weights.
+        return np.full(n_samples, 1.0)
 
     # Normalize to range [0.1, 1.0]
     weights = 0.1 + 0.9 * (weights - weights.min()) / (weights.max() - weights.min())
@@ -1602,8 +1650,12 @@ def refit_models(
         f"Devil target distribution: 0={np.sum(y_devil == 0)}, 1={np.sum(y_devil == 1)}"
     )
 
-    # Generate time-decay weights
-    sample_weights = generate_time_decay_weights(len(X_base))
+    # Generate time-decay weights — ranked by TIMESTAMP, not row index
+    # (the frame is symbol-blocked; see generate_time_decay_weights).
+    ts_col = df["timestamp"] if "timestamp" in df.columns else None
+    sample_weights = generate_time_decay_weights(
+        len(X_base), timestamps=ts_col
+    )
     logger.info(
         f"Time-decay weights: min={sample_weights.min():.3f}, max={sample_weights.max():.3f}"
     )
@@ -1643,50 +1695,62 @@ def refit_models(
     # Why TimeSeriesSplit: respects chronological ordering — each fold only
     # trains on past bars. KFold would let the Angel see future bars.
     #
+    # 2026-09-09 CRITICAL FIX: the frame is symbol-blocked (sorted
+    # ["symbol","timestamp"]), so row index is NOT a chronological axis —
+    # TimeSeriesSplit over raw indices made each val fold one or two WHOLE
+    # symbol blocks, and the "OOF" Angel probabilities for late-listed
+    # symbols came from models trained on OTHER symbols' full history
+    # INCLUDING dates after the scored row. On correlated FX pairs that is
+    # genuine future leakage into the Devil's key meta-feature AND into the
+    # threshold calibration. The split now runs on a chronological
+    # permutation and probabilities are written back to original indices.
+    #
     # n_splits=5: 5 expanding folds. Early folds → noisier Angel probs,
     # which is realistic (production Angel also starts uncertain).
 
     tss = TimeSeriesSplit(n_splits=5)
     angel_probs_oof = np.full(len(X_base), np.nan)
 
+    ts_vals = df["timestamp"].to_numpy()
+    perm = np.argsort(ts_vals, kind="stable")
+    X_perm = X_base[perm]
+    y_perm = y_angel[perm]
+    w_perm = sample_weights[perm]
+
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
 
-        for fold_train_idx, fold_val_idx in tss.split(X_base):
-            fold_weights = sample_weights[fold_train_idx]
+        for fold_train_idx, fold_val_idx in tss.split(X_perm):
+            fold_weights = w_perm[fold_train_idx]
             fold_angel = make_classifier(a_params, feature_cols)
-            df_fold_train = pl.DataFrame(
-                X_base[fold_train_idx], schema=feature_cols
-            ).to_pandas()
-            df_fold_val = pl.DataFrame(
-                X_base[fold_val_idx], schema=feature_cols
-            ).to_pandas()
             fold_angel.fit(
-                df_fold_train,
-                y_angel[fold_train_idx],
+                X_perm[fold_train_idx],
+                y_perm[fold_train_idx],
                 sample_weight=fold_weights,
             )
-            angel_probs_oof[fold_val_idx] = fold_angel.predict_proba(
-                df_fold_val
-            )[:, 1]
+            probs = fold_angel.predict_proba(X_perm[fold_val_idx])[:, 1]
+            angel_probs_oof[perm[fold_val_idx]] = probs
 
-        # Fill train-only head (first ~1/n_splits rows never appear in val)
-        # using a model trained solely on that window — no leakage from future.
+        # Fill train-only head (the EARLIEST rows never appear in val — in
+        # chronological space now, not basket space) using a model trained
+        # solely on that window. In-sample for the head itself, but no
+        # future leakage: the head is the oldest slice and its model has
+        # seen nothing newer.
         head_missing = np.isnan(angel_probs_oof)
         if head_missing.sum() > 0:
-            first_train_idx, _ = next(iter(tss.split(X_base)))
+            first_train_idx, _ = next(iter(tss.split(X_perm)))
             head_angel = make_classifier(a_params, feature_cols)
             head_angel.fit(
-                pl.DataFrame(X_base[first_train_idx], schema=feature_cols).to_pandas(),
-                y_angel[first_train_idx],
-                sample_weight=sample_weights[first_train_idx],
+                X_perm[first_train_idx],
+                y_perm[first_train_idx],
+                sample_weight=w_perm[first_train_idx],
             )
             angel_probs_oof[head_missing] = head_angel.predict_proba(
-                pl.DataFrame(X_base[head_missing], schema=feature_cols).to_pandas()
+                X_base[head_missing]
             )[:, 1]
             logger.info(
-                f"  Head fill: {head_missing.sum()} train-only rows scored by "
-                f"Fold-1 Angel (no leakage from future)"
+                f"  Head fill: {head_missing.sum()} earliest rows scored by "
+                f"Fold-1 Angel (in-sample for the head, no future leakage)"
             )
 
     # Add OOF angel_prob as a new column to the DataFrame
@@ -2204,8 +2268,6 @@ def _evaluate_holdout(
     approved_macro = proposed_devil_targets_macro[approved_mask]
 
     brier = float(brier_score_loss(approved_targets, approved_devil_probs))
-    survival_wr = float(approved_targets.mean()) if len(approved_targets) > 0 else 0.0
-    ev = float(survival_wr * (tp_mult / sl_mult) - (1.0 - survival_wr))
 
     macro_wins = int(approved_macro.sum())
     macro_losses = n_approved - macro_wins
@@ -2215,6 +2277,14 @@ def _evaluate_holdout(
         gross_profit / gross_loss if gross_loss > 0 else float("inf")
     )
     macro_wr = float(approved_macro.mean()) if n_approved > 0 else 0.0
+
+    # EV from the MACRO approval rate (2026-09-09): the old code multiplied
+    # the 5-bar SURVIVAL win rate by the 45-bar MACRO R:R — survival is not
+    # the complement of macro loss (a trade can survive 5 bars and still
+    # time out), so the value systematically overstated per-trade expectancy
+    # (the served artifact recorded 1.58 against a 0.0005 bar — the gate
+    # could not fail).
+    ev = float(macro_wr * (tp_mult / sl_mult) - (1.0 - macro_wr))
 
     return {
         "brier_score": brier,
@@ -2973,8 +3043,13 @@ def validate_candidate(
         # EV using ATR R-multiple: wins = +tp_mult R, losses = -sl_mult R
         # Where R = 1 unit of sl_mult ATR
         # EV = win_rate * (tp_mult / sl_mult) - (1 - win_rate) * 1
+        # EV from the MACRO win rate (2026-09-09) — the fold's own bracket
+        # outcome, not the 5-bar survival rate mapped through macro R:R.
+        macro_win_rate = (
+            fold_macro_wins / n_devil_approved if n_devil_approved > 0 else 0.0
+        )
         ev = float(
-            win_rate * (tp_mult / sl_mult) - (1.0 - win_rate)
+            macro_win_rate * (tp_mult / sl_mult) - (1.0 - macro_win_rate)
         )
 
         logger.info(
@@ -3323,31 +3398,49 @@ def save_models(
     devil_temp = model_dir / "devil_temp.pkl"
 
     # ═══════════════════════════════════════════════════════════════════
-    # ATOMIC WRITE: Angel Model
+    # TWO-PHASE ATOMIC WRITE (2026-09-09): dump BOTH pickles to temp files
+    # first, then os.replace back-to-back. The old order (replace Angel,
+    # THEN serialize Devil) left a window where a bar's hot-reload ingested
+    # a NEW Angel beside an OLD Devil — and if serializing the Devil failed
+    # (disk full, SIGKILL), the served pair stayed mixed until the next
+    # retrain. The live strategy's pair-seam stand-down tolerates the much
+    # smaller between-replaces gap.
     # ═══════════════════════════════════════════════════════════════════
     try:
         joblib.dump(angel_model, angel_temp)
         angel_size = angel_temp.stat().st_size / (1024 * 1024)
-        os.replace(angel_temp, angel_path)
-        logger.info(f"[ATOMIC] Angel model saved: {angel_path} ({angel_size:.1f} MB)")
-
     except Exception as e:
-        logger.error(f"[ATOMIC] Failed to save Angel model: {e}")
+        logger.error(f"[ATOMIC] Failed to serialize Angel model: {e}")
         if angel_temp.exists():
             angel_temp.unlink()
         raise
 
-    # ═══════════════════════════════════════════════════════════════════
-    # ATOMIC WRITE: Devil Model
-    # ═══════════════════════════════════════════════════════════════════
     try:
         joblib.dump(devil_model, devil_temp)
         devil_size = devil_temp.stat().st_size / (1024 * 1024)
+    except Exception as e:
+        logger.error(f"[ATOMIC] Failed to serialize Devil model: {e}")
+        if angel_temp.exists():
+            angel_temp.unlink()
+        if devil_temp.exists():
+            devil_temp.unlink()
+        raise
+
+    # Both serialized successfully — now the two replaces, back to back.
+    os.replace(angel_temp, angel_path)
+    logger.info(f"[ATOMIC] Angel model saved: {angel_path} ({angel_size:.1f} MB)")
+    try:
         os.replace(devil_temp, devil_path)
         logger.info(f"[ATOMIC] Devil model saved: {devil_path} ({devil_size:.1f} MB)")
-
     except Exception as e:
-        logger.error(f"[ATOMIC] Failed to save Devil model: {e}")
+        # Angel is already live but Devil is not: the live strategy's
+        # pair-seam stand-down refuses to score the mixed pair, so the
+        # window is guarded — log loudly rather than pretending all is well.
+        logger.error(
+            f"[ATOMIC] Angel replaced but Devil replace FAILED ({e}) — "
+            "live pair is mixed; the strategy will stand down until the "
+            "next retrain lands both."
+        )
         if devil_temp.exists():
             devil_temp.unlink()
         raise
@@ -3458,13 +3551,18 @@ def save_threshold(
     threshold_path = model_dir / "threshold.json"
 
     data = {
-        "devil_threshold": round(threshold, 4),
+        # Full precision on both bars: the Devil's training population and the
+        # bracket fit were conditioned on the exact tuned floats, and
+        # MLStrategy compares against this file. round(x, 4) here shifted the
+        # live Angel bar ~5e-5 looser than the population the pair was
+        # fitted for.
+        "devil_threshold": threshold,
         # Pin the Angel bar the pair was trained at: the Devil's training
         # population and the bracket fit are conditioned on it, so the live
         # strategy must run the model at this value (MLStrategy overrides
         # its default with this key when present).
-        "angel_threshold": round(angel_threshold, 4),
-        "updated_at": datetime.now().isoformat(),
+        "angel_threshold": angel_threshold,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
     }
 
     # Atomic write — same pattern as model serialisation
