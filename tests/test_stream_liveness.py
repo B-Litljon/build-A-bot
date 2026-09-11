@@ -1,7 +1,7 @@
 import asyncio
 import time
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 import sys
 from pathlib import Path
 
@@ -33,6 +33,10 @@ Glossary:
         one.
     test_reset_stop_clears_event -- the stop flag can be cleared so the stream
         can restart after a shutdown signal.
+    TestSeamBackfillStatusEmit -- bars recovered through the seam paths
+        (_backfill_seam_bar / _catch_up_missed_bars) must refresh
+        status.json, else a surviving reconnect reads as stale to the
+        watchdog. Including when evaluation itself raises.
 """
 
 # Add src to path
@@ -163,6 +167,113 @@ class TestStreamLiveness(unittest.TestCase):
 
         order_manager.close_position.assert_not_called()
         provider.force_disconnect.assert_not_called()
+
+
+class TestSeamBackfillStatusEmit(unittest.TestCase):
+    """2026-09-10 regression: bars recovered via the seam paths score while
+    the stream is DOWN, so they are the very bars that must refresh
+    status.json -- without an emit there, a surviving reconnect looks stale
+    to soak_watchdog.sh and the soak gets restarted mid-recovery."""
+
+    def _make_orchestrator(self):
+        provider = MagicMock()
+        provider._stream_gran = 15
+        strategy = MagicMock()
+        strategy.warmup_period = 3
+        strategy.generate_signals.return_value = None
+        order_manager = MagicMock()
+
+        orch = OandaForexOrchestrator(
+            symbols=["EUR/USD"],
+            provider=provider,
+            strategy=strategy,
+            order_manager=order_manager,
+            warmup_period=3,
+            flatten_on_exit=False,
+            notifier=MagicMock(),
+        )
+        return orch, provider
+
+    def _prime_buffer(self, orch, n=5):
+        """Fill EUR_USD's buffer with sealed historical bars ending in the
+        past, mirroring what _prime_history leaves behind."""
+        import datetime as _dt
+        now = _dt.datetime.now(_dt.timezone.utc)
+        for i in range(n):
+            ts = now - _dt.timedelta(minutes=15 * (n - i))
+            orch._bar_buffers["EUR_USD"] = orch._bar_buffers.get(
+                "EUR_USD", []
+            ) + [
+                {
+                    "symbol": "EUR_USD",
+                    "timestamp": ts,
+                    "open": 1.08, "high": 1.081, "low": 1.079,
+                    "close": 1.0805, "volume": 100,
+                    "complete": True,
+                }
+            ]
+
+    def _rest_frame_with(self, ts):
+        """A polars frame shaped like get_historical_bars' output,
+        containing exactly the bar the backfill is looking for."""
+        import polars as pl
+        return pl.DataFrame(
+            {
+                "timestamp": [ts],
+                "open": [1.0805], "high": [1.0815], "low": [1.0795],
+                "close": [1.081], "volume": [120],
+                "complete": [True],
+            }
+        )
+
+    def test_backfill_seam_bar_emits_status(self):
+        orch, provider = self._make_orchestrator()
+        self._prime_buffer(orch)
+        orch._seam_crossed["EUR_USD"] = False
+        import datetime as _dt
+        ts = _dt.datetime.now(_dt.timezone.utc)
+        provider.get_historical_bars = MagicMock(
+            return_value=self._rest_frame_with(ts)
+        )
+
+        with patch("src.execution.oanda_forex_orchestrator.events"
+                   ) as mock_events:
+            mock_events.write_status = MagicMock()
+            asyncio.run(orch._backfill_seam_bar("EUR_USD", ts))
+
+        mock_events.write_status.assert_called()
+
+    def test_backfill_seam_bar_emits_status_even_when_eval_raises(self):
+        """Telemetry must refresh even if evaluation blew up -- the watchdog
+        cares that bars are being PROCESSED, not that they traded."""
+        orch, provider = self._make_orchestrator()
+        self._prime_buffer(orch)
+        orch._seam_crossed["EUR_USD"] = False
+        orch._evaluate_and_trade = MagicMock(
+            side_effect=RuntimeError("boom")
+        )
+        import datetime as _dt
+        ts = _dt.datetime.now(_dt.timezone.utc)
+        provider.get_historical_bars = MagicMock(
+            return_value=self._rest_frame_with(ts)
+        )
+
+        with patch("src.execution.oanda_forex_orchestrator.events"
+                   ) as mock_events:
+            mock_events.write_status = MagicMock()
+            asyncio.run(orch._backfill_seam_bar("EUR_USD", ts))
+
+        mock_events.write_status.assert_called()
+
+    def test_catch_up_missed_bars_emits_status(self):
+        orch, provider = self._make_orchestrator()
+        self._prime_buffer(orch)
+        with patch("src.execution.oanda_forex_orchestrator.events"
+                   ) as mock_events:
+            mock_events.write_status = MagicMock()
+            asyncio.run(orch._catch_up_missed_bars())
+
+        mock_events.write_status.assert_called()
 
 
 class TestProviderLivenessState(unittest.TestCase):
