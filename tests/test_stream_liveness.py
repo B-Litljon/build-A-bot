@@ -64,10 +64,28 @@ class TestStreamLiveness(unittest.TestCase):
         )
         return orch, provider, order_manager
 
+    def _healthy(self, provider):
+        """Provider liveness attributes pinned to a healthy stream."""
+        provider.stream_down_seconds = None
+        provider.seconds_since_last_price = 3.0
+        provider.seconds_since_last_message = 3.0
+
+    def _stale_prices(self, provider, age=120.0):
+        """Stream up (thread alive) but no PRICE past the threshold."""
+        provider.stream_down_seconds = None
+        provider.seconds_since_last_price = age
+        provider.seconds_since_last_message = age
+
+    def _stream_down(self, provider, age=120.0):
+        """Stream thread exited `age` seconds ago (age None everywhere else)."""
+        provider.stream_down_seconds = age
+        provider.seconds_since_last_price = None
+        provider.seconds_since_last_message = None
+
     def test_stale_stream_flattens_and_reconnects(self):
         """Stale beyond threshold + open position -> flatten + disconnect."""
         orch, provider, order_manager = self._make_orchestrator()
-        provider.seconds_since_last_message = 120.0
+        self._stale_prices(provider)
         orch._positions["EUR_USD"] = {
             "entry": 1.085, "sl": 1.084, "tp": 1.086,
             "units": 1000, "state": "OPEN",
@@ -82,17 +100,52 @@ class TestStreamLiveness(unittest.TestCase):
     def test_stale_stream_no_positions_still_reconnects(self):
         """Stale with no exposure -> disconnect only, no close calls."""
         orch, provider, order_manager = self._make_orchestrator()
-        provider.seconds_since_last_message = 120.0
+        self._stale_prices(provider)
 
         asyncio.run(orch._check_stream_liveness())
 
         order_manager.close_position.assert_not_called()
         provider.force_disconnect.assert_called_once()
 
+    def test_stream_down_with_positions_flattens(self):
+        """2026-09-09: a DOWN stream (age None everywhere) with positions
+        must flatten. The old code returned on age None — the exact state
+        during every real outage — leaving the stop unwatched."""
+        orch, provider, order_manager = self._make_orchestrator()
+        self._stream_down(provider)
+        orch._positions["EUR_USD"] = {
+            "entry": 1.085, "sl": 1.084, "tp": 1.086,
+            "units": 1000, "state": "OPEN",
+        }
+
+        asyncio.run(orch._check_stream_liveness())
+
+        order_manager.close_position.assert_called_once_with("EUR_USD")
+        provider.force_disconnect.assert_called_once()
+        self.assertEqual(orch._positions, {})
+
+    def test_price_silence_while_heartbeats_flow_flattens(self):
+        """2026-09-09: heartbeats used to count as liveness, so 'connection
+        alive, prices missing' could never flatten. Prices are what the
+        stops run on."""
+        orch, provider, order_manager = self._make_orchestrator()
+        provider.stream_down_seconds = None
+        provider.seconds_since_last_price = 120.0   # prices stopped...
+        provider.seconds_since_last_message = 1.0   # ...heartbeats continue
+        orch._positions["EUR_USD"] = {
+            "entry": 1.085, "sl": 1.084, "tp": 1.086,
+            "units": 1000, "state": "OPEN",
+        }
+
+        asyncio.run(orch._check_stream_liveness())
+
+        order_manager.close_position.assert_called_once_with("EUR_USD")
+        provider.force_disconnect.assert_called_once()
+
     def test_fresh_stream_no_action(self):
         """Recent message -> no flatten, no disconnect."""
         orch, provider, order_manager = self._make_orchestrator()
-        provider.seconds_since_last_message = 3.0
+        self._healthy(provider)
 
         asyncio.run(orch._check_stream_liveness())
 
@@ -100,8 +153,10 @@ class TestStreamLiveness(unittest.TestCase):
         provider.force_disconnect.assert_not_called()
 
     def test_stream_not_running_no_action(self):
-        """No stream yet (age None) -> watchdog stays quiet."""
+        """No stream yet (all ages None, down_seconds None) -> watchdog quiet."""
         orch, provider, order_manager = self._make_orchestrator()
+        provider.stream_down_seconds = None
+        provider.seconds_since_last_price = None
         provider.seconds_since_last_message = None
 
         asyncio.run(orch._check_stream_liveness())

@@ -1289,29 +1289,19 @@ class LiveOrchestrator:
                     ]
                 )
 
-            # V3.3: 18-feature set (10 base + 4 HTF 5m + 4 microstructure)
-            ml_feature_names = [
-                "rsi_14",
-                "ppo",
-                "natr_14",
-                "bb_pct_b",
-                "bb_width_pct",
-                "price_sma50_ratio",
-                "log_return",
-                "hour_of_day",
-                "dist_sma50",
-                "vol_rel",
-                # V3.3: HTF features
-                "htf_rsi_14",
-                "htf_trend_agreement",
-                "htf_vol_rel",
-                "htf_bb_pct_b",
-                # Phase 5: Microstructure features
-                "range_coil_10",
-                "bar_body_pct",
-                "bar_upper_wick_pct",
-                "bar_lower_wick_pct",
-            ]
+            # Model-driven feature schema (fixed 2026-08-30): the served
+            # model's own feature_names_in_, via the strategy — never a
+            # hardcoded list again. The 18-name literal that used to sit here
+            # went stale when training dropped five dead features and added
+            # the session_* flags: fed to a 17-feature model, the select()
+            # below crashes every bar (loud, but a full outage of this path).
+            # MLStrategy refreshes feature_names on hot-reload, so a retrained
+            # artifact takes effect here with no edit.
+            # Caveat for any future revival of this path: the Angel bar below
+            # is the global ANGEL_THRESHOLD constant, not the artifact's
+            # pinned threshold.json value — see core/thresholds.py precedence
+            # (per-artifact calibrated bars since 2026-08-29).
+            ml_feature_names = list(self._strategy.feature_names)
 
             # Drop any rows containing Nulls, NaNs, or Infinities to prevent model crashes
             features_df = features_df.filter(

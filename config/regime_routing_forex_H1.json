@@ -1,0 +1,25 @@
+{
+  "_generated_by": "src/analysis/build_strategy_matrix.py",
+  "_generated_at": "2026-09-07T18:29:18.797625-07:00",
+  "_basket": [
+    "AUD_JPY",
+    "EUR_JPY",
+    "GBP_AUD",
+    "GBP_JPY",
+    "GBP_NZD",
+    "NZD_JPY"
+  ],
+  "_gates_applied": true,
+  "_significance_required": true,
+  "_min_cell_trades": 30,
+  "_bracket": "2.0x/4.0x/45bar",
+  "mixed_high": null,
+  "mixed_normal": null,
+  "trend_high": null,
+  "mixed_low": null,
+  "range_low": null,
+  "trend_low": null,
+  "trend_normal": null,
+  "range_high": null,
+  "range_normal": null
+}

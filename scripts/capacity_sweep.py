@@ -103,8 +103,9 @@ def sweep_one_window(pin: str) -> list:
     for label, overrides, drop in VARIANTS:
         feats = [c for c in cols if c not in drop]
         a_params, d_params = {**ap0, **overrides}, {**dp0, **overrides}
-        angel, devil, a_feats, d_feats = R.refit_models(
-            rem, feats, angel_params=a_params, devil_params=d_params
+        angel, devil, a_feats, d_feats, angel_thr = R.refit_models(
+            rem, feats, angel_params=a_params, devil_params=d_params,
+            sl_mult=sl, tp_mult=tp,
         )
         auc_in = roc_auc_score(
             rem["angel_target"].to_numpy(),
@@ -115,7 +116,8 @@ def sweep_one_window(pin: str) -> list:
             angel.predict_proba(hold.select(a_feats).to_pandas())[:, 1],
         )
         sc = R._evaluate_holdout(
-            hold, angel, devil, a_feats, d_feats, 0.66, sl_mult=sl, tp_mult=tp
+            hold, angel, devil, a_feats, d_feats, 0.66, sl_mult=sl, tp_mult=tp,
+            angel_threshold=angel_thr,
         )
         lb = (
             R._holdout_pf_lower_bound(sc["wins"], sc["trades"], sl, tp)

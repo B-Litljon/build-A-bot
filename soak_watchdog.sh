@@ -18,11 +18,10 @@
 #
 # Guards, in order:
 #   1. soak.off kill switch          -> do nothing
-#   2. soak already running          -> do nothing
-#   3. before first-launch gate      -> wait (Sun 2026-07-12 14:05 PT market open)
-#   4. weekend blackout              -> no cold starts Fri 14:00 - Sun 14:05 PT
+#   2. soak already running          -> staleness check, then do nothing
+#   3. weekend blackout              -> no cold starts Fri 14:00 - Sun 14:05 PT
 #                                       (forex closed; a RUNNING soak is left alone)
-#   5. crash-loop brake              -> at most one launch per 15 min
+#   4. crash-loop brake              -> at most one launch per 15 min
 #
 # Test knobs: WATCHDOG_NOW=<epoch> fakes the clock; DRY_RUN=1 logs the
 # decision instead of launching. `soak_watchdog.sh selftest` just logs a
@@ -44,6 +43,22 @@ export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 SYSTEMCTL=(systemctl --user)
 UNIT=soak.service
 
+# Staleness check (added 2026-09-09): pgrep proves the PROCESS is alive, not
+# that it is producing bars. A wedged event loop with open positions satisfies
+# pgrep forever while its software stops watch nothing — the worst failure
+# CLAUDE.md names. status.json is rewritten every M15 bar; older than
+# STALE_SECS means at least one bar was missed. Ticks are 5 min apart, so
+# STALE_TICKS consecutive stale ticks escalate to a restart (SIGTERM flattens,
+# boot reconcile adopts whatever the broker holds).
+STALE_SECS=${STALE_SECS:-1200}   # 20 min = one missed bar + buffer
+STALE_TICKS=${STALE_TICKS:-3}    # ~15 min of provable silence -> restart
+STALE_STATE="$REPO/logs/soak_watchdog_stale"
+NTFY_URL=${NTFY_URL:-http://127.0.0.1:8091/Reminders}
+ntfy() {
+  curl -sf -m 5 -H "Title: $1" -H "Priority: $2" -H "Tags: $3" \
+    -d "$4" "$NTFY_URL" >/dev/null 2>&1 || true
+}
+
 log() { echo "$(date '+%Y-%m-%dT%H:%M:%S') [watchdog] $*"; }
 
 if [ "${1:-}" = "selftest" ]; then
@@ -59,29 +74,61 @@ fi
 # 2. already running? (tight pattern: the venv python running run_oanda.py,
 #    so an editor or grep with the filename in its argv doesn't count)
 if pgrep -f 'bin/python -u run_oanda\.py' > /dev/null 2>&1; then
+  NOW="${WATCHDOG_NOW:-$(date +%s)}"
+  # Market-open test: skip staleness when the market is closed, when the run
+  # is too young to have written a bar, or when status.json is missing.
+  DOW=$(TZ=America/Los_Angeles date -d "@$NOW" +%u)
+  HHMM=$((10#$(TZ=America/Los_Angeles date -d "@$NOW" +%H%M)))
+  market_closed=0
+  { [ "$DOW" -eq 5 ] && [ "$HHMM" -ge 1400 ]; } || [ "$DOW" -eq 6 ] \
+    || { [ "$DOW" -eq 7 ] && [ "$HHMM" -lt 1405 ]; } && market_closed=1
+  if [ "$market_closed" -eq 0 ] && [ -f "$REPO/logs/status.json" ]; then
+    status_age=$(( NOW - $(stat -c %Y "$REPO/logs/status.json") ))
+    started=$(python3 -c "import json;print(json.load(open('$REPO/logs/status.json')).get('started',''))" 2>/dev/null || true)
+    start_epoch=$(date -d "$started" +%s 2>/dev/null || echo 0)
+    run_age=$(( NOW - start_epoch ))
+    # Younger than ~2 bars or older than STALE_SECS both matter: a young run
+    # has not had a bar to record yet; a stale one has stopped recording.
+    if [ "$status_age" -gt "$STALE_SECS" ] && [ "$run_age" -gt "$STALE_SECS" ]; then
+      ticks=$(( $(cat "$STALE_STATE" 2>/dev/null || echo 0) + 1 ))
+      echo "$ticks" > "$STALE_STATE"
+      log "STALE: status.json is ${status_age}s old (bar missed) — stale tick $ticks/$STALE_TICKS"
+      ntfy "soak wedge suspected" "high" "warning" \
+        "status.json ${status_age}s stale on tick $ticks/$STALE_TICKS"
+      if [ "$ticks" -ge "$STALE_TICKS" ]; then
+        log "STALE: $ticks consecutive stale ticks — restarting soak (SIGTERM flatten + boot reconcile)"
+        ntfy "soak restarting after wedge" "urgent" "rotating_light" \
+          "status.json stale for $ticks ticks; restarting $UNIT"
+        if [ "${DRY_RUN:-0}" = "1" ]; then
+          log "DRY_RUN=1 — would run: systemctl --user restart $UNIT"
+        else
+          "${SYSTEMCTL[@]}" restart "$UNIT"
+          rm -f "$STALE_STATE"
+        fi
+      fi
+    else
+      rm -f "$STALE_STATE"  # bars flowing again: reset the counter
+    fi
+  fi
   exit 0
 fi
 
 NOW="${WATCHDOG_NOW:-$(date +%s)}"
 
-# 3. don't launch before the scheduled Sunday relaunch (machine TZ is PT)
-NOT_BEFORE=$(date -d '2026-07-12 14:05' +%s)
-if [ "$NOW" -lt "$NOT_BEFORE" ]; then
-  exit 0
-fi
-
-# 4. weekend blackout — forex is closed Fri 14:00 PT -> Sun 14:00 PT (tracks
+# 3. weekend blackout — forex is closed Fri 14:00 PT -> Sun 14:00 PT (tracks
 #    5pm New York year-round since ET/PT shift DST together). Don't cold-start
-#    into a closed market; retry ticks land at Sun 14:05.
-DOW=$(date -d "@$NOW" +%u)              # 1=Mon .. 7=Sun
-HHMM=$((10#$(date -d "@$NOW" +%H%M)))
+#    into a closed market; retry ticks land at Sun 14:05. Computed in
+#    America/Los_Angeles so it stays correct if the machine TZ ever changes.
+DOW=$(TZ=America/Los_Angeles date -d "@$NOW" +%u)   # 1=Mon .. 7=Sun
+HHMM=$((10#$(TZ=America/Los_Angeles date -d "@$NOW" +%H%M)))
 if { [ "$DOW" -eq 5 ] && [ "$HHMM" -ge 1400 ]; } || [ "$DOW" -eq 6 ] \
    || { [ "$DOW" -eq 7 ] && [ "$HHMM" -lt 1405 ]; }; then
   exit 0
 fi
 
-# 5. crash-loop brake
-STATE=/tmp/soak_watchdog_last_launch
+# 4. crash-loop brake (state in logs/, not /tmp: tmpfs is wiped on reboot and
+#    a reboot mid-loop would otherwise re-arm the loop)
+STATE="$REPO/logs/soak_watchdog_last_launch"
 if [ -f "$STATE" ]; then
   LAST=$(cat "$STATE")
   if [ $((NOW - LAST)) -lt 900 ]; then
@@ -129,9 +176,9 @@ if ! "${SYSTEMCTL[@]}" start "$UNIT"; then
   log "LAUNCH FAILED — systemctl start $UNIT returned non-zero; try: systemctl --user status $UNIT"
   exit 0
 fi
-sleep 5
+sleep 15
 if pgrep -f 'bin/python -u run_oanda\.py' > /dev/null 2>&1; then
   log "launch OK — pid $(cat /tmp/soak.pid 2>/dev/null || echo '?'), log $(cat /tmp/soak_logpath 2>/dev/null || echo '?')"
 else
-  log "LAUNCH FAILED — no soak process 5s after start; check $(cat /tmp/soak_logpath 2>/dev/null || echo 'logs/soak_*.log') and journalctl --user -u $UNIT"
+  log "LAUNCH FAILED — no soak process 15s after start; check $(cat /tmp/soak_logpath 2>/dev/null || echo 'logs/soak_*.log') and journalctl --user -u $UNIT"
 fi

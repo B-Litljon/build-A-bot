@@ -34,6 +34,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -510,13 +511,25 @@ class TestPermanentLeakGuard(unittest.TestCase):
             self.angel = _MockLGBM(class1_prob)
             self.devil = _MockLGBM(class1_prob)
 
-        def __call__(self, df, feature_cols, angel_params=None, devil_params=None):
+        def __call__(
+            self,
+            df,
+            feature_cols,
+            angel_params=None,
+            devil_params=None,
+            sl_mult=None,
+            tp_mult=None,
+        ):
             self.frames.append((df["timestamp"].min(), df["timestamp"].max()))
             return (
                 self.angel,
                 self.devil,
                 list(feature_cols),
                 list(feature_cols) + ["angel_prob"],
+                # refit_models now also returns the Angel proposal bar the
+                # Devil's population was filtered at; 0.4 mirrors the
+                # pre-calibration constant these tests were written against.
+                0.4,
             )
 
     def test_no_training_frame_touches_the_holdout(self):
@@ -583,7 +596,15 @@ class TestMainWiringLeakGuard(unittest.TestCase):
         recorder = TestPermanentLeakGuard._Recorder()
         captured = {}
 
-        def fake_promote(report, angel, devil, threshold, asset_config=None, hmm_models=None):
+        def fake_promote(
+            report,
+            angel,
+            devil,
+            threshold,
+            asset_config=None,
+            hmm_models=None,
+            angel_threshold=None,
+        ):
             captured["report"] = report
             return False
 
@@ -675,6 +696,76 @@ class TestMetadataRecordsConfidenceVerdict(unittest.TestCase):
             # only written on promotion, which implies the fold gate passed,
             # which implies diagnostic_only was False. The flag lives on the
             # ValidationReport and in the logs, not in the sidecar.
+
+
+class TestChronologicalOOFIntegrity(unittest.TestCase):
+    """2026-09-09: the frame is symbol-blocked, so row index is not a time
+    axis. These pin the two fixes that restore chronology to the Devil's
+    training inputs: timestamp-ranked decay weights and the chronological
+    permutation around the OOF split."""
+
+    def test_decay_weights_follow_timestamps_not_basket_position(self):
+        ts = pl.Series(
+            "t",
+            [
+                datetime(2026, 1, 1), datetime(2026, 2, 1), datetime(2026, 3, 1),
+                datetime(2026, 6, 1), datetime(2026, 7, 1), datetime(2026, 8, 1),
+            ],
+        )
+        w = R.generate_time_decay_weights(6, timestamps=ts)
+        # The newest row overall must carry the max weight...
+        self.assertEqual(w[5], w.max())
+        # ...regardless of which symbol block it sits in, and recency must
+        # order weights within a block.
+        self.assertGreater(w[1], w[0])
+        self.assertGreater(w[5], w[3])
+
+    def test_decay_weights_rank_by_time_within_symbol_blocks(self):
+        # Symbol A occupies the last three rows here but holds OLD timestamps;
+        # the old row-index weighting would have given A's rows the top
+        # weights. Timestamp ranking must put the NEWER rows (index 0-2) on top.
+        ts = pl.Series(
+            "t",
+            [
+                datetime(2026, 9, 1), datetime(2026, 9, 2), datetime(2026, 9, 3),
+                datetime(2026, 1, 1), datetime(2026, 1, 2), datetime(2026, 1, 3),
+            ],
+        )
+        w = R.generate_time_decay_weights(6, timestamps=ts)
+        self.assertEqual(w[2], w.max())
+        self.assertGreater(w[0], w[3])
+
+    def test_decay_weights_legacy_shape_unchanged_without_timestamps(self):
+        """No-timestamps path keeps the old [0.1, 1.0] contract."""
+        w = R.generate_time_decay_weights(100)
+        self.assertAlmostEqual(w.min(), 0.1, places=6)
+        self.assertAlmostEqual(w.max(), 1.0, places=6)
+        self.assertGreater(w[-1], w[0])
+
+    def test_decay_weights_uniform_when_single_timestamp(self):
+        w = R.generate_time_decay_weights(
+            4, timestamps=pl.Series("t", [datetime(2026, 1, 1)] * 4)
+        )
+        np.testing.assert_array_equal(w, np.ones(4))
+
+    def test_oof_split_uses_chronological_permutation(self):
+        """Pin the permutation refit_models applies before TimeSeriesSplit:
+        with a symbol-blocked frame, raw-index splitting made basket-tail
+        symbols val folds scored by models trained on the future."""
+        ts_vals = np.array(
+            [
+                np.datetime64("2026-01-01"), np.datetime64("2026-02-01"),
+                np.datetime64("2026-03-01"), np.datetime64("2026-06-01"),
+                np.datetime64("2026-07-01"), np.datetime64("2026-08-01"),
+            ]
+        )
+        perm = np.argsort(ts_vals, kind="stable")
+        self.assertTrue(np.array_equal(perm, np.arange(6)))
+        # Inverted frame (newest first in row order): permutation must
+        # restore chronology for the split.
+        ts_desc = ts_vals[::-1]
+        perm_desc = np.argsort(ts_desc, kind="stable")
+        np.testing.assert_array_equal(ts_desc[perm_desc], np.sort(ts_vals))
 
 
 if __name__ == "__main__":

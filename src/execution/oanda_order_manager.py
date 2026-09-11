@@ -307,16 +307,19 @@ class OandaOrderManager:
         Flatten the net position for *instrument* via OANDA's
         ``/positions/{instrument}/close`` endpoint.
 
-        Uses ``"ALL"`` semantics so the broker liquidates whatever is
-        actually open, even if local state has drifted. Returns True if
-        a close request was submitted, False if already flat.
+        Returns True ONLY when the broker has been verified flat (close
+        filled and confirmed by a follow-up sync); False when the position
+        was already verified flat before any request. Raises
+        ``OrderCloseError`` when flatness could NOT be verified — callers
+        must retry or park, never treat the position as closed.
 
-        Raises
-        ------
-        OrderCloseError
-            If the broker request fails. Local state is untouched so a
-            retry can be attempted; callers MUST treat the position as
-            still open.
+        Contract change 2026-09-09: the old "True = request submitted" was a
+        trap — a cancelled FOK (halt / zero liquidity during a rollover
+        blowout, exactly when breaches happen) returned True with
+        ``total_filled == 0`` and the position still open, and callers popped
+        their tracking record on that. The cache-flat no-op was the mirror
+        trap after an unverified entry: it "succeeded" without ever asking
+        the broker. Both are now verification-first.
 
         Note: ``oandapyV20.contrib.requests.PositionCloseRequest`` is
         bypassed here because its ``Units("ALL")`` validator raises
@@ -328,11 +331,30 @@ class OandaOrderManager:
             net = self._net_positions.get(oanda_symbol, 0)
 
         if net == 0:
-            logger.info(
-                "[%s] OandaOrderManager.close_position: already flat — no-op.",
+            # Cache says flat — VERIFY before believing it: after an
+            # ambiguous submit whose re-sync failed, the cache can read 0
+            # while the broker holds the fill. A verified-flat is the only
+            # legitimate no-op.
+            if not self.sync_position(oanda_symbol):
+                raise OrderCloseError(
+                    f"close_position({oanda_symbol}): cache says flat but "
+                    "broker state is unverifiable — treat as still open"
+                )
+            with self._state_lock:
+                net = self._net_positions.get(oanda_symbol, 0)
+            if net == 0:
+                logger.info(
+                    "[%s] OandaOrderManager.close_position: already flat "
+                    "(verified) — no-op.",
+                    oanda_symbol,
+                )
+                return False
+            logger.warning(
+                "[%s] close_position: cache was flat but broker shows net=%d "
+                "— closing the unverified fill",
                 oanda_symbol,
+                net,
             )
-            return False
 
         if net > 0:
             data = {"longUnits": "ALL"}
@@ -373,8 +395,6 @@ class OandaOrderManager:
                     self._net_positions[oanda_symbol],
                 )
 
-            return True
-
         except Exception as e:
             logger.error(
                 "[%s] OandaOrderManager.close_position failed (net was %d): %s",
@@ -386,6 +406,24 @@ class OandaOrderManager:
             raise OrderCloseError(
                 f"close_position({oanda_symbol}) failed with net={net}: {e}"
             ) from e
+
+        # ── verification-first contract (2026-09-09) ───────────────────
+        # The fill parse above is advisory; the broker is authoritative.
+        # A close whose sync fails is NOT closed for tracking purposes.
+        if not self.sync_position(oanda_symbol):
+            raise OrderCloseError(
+                f"close_position({oanda_symbol}): close submitted but "
+                "follow-up sync failed — position state unverified; treat "
+                "as still open"
+            )
+        with self._state_lock:
+            verified = self._net_positions.get(oanda_symbol, 0)
+        logger.info(
+            "[%s] OandaOrderManager.close_position verified | net=%d",
+            oanda_symbol,
+            verified,
+        )
+        return verified == 0
 
     # ── target-position entry / reversal ───────────────────────────────
 

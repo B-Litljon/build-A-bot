@@ -1,26 +1,22 @@
 {
   "denomination_minutes": 15,
-  "generated_at": "2026-07-07T23:38:49.849717+00:00",
-  "source_log": "logs/soak_2026-07-02_0215.log",
+  "generated_at": "2026-09-09T22:22:27.059508+00:00",
+  "source_log": "logs/soak_2026-08-30_1405.log",
   "default_alpha": 0.15,
   "samples": {
-    "AUD_JPY": 330,
-    "EUR_JPY": 331,
-    "GBP_AUD": 331,
-    "GBP_JPY": 331,
-    "GBP_NZD": 331,
-    "NZD_JPY": 330,
-    "XAG_USD": 298,
-    "XAU_USD": 298
+    "AUD_JPY": 710,
+    "EUR_JPY": 710,
+    "GBP_AUD": 710,
+    "GBP_JPY": 710,
+    "GBP_NZD": 710,
+    "NZD_JPY": 710
   },
   "alphas": {
-    "AUD_JPY": 0.3624,
-    "EUR_JPY": 0.3538,
-    "GBP_AUD": 0.5834,
-    "GBP_JPY": 0.3787,
-    "GBP_NZD": 0.9032,
-    "NZD_JPY": 0.6615,
-    "XAG_USD": 0.1462,
-    "XAU_USD": 0.0718
+    "AUD_JPY": 0.3372,
+    "EUR_JPY": 0.36,
+    "GBP_AUD": 0.6952,
+    "GBP_JPY": 0.3307,
+    "GBP_NZD": 0.8929,
+    "NZD_JPY": 0.5591
   }
 }

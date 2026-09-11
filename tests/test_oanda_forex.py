@@ -173,6 +173,59 @@ class TestOandaForexOrchestrator(unittest.TestCase):
         order_manager.submit_target_position.assert_called_once_with("EUR_USD", -1000)
         self.assertEqual(orch._positions["EUR_USD"]["units"], -1000)
 
+    def test_entry_brackets_reanchor_on_fill(self):
+        """2026-09-09: brackets keep their approved DISTANCES but re-center
+        on the real fill price — a catch-up entry can fill a bar's move away
+        from the signal bar's close, and a stop anchored to a price that
+        never traded can sit on the wrong side of the market."""
+        orch, _, strategy, order_manager, risk_manager = self._make_orchestrator()
+        strategy.generate_signals.return_value = FakeSignal(direction="long")
+        risk_manager.calculate_bracket.return_value = (0.00050, 0.00150)
+        order_manager.submit_target_position.return_value = {
+            "filled": 1000,
+            "avg_price": 1.08550,  # filled 50 pips away from the signal close
+            "closed_units": 0,
+            "opened_units": 1000,
+            "position_units": 1000,
+            "position_avg_price": 1.08550,
+        }
+
+        for i in range(3):
+            asyncio.run(
+                orch._on_bar(self._bar_dict(timestamp=i, close=1.08000 + i * 0.001))
+            )
+
+        rec = orch._positions["EUR_USD"]
+        self.assertEqual(rec["entry"], 1.08550)
+        self.assertAlmostEqual(rec["sl"], 1.08550 - 0.00050, places=10)
+        self.assertAlmostEqual(rec["tp"], 1.08550 + 0.00150, places=10)
+
+    def test_entry_units_mismatch_parks_unverified(self):
+        """2026-09-09: a flatten racing the entry leaves the broker at a net
+        different from the requested target (delta-based order). Recording it
+        as a normal OPEN position would mis-track size — park instead."""
+        orch, _, strategy, order_manager, risk_manager = self._make_orchestrator()
+        strategy.generate_signals.return_value = FakeSignal(direction="long")
+        risk_manager.calculate_bracket.return_value = (0.00050, 0.00150)
+        order_manager.submit_target_position.return_value = {
+            "filled": 2000,
+            "avg_price": 1.08500,
+            "closed_units": 0,
+            "opened_units": 2000,
+            "position_units": 2000,  # requested 1000 — the race left 2x
+            "position_avg_price": 1.08500,
+        }
+
+        for i in range(3):
+            asyncio.run(
+                orch._on_bar(self._bar_dict(timestamp=i, close=1.08000 + i * 0.001))
+            )
+
+        rec = orch._positions.get("EUR_USD")
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec["state"], "ENTRY_UNRECONCILED")
+        self.assertIsNone(rec["sl"])  # no stop against an unverified size
+
     # ── (b) 5 rapid breach ticks -> close dispatched EXACTLY ONCE ──
 
     @patch("asyncio.run_coroutine_threadsafe")

@@ -50,6 +50,7 @@ See the root [GLOSSARY.md](../GLOSSARY.md) for domain terms.
 | `test_execution_safety.py` | 3 | Rebalance deadband, fill parsing, partial fills |
 | `test_retrainer_output_dir.py` | 3 | `RETRAIN_MODEL_DIR` isolation |
 | `test_holdout_gate.py` | 26 | Holdout split, artifact scoring, metadata recording, the confidence-bound verdict, the boundary-tail purge, and the permanent leak guards |
+| `test_dynamic_thresholds.py` | 14 | The 2026-08-29 gate rebuild: OOF Angel-bar calibration, Devil min_child auto-scaling, CP fold-evidence bounds |
 | `test_retraining_notification.py` | 9 | The retrain Discord embed: a gate pass is not a deployment |
 | `test_ml_strategy_guards.py` | 5 | The stale-bar guard + threshold.json pinning |
 | `verify_warmup.py` | (1, **not collected**) | Warm-up injection |
@@ -115,6 +116,17 @@ and `TestMainWiringLeakGuard` runs `main()` end to end so a regression in
 Phase 3a/4.5 wiring fails here. The tests use small mocks so they never
 train real models, but they exercise the same indexing paths the production
 gate uses.
+
+**`test_dynamic_thresholds.py`** — pins the three 2026-08-29 gate fixes as
+units, because each was originally discovered as a silent failure in a gate
+log: the Angel bar calibrated from OOF score quantiles (compressed /
+constant / tiny-frame / empty distributions, determinism), the Devil
+min_child auto-scaler (a tenth of the approved population, capped, floored —
+a split is always possible), and the CP lower bound's pinned reference values
+(3/3 perfect must fail the 1.2 bar, 4/4 must pass). One trap is written into
+the file header: never put `tests/` itself on `sys.path` to reach sibling
+test modules — `tests/execution/` then shadows the real `execution` package
+and core imports die mid-collection; import siblings as `tests.test_*`.
 
 **`test_retraining_notification.py`** — the other half of that isolation. The
 files stayed isolated on 2026-08-17, but the *alert* did not: a side experiment

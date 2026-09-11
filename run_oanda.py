@@ -68,7 +68,10 @@ from execution.oanda_forex_orchestrator import (  # noqa: E402
     OandaForexOrchestrator,
 )
 from execution.risk_manager import RiskManager, RiskProfile  # noqa: E402
-from strategies.concrete_strategies.ml_strategy import MLStrategy  # noqa: E402
+# MLStrategy is the served strategy and is imported eagerly. The registry
+# resolves lazily, so naming any other strategy imports only that one — the
+# experimental library stays out of the live bot's import graph.
+from strategies.concrete_strategies import STRATEGIES, MLStrategy  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +171,24 @@ def _parse_args() -> argparse.Namespace:
         choices=sorted(_GRANULARITY_PROFILES),
         help="Stream granularity/timeframe in minutes (default: 1)",
     )
+    parser.add_argument(
+        "--strategy",
+        type=str,
+        default=os.getenv("OANDA_STRATEGY", "ml_strategy"),
+        choices=sorted(STRATEGIES.keys()),
+        help="Strategy to run (default: ml_strategy)",
+    )
+    parser.add_argument(
+        "--routing-config",
+        type=str,
+        default=os.getenv("OANDA_ROUTING_CONFIG", ""),
+        help=(
+            "Path to a regime routing table JSON. REQUIRED for --strategy "
+            "regime_router; there is deliberately no default, because the only "
+            "tables in config/ are hand-authored templates with no empirical "
+            "basis and serving one by default would trade on invented routes."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -231,17 +252,50 @@ async def _main() -> None:
     risk_profile = RiskProfile.for_asset_class("forex")
 
     htf_tf, warmup_pd = _GRANULARITY_PROFILES[args.granularity]
-    strategy = MLStrategy(
-        asset_class="forex",
-        angel_path=_MODEL_DIR / "angel_latest.pkl",
-        devil_path=_MODEL_DIR / "devil_latest.pkl",
-        timeframe=args.granularity,
-        htf_timeframe=htf_tf,
-        warmup_period=warmup_pd,
-        # cost_ratio feature baseline must use the same window as the live
-        # regime gate — one source of truth for both sides.
-        regime_window=risk_profile.regime_window,
-    )
+    if args.strategy == "ml_strategy":
+        strategy = MLStrategy(
+            asset_class="forex",
+            angel_path=_MODEL_DIR / "angel_latest.pkl",
+            devil_path=_MODEL_DIR / "devil_latest.pkl",
+            timeframe=args.granularity,
+            htf_timeframe=htf_tf,
+            warmup_period=warmup_pd,
+            # cost_ratio feature baseline must use the same window as the live
+            # regime gate — one source of truth for both sides.
+            regime_window=risk_profile.regime_window,
+        )
+    elif args.strategy == "regime_router":
+        # Fail loudly rather than silently trading a made-up routing table.
+        if not args.routing_config:
+            raise SystemExit(
+                "--strategy regime_router requires --routing-config "
+                "(or OANDA_ROUTING_CONFIG). The tables in config/ are "
+                "hand-authored templates, not measurements; generate a real one "
+                "with src/analysis/build_strategy_matrix.py first."
+            )
+        cfg = Path(args.routing_config)
+        if not cfg.exists():
+            raise SystemExit(f"Routing config not found: {cfg}")
+        from strategies.concrete_strategies import RegimeRouterStrategy
+
+        strategy = RegimeRouterStrategy(
+            routing_config_path=cfg,
+            regime_window=risk_profile.regime_window,
+        )
+    else:
+        # The non-ML library strategies take their parameters as kwargs and
+        # default sensibly, but none of them has been shown to have an edge --
+        # every one measured negative net expectancy on GBP_JPY M15 (see
+        # llm_reports/). Running one live is a deliberate experiment, not a
+        # default, so say so on the way up.
+        strategy_cls = STRATEGIES[args.strategy]
+        strategy = strategy_cls()
+        logger.warning(
+            "Strategy '%s' is an UNVALIDATED library strategy — no measured edge. "
+            "Running it live is an experiment.",
+            args.strategy,
+        )
+    logger.info("Selected strategy: %s (%s)", args.strategy, strategy.__class__.__name__)
 
     # Per-instrument spread alphas shipped with the model (spread_alphas.json,
     # written by the retrainer on gate pass). Used by Gate A's stale-spread

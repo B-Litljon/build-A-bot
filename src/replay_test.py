@@ -28,14 +28,19 @@ Glossary:
     DATA_PATH -- data/oos_bars.parquet, the bars to replay.
     LEDGER_PATH -- data/signal_ledger.parquet, the recorded signals. Consumed
         by evaluate_performance.py and reinforcement_voter.py.
-    ANGEL_MODEL_PATH / DEVIL_MODEL_PATH -- the legacy root-level model paths
-        (models/angel_latest.pkl), not the current per-asset-class layout.
-    ANGEL_THRESHOLD / DEVIL_THRESHOLD -- matching live; the Angel bar is
-        imported from core.thresholds (0.40 unless env-overridden).
+    MODEL_DIR -- OANDA_MODEL_DIR env or models/forex_m15_wide: the SERVED
+        model dir. The legacy root-level pkls were archived 2026-09-09; a
+        replay must exercise the pair the bot actually runs.
+    ANGEL_MODEL_PATH / DEVIL_MODEL_PATH -- MODEL_DIR / {angel,devil}_latest.pkl.
+    ANGEL_THRESHOLD / DEVIL_THRESHOLD -- fallback bars; overridden per-harness
+        by MODEL_DIR/threshold.json (both keys), matching live precedence.
+    HTF_TF -- the higher timeframe paired with the replay granularity, from
+        retrainer._HTF_FOR_TIMEFRAME (SOAK_GRANULARITY env, default 15 -> "1h").
     WARMUP_PERIOD -- 260 bars before signals are emitted, sized for the
         50-period average on 5-minute bars.
-    FEATURE_NAMES -- this script's own feature list; verify it still matches
-        the pipeline before trusting results.
+    FEATURE_NAMES -- retrainer.BASE_FEATURE_COLS, not a hand-copied list: the
+        old local list omitted the four session_* flags, which made replay
+        crash on the served model's schema.
     In-memory accumulation -- signals are collected and written once at the
         end rather than appended per row, which is the difference between a
         replay that takes seconds and one that takes hours.
@@ -45,6 +50,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 from collections import deque
 from dataclasses import dataclass
@@ -63,6 +69,7 @@ from src.ml.feature_pipeline import FeaturePipeline
 from src.ml.features.v3_features import V3BaseFeatures, V3HTFFeatures
 from src.ml.trainers.v3_rf_trainer import V3RandomForestTrainer
 from src.core.thresholds import ANGEL_THRESHOLD
+from src.core.retrainer import BASE_FEATURE_COLS, _HTF_FOR_TIMEFRAME
 from src.strategies.concrete_strategies.ml_strategy import MLStrategy
 
 logging.basicConfig(
@@ -74,37 +81,23 @@ logger = logging.getLogger(__name__)
 # Configuration
 DATA_PATH = Path("data/oos_bars.parquet")
 LEDGER_PATH = Path("data/signal_ledger.parquet")
-ANGEL_MODEL_PATH = Path("models/angel_latest.pkl")
-DEVIL_MODEL_PATH = Path("models/devil_latest.pkl")
+# The SERVED model dir (matches soak.service's OANDA_MODEL_DIR default).
+MODEL_DIR = Path(os.getenv("OANDA_MODEL_DIR", "models/forex_m15_wide"))
+ANGEL_MODEL_PATH = MODEL_DIR / "angel_latest.pkl"
+DEVIL_MODEL_PATH = MODEL_DIR / "devil_latest.pkl"
 
-# Thresholds (must match training configuration)
-# Angel bar imported from core.thresholds (shared repo-wide, env-overridable)
+# Thresholds: fallbacks only — the harness reads both keys from
+# MODEL_DIR/threshold.json (same precedence as the live strategy).
 DEVIL_THRESHOLD = 0.50
 WARMUP_PERIOD = 260  # V3.3: expanded for 5m HTF SMA-50 warm-up (250 bars minimum)
 
-# Feature names (must match MLStrategy and retrainer.FEATURE_COLS)
-FEATURE_NAMES = [
-    "rsi_14",
-    "ppo",
-    "natr_14",
-    "bb_pct_b",
-    "bb_width_pct",
-    "price_sma50_ratio",
-    "log_return",
-    "hour_of_day",
-    "dist_sma50",
-    "vol_rel",
-    # V3.3: HTF features
-    "htf_rsi_14",
-    "htf_trend_agreement",
-    "htf_vol_rel",
-    "htf_bb_pct_b",
-    # Phase 5: Microstructure features
-    "range_coil_10",
-    "bar_body_pct",
-    "bar_upper_wick_pct",
-    "bar_lower_wick_pct",
-]
+# Feature names — the training schema itself, not a hand-maintained copy.
+FEATURE_NAMES: List[str] = list(BASE_FEATURE_COLS)
+
+# HTF pairing for the replay granularity (the training side of the map that
+# tests/test_htf_pairing.py pins equal to the live launcher's).
+_GRANULARITY = int(os.getenv("SOAK_GRANULARITY", "15"))
+HTF_TF = _HTF_FOR_TIMEFRAME.get(_GRANULARITY, "1h")
 
 
 @dataclass
@@ -216,7 +209,7 @@ class ReplayHarness:
         """
         self.provider = provider
         self.feature_engineer = FeaturePipeline(
-            feature_generators=[V3BaseFeatures(), V3HTFFeatures(timeframe="5m")]
+            feature_generators=[V3BaseFeatures(), V3HTFFeatures(timeframe=HTF_TF)]
         )
 
         # Load models
@@ -233,20 +226,27 @@ class ReplayHarness:
             self.devil_trainer.model.n_jobs = 1
 
         # ═══════════════════════════════════════════════════════════════════
-        # Dynamic Devil threshold — read from models/threshold.json so replay
-        # uses exactly the same threshold the retrainer selected.  Falls back
-        # to the module-level DEVIL_THRESHOLD constant if file is absent.
+        # Dynamic thresholds — read BOTH keys from the SERVED model dir's
+        # threshold.json (same precedence as the live strategy). The old code
+        # read models/threshold.json (a root file that predates the per-model
+        # layout) and only the Devil bar, so replay ran the model at the wrong
+        # Angel bar and ignored the calibration the pair was fitted for.
+        # Falls back to the module constants if the file is absent.
         # ═══════════════════════════════════════════════════════════════════
-        project_root = Path(__file__).resolve().parent.parent
-        threshold_path = project_root / "models" / "threshold.json"
+        threshold_path = MODEL_DIR / "threshold.json"
         self.devil_threshold: float = DEVIL_THRESHOLD  # start with module default
+        self.angel_threshold: float = ANGEL_THRESHOLD
         if threshold_path.exists():
             try:
                 with open(threshold_path, "r") as _fh:
                     _data = json.load(_fh)
                 self.devil_threshold = float(_data["devil_threshold"])
+                self.angel_threshold = float(
+                    _data.get("angel_threshold", self.angel_threshold)
+                )
                 logger.info(
-                    "Dynamic Devil threshold loaded: %.4f (from %s)",
+                    "Dynamic thresholds loaded: angel=%.4f devil=%.4f (from %s)",
+                    self.angel_threshold,
                     self.devil_threshold,
                     threshold_path,
                 )
@@ -367,7 +367,7 @@ class ReplayHarness:
             warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
             angel_prob = self.angel_trainer.predict_proba(angel_input)[0, 1]
 
-        if angel_prob < ANGEL_THRESHOLD:
+        if angel_prob < self.angel_threshold:
             return None  # Rejection - not appended to ledger
 
         # ═══════════════════════════════════════════════════════════════════
@@ -474,6 +474,11 @@ class ReplayHarness:
         """
         if not self.signal_ledger:
             logger.warning("No signals to save")
+            # Delete the previous ledger: a zero-signal replay that leaves the
+            # old parquet in place lets the grader resolve STALE signals
+            # against the new bars (the exact trap that made the offline loop
+            # produce garbage verdicts).
+            output_path.unlink(missing_ok=True)
             return
 
         logger.info(f"Saving {len(self.signal_ledger):,} signals to {output_path}...")
@@ -516,12 +521,12 @@ def main():
 
     if not ANGEL_MODEL_PATH.exists():
         logger.error(f"Angel model not found: {ANGEL_MODEL_PATH}")
-        logger.error("Run: python -m src.ml.train_model")
+        logger.error(f"Point OANDA_MODEL_DIR at a trained model dir (default: {MODEL_DIR})")
         return 1
 
     if not DEVIL_MODEL_PATH.exists():
         logger.error(f"Devil model not found: {DEVIL_MODEL_PATH}")
-        logger.error("Run: python -m src.ml.train_model")
+        logger.error(f"Point OANDA_MODEL_DIR at a trained model dir (default: {MODEL_DIR})")
         return 1
 
     # Initialize provider

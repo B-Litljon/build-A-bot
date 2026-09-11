@@ -80,7 +80,9 @@ class TestRetrainerOutputDir(unittest.TestCase):
             # fitted for).
             thr = json.loads((override / "threshold.json").read_text())
             self.assertEqual(thr["devil_threshold"], 0.27)
-            self.assertEqual(thr["angel_threshold"], round(ANGEL_THRESHOLD, 4))
+            # Full precision since 2026-09-09 (previously round(x, 4), which
+            # drifted the live bar from the calibration population).
+            self.assertEqual(thr["angel_threshold"], ANGEL_THRESHOLD)
 
 
 if __name__ == "__main__":

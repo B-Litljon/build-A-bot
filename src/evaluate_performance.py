@@ -9,18 +9,20 @@ Usage:
 
 Inputs:
     - data/oos_bars.parquet: 1-minute OHLCV + ATR data
-    - data/signal_ledger.csv: Trading signals
+    - data/signal_ledger.parquet: Trading signals
 
 Exit Logic:
     - Entry: Close price of signal bar
-    - SL: Entry - (0.5 * ATR)
-    - TP: Entry + (3.0 * ATR)
+    - SL: Entry - (SL_MULTIPLIER * ATR)   — 2.0x for forex, from RiskProfile
+    - TP: Entry + (TP_MULTIPLIER * ATR)   — 4.0x for forex, from RiskProfile
     - Max Hold: 45 bars
+    - Stop is checked FIRST intra-bar (matches the retrainer's labeler; a bar
+      touching both levels grades as a loss).
 
 This is what run_pipeline.sh's "Phase 3: Trade Resolution" actually runs --
 NOT src/core/resolver.py, despite that module's usage line claiming otherwise.
-Both write data/resolved_ledger.csv; this one is the live path and uses
-volatility-scaled brackets rather than fixed percentages.
+This one writes data/evaluation_results.parquet (never resolved_ledger.csv —
+that was resolver.py's output and nothing writes it anymore).
 
 Glossary:
     BARS_PATH -- data/oos_bars.parquet, the bars to grade against.
@@ -30,9 +32,10 @@ Glossary:
     OUTPUT_PATH -- data/evaluation_results.parquet.
     DRIFT_REPORT_PATH -- data/drift_report.json, read for the regime-aware
         thresholds below.
-    SL_MULTIPLIER / TP_MULTIPLIER / MAX_HOLD_BARS -- 0.5 / 3.0 / 45. Must match
-        the retrainer's bracket definition or the grades describe trades the
-        bot would never have taken.
+    SL_MULTIPLIER / TP_MULTIPLIER / MAX_HOLD_BARS -- the bracket definition,
+        sourced from RiskProfile.for_asset_class("forex") (2.0x / 4.0x / 45)
+        so the grades describe the trades the live bot actually takes. Must
+        match the retrainer's bracket definition or the grades are fiction.
     BASE_THRESHOLD -- 0.50, the normal conviction requirement.
     HIGH_VOLATILITY_THRESHOLD -- 0.75. In a high-volatility regime the bar is
         RAISED, because that is where the drift analysis found calibration
@@ -55,6 +58,8 @@ from typing import Optional
 import numpy as np
 import polars as pl
 
+from src.execution.risk_manager import RiskProfile
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -67,9 +72,12 @@ LEDGER_PATH = Path("data/signal_ledger.parquet")
 OUTPUT_PATH = Path("data/evaluation_results.parquet")
 DRIFT_REPORT_PATH = Path("data/drift_report.json")
 
-# Exit Parameters
-SL_MULTIPLIER = 0.5
-TP_MULTIPLIER = 3.0
+# Exit Parameters — the live product's brackets. The 0.5/3.0 constants here
+# were the equities profile and described a trade the forex bot never takes
+# (and the trainer grades SL-first — see the exit loop below).
+_FOREX_PROFILE = RiskProfile.for_asset_class("forex")
+SL_MULTIPLIER = _FOREX_PROFILE.sl_atr_multiplier
+TP_MULTIPLIER = _FOREX_PROFILE.tp_atr_multiplier
 MAX_HOLD_BARS = 45
 
 # Dynamic Thresholding Parameters
@@ -306,18 +314,19 @@ def vectorized_backtest(
                 # Ran out of data
                 break
 
+            # Check if SL hit (Loss) — FIRST, matching the retrainer's
+            # labeler (a bar touching both stop and target counts as a loss).
+            if future_low <= sl_price:
+                exit_bar = i
+                exit_price = sl_price
+                exit_type = "LOSS"
+                break
+
             # Check if TP hit (Win)
             if future_high >= tp_price:
                 exit_bar = i
                 exit_price = tp_price
                 exit_type = "WIN"
-                break
-
-            # Check if SL hit (Loss)
-            if future_low <= sl_price:
-                exit_bar = i
-                exit_price = sl_price
-                exit_type = "LOSS"
                 break
 
         # If no exit found within MAX_HOLD_BARS, exit at last bar

@@ -81,7 +81,11 @@ Verified during the 2026-07-27 glossary pass:
 ## Testing
 
 ```bash
-PYTHONPATH=src:. python -m pytest -q     # 200 tests
+# Use the project venv python — system python 3.14 lacks the deps
+# (alpaca, mcp, …) and fails test COLLECTION with 23 import errors.
+PYTHONPATH=src:. \
+  /home/tha_magick_man/.local/share/virtualenvs/build-A-bot-A3hTUWzK/bin/python \
+  -m pytest -q     # 416 collected / 411 passed / 5 skipped (2026-09-09)
 ```
 
 `PYTHONPATH=src:.` is required — entry points prepend `src/` to the path, which

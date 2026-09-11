@@ -46,6 +46,10 @@ Glossary:
         [V3BaseFeatures, V3HTFFeatures, V3SessionFeatures, V3CostFeatures].
         This order is IDENTICAL to retrainer.py's; keeping them in lockstep is
         what prevents training/inference skew.
+    _close_enough -- float-tolerant equality used by _validate_metadata's
+        bracket check (added 2026-09-09): metadata sl/tp multipliers must
+        match RiskProfile.for_asset_class(asset_class) or boot refuses —
+        train/serve skew on the Devil's labels is not survivable live.
     _cost_gen -- the V3CostFeatures instance kept as a handle so hot-reload can
         swap its alpha table in place without rebuilding the pipeline.
     feature_names -- read from the trained model's own feature_names_in_, NOT
@@ -108,6 +112,8 @@ from strategies.base import BaseStrategy, Signal
 from core import events
 from core.notification_manager import NotificationManager
 from core.thresholds import ANGEL_THRESHOLD as DEFAULT_ANGEL_THRESHOLD
+# NOTE: execution.risk_manager is imported lazily inside _validate_metadata —
+# a module-level import here cycles through execution/__init__.py.
 
 # CRITICAL: Import FeaturePipeline to prevent training/inference skew
 from ml.feature_pipeline import FeaturePipeline
@@ -125,6 +131,11 @@ from ml.regimes.hmm_regime import (
 from ml.trainers.v3_rf_trainer import V3RandomForestTrainer
 
 logger = logging.getLogger(__name__)
+
+
+def _close_enough(a: float, b: float, rel_tol: float = 1e-6) -> bool:
+    """Float-tolerant equality for metadata bracket comparison."""
+    return abs(a - b) <= rel_tol * max(abs(a), abs(b), 1.0)
 
 
 class MLStrategy(BaseStrategy):
@@ -311,6 +322,22 @@ class MLStrategy(BaseStrategy):
         # Devil and fall back to the constructor default for the Angel.
         self.angel_threshold, self.devil_threshold = self._load_thresholds()
 
+        # Sidecar mtimes for the independent reload path (2026-09-09): the
+        # threshold/spread sidecars reload on their OWN mtimes now, not only
+        # when a pickle changed — a retrain writes pkls first, and a bar
+        # landing in between used to pin the new pair to the OLD bars forever.
+        thr_path = self.angel_path.parent / "threshold.json"
+        self._threshold_mtime = (
+            os.path.getmtime(thr_path) if thr_path.exists() else 0.0
+        )
+        # _pair_mixed: set when one half of the Angel/Devil pair advances
+        # without the other (the retrainer replaces them separately); cleared
+        # once the other half has also been reloaded. While set,
+        # generate_signals stands down rather than score a mixed generation.
+        # _pair_pending: which side we are waiting for ("angel"/"devil"/None).
+        self._pair_mixed = False
+        self._pair_pending = None
+
         # Heartbeat state: every N bars per symbol, log a summary of the
         # angel_prob distribution. Lets the operator see the model is
         # actively evaluating even when no signals fire (most rejections
@@ -326,10 +353,17 @@ class MLStrategy(BaseStrategy):
 
     def _validate_metadata(self) -> None:
         """
-        Validate that the loaded model matches the expected asset class using the metadata sidecar.
+        Validate that the loaded model matches the expected asset class and
+        bracket multiples using the metadata sidecar.
 
         The sidecar lives next to the model artifacts (angel_path's directory) so
         side models (e.g. models/forex_m15/) carry their own metadata.
+
+        Bracket check (added 2026-09-09): the retrainer records
+        sl_atr_multiplier/tp_atr_multiplier into metadata; the Devil's labels
+        encode those multiples, so serving a model trained on one bracket set
+        under another is silent train/serve skew (the exact failure
+        soak.service warns about). Raise when present-and-mismatched.
         """
         metadata_path = self.angel_path.parent / "metadata.json"
         
@@ -350,6 +384,32 @@ class MLStrategy(BaseStrategy):
                     f"Distribution drift detected: Strategy instantiated for asset class '{self.asset_class}', "
                     f"but model was trained on '{trained_class}'."
                 )
+
+            # Bracket enforcement — skip silently when the keys are absent
+            # (pre-2026-09 artifacts predate them); raise on a real mismatch.
+            if "sl_atr_multiplier" in data or "tp_atr_multiplier" in data:
+                from execution.risk_manager import RiskProfile  # lazy: avoids
+                # an import cycle through execution/__init__.py at module load.
+
+                profile = RiskProfile.for_asset_class(self.asset_class)
+                trained_sl = data.get("sl_atr_multiplier")
+                trained_tp = data.get("tp_atr_multiplier")
+                if (
+                    trained_sl is not None
+                    and not _close_enough(trained_sl, profile.sl_atr_multiplier)
+                ) or (
+                    trained_tp is not None
+                    and not _close_enough(trained_tp, profile.tp_atr_multiplier)
+                ):
+                    raise RuntimeError(
+                        "Bracket mismatch: model trained with "
+                        f"sl={trained_sl}x/tp={trained_tp}x but this tree's "
+                        f"forex profile runs sl={profile.sl_atr_multiplier}x/"
+                        f"tp={profile.tp_atr_multiplier}x. Refusing to serve "
+                        "train/serve-skewed labels — retrain or point the "
+                        "model dir at the matching artifact."
+                    )
+
             logger.info("_validate_metadata: passed (asset_class=%s)", trained_class)
         except Exception as exc:
             if isinstance(exc, RuntimeError):
@@ -468,6 +528,8 @@ class MLStrategy(BaseStrategy):
             bool: True if any model was reloaded, False otherwise.
         """
         reloaded = False
+        angel_new = False
+        devil_new = False
 
         try:
             # Check Angel model
@@ -487,6 +549,7 @@ class MLStrategy(BaseStrategy):
                             self.angel_mtime = current_angel_mtime
                         logger.info(f"[HOT-RELOAD] Angel model updated successfully")
                         reloaded = True
+                        angel_new = True
                     except Exception as e:
                         logger.error(f"[HOT-RELOAD] Failed to reload Angel model: {e}")
 
@@ -507,8 +570,100 @@ class MLStrategy(BaseStrategy):
                             self.devil_mtime = current_devil_mtime
                         logger.info(f"[HOT-RELOAD] Devil model updated successfully")
                         reloaded = True
+                        devil_new = True
                     except Exception as e:
                         logger.error(f"[HOT-RELOAD] Failed to reload Devil model: {e}")
+
+            # ── pair-seam detection (2026-09-09) ──────────────────────────
+            # The retrainer replaces angel and devil separately (two os.replace
+            # calls). A bar landing between them used to score a MIXED
+            # generation (new Angel + old Devil) — same-schema pairs pass the
+            # name-list check below silently. Stand down instead, and only
+            # clear when the OTHER half has been reloaded too (or both landed
+            # together in one pass).
+            if angel_new and devil_new:
+                if self._pair_mixed:
+                    logger.info("[HOT-RELOAD] Angel/Devil pair consistent again")
+                self._pair_mixed = False
+                self._pair_pending = None
+            elif angel_new:
+                self._pair_mixed = True
+                self._pair_pending = "devil"
+                logger.warning(
+                    "[HOT-RELOAD] Angel advanced without Devil — standing "
+                    "down signals until the Devil lands"
+                )
+            elif devil_new:
+                if self._pair_pending == "devil":
+                    # The half we were waiting for just landed.
+                    self._pair_mixed = False
+                    self._pair_pending = None
+                    logger.info("[HOT-RELOAD] Angel/Devil pair consistent again")
+                else:
+                    self._pair_mixed = True
+                    self._pair_pending = "angel"
+                    logger.warning(
+                        "[HOT-RELOAD] Devil advanced without Angel — standing "
+                        "down signals until the Angel lands"
+                    )
+
+            # ── sidecar reloads, independent of the pickle branch ─────────
+            # threshold.json and spread_alphas.json land AFTER the pickles in
+            # a promotion. Gating them on `if reloaded:` meant a bar that saw
+            # only the pickle change re-read the OLD sidecars and then never
+            # looked again (pickle mtimes were then equal) — the new pair ran
+            # at the old bars forever. Each sidecar now reloads on its own
+            # mtime, every bar.
+            thr_path = self.angel_path.parent / "threshold.json"
+            thr_mtime = os.path.getmtime(thr_path) if thr_path.exists() else 0.0
+            if thr_mtime > self._threshold_mtime:
+                old_angel = self.angel_threshold
+                old_devil = self.devil_threshold
+                self.angel_threshold, self.devil_threshold = self._load_thresholds()
+                self._threshold_mtime = thr_mtime
+                if self.angel_threshold != old_angel:
+                    logger.info(
+                        "[HOT-RELOAD] Angel threshold updated: %.4f -> %.4f",
+                        old_angel,
+                        self.angel_threshold,
+                    )
+                if self.devil_threshold != old_devil:
+                    logger.info(
+                        "[HOT-RELOAD] Devil threshold updated: %.4f -> %.4f",
+                        old_devil,
+                        self.devil_threshold,
+                    )
+
+            table_path = self.angel_path.parent / "spread_alphas.json"
+            table_mtime = (
+                os.path.getmtime(table_path) if table_path.exists() else 0.0
+            )
+            needs_cost = "cost_ratio" in self.feature_names
+            if table_mtime != self._spread_table_mtime or (
+                needs_cost and self._cost_gen.alpha_table is None
+            ):
+                new_table, self._spread_table_mtime = self._load_spread_table()
+                with self._reload_lock:
+                    self._cost_gen.alpha_table = (
+                        new_table["alphas"] if new_table else None
+                    )
+                    if new_table:
+                        self._cost_gen.default_alpha = new_table.get(
+                            "default_alpha", 0.15
+                        )
+                logger.info(
+                    "[HOT-RELOAD] Spread table %s",
+                    "updated" if new_table else "removed/unreadable",
+                )
+            if needs_cost and self._cost_gen.alpha_table is None:
+                msg = (
+                    "[HOT-RELOAD] SCHEMA MISMATCH: model expects "
+                    "cost_ratio but spread_alphas.json is missing from "
+                    f"{self.angel_path.parent} — predictions will fail "
+                    "until the table is restored."
+                )
+                logger.critical(msg)
+                self.notification_manager.send_system_message(msg)
 
             # Send notification if any model was reloaded
             if reloaded:
@@ -533,60 +688,6 @@ class MLStrategy(BaseStrategy):
                         "equal Angel features + angel_prob. Angel/Devil pair "
                         "on disk is inconsistent — predictions are suspect "
                         "until the next retrain completes."
-                    )
-                    logger.critical(msg)
-                    self.notification_manager.send_system_message(msg)
-
-                # Also reload the thresholds — a retrain always produces a
-                # new threshold.json alongside the new model weights.
-                old_angel = self.angel_threshold
-                old_devil = self.devil_threshold
-                self.angel_threshold, self.devil_threshold = (
-                    self._load_thresholds()
-                )
-                if self.angel_threshold != old_angel:
-                    logger.info(
-                        "[HOT-RELOAD] Angel threshold updated: %.4f -> %.4f",
-                        old_angel,
-                        self.angel_threshold,
-                    )
-                if self.devil_threshold != old_devil:
-                    logger.info(
-                        "[HOT-RELOAD] Devil threshold updated: %.4f -> %.4f",
-                        old_devil,
-                        self.devil_threshold,
-                    )
-
-                # Reload the spread-alpha table when it changed on disk or the
-                # refreshed schema newly requires cost_ratio (a cost-aware
-                # retrain landed over a pre-cost model dir).
-                table_path = self.angel_path.parent / "spread_alphas.json"
-                table_mtime = (
-                    os.path.getmtime(table_path) if table_path.exists() else 0.0
-                )
-                needs_cost = "cost_ratio" in self.feature_names
-                if table_mtime != self._spread_table_mtime or (
-                    needs_cost and self._cost_gen.alpha_table is None
-                ):
-                    new_table, self._spread_table_mtime = self._load_spread_table()
-                    with self._reload_lock:
-                        self._cost_gen.alpha_table = (
-                            new_table["alphas"] if new_table else None
-                        )
-                        if new_table:
-                            self._cost_gen.default_alpha = new_table.get(
-                                "default_alpha", 0.15
-                            )
-                    logger.info(
-                        "[HOT-RELOAD] Spread table %s",
-                        "updated" if new_table else "removed/unreadable",
-                    )
-                if needs_cost and self._cost_gen.alpha_table is None:
-                    msg = (
-                        "[HOT-RELOAD] SCHEMA MISMATCH: model expects "
-                        "cost_ratio but spread_alphas.json is missing from "
-                        f"{self.angel_path.parent} — predictions will fail "
-                        "until the table is restored."
                     )
                     logger.critical(msg)
                     self.notification_manager.send_system_message(msg)
@@ -621,6 +722,18 @@ class MLStrategy(BaseStrategy):
         """
         # Check for model updates at the start of each bar processing cycle
         self._check_model_updates()
+
+        # Pair-seam stand-down (2026-09-09): one half of the Angel/Devil pair
+        # advanced without the other (the retrainer replaces them separately).
+        # Scoring a mixed generation would judge the new Angel with the old
+        # Devil — a silent train/serve skew. Skip the bar instead; the flag
+        # clears itself once both loaded weights match disk.
+        if self._pair_mixed:
+            logger.warning(
+                "[MLStrategy] Angel/Devil pair mid-promotion — "
+                "skipping signal generation this bar"
+            )
+            return None
 
         self.validate_input(df)
 

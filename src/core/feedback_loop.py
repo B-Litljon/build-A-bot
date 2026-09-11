@@ -8,29 +8,34 @@ Usage:
     python -m src.core.feedback_loop
 
 Inputs:
-    - data/resolved_ledger.csv (resolved trades with outcomes)
+    - data/evaluation_results.parquet (graded trades with exit_type, devil_prob,
+      pnl_r) — written by src/evaluate_performance.py, Phase 3.
 
 Output:
     - Terminal metrics summary
     - Discord alert (if drift detected)
 
-This is the watchdog half of the LEGACY offline loop: resolver.py grades the
-signals, this module decides whether the grades are bad enough to justify
+This is the watchdog half of the offline loop: evaluate_performance.py grades
+the signals, this module decides whether the grades are bad enough to justify
 retraining. Its exit code is what run_pipeline.sh reads to decide whether to
 invoke the retrainer. See GLOSSARY.md ("drift", "Brier score", "OOS").
 
 Glossary:
-    RESOLVED_PATH -- data/resolved_ledger.csv, written by resolver.py. The only
-        input; this module writes no files.
-    TAKE_PROFIT / STOP_LOSS -- +0.5% / -0.2%, the same legacy fixed brackets
-        resolver.py used. Only used to turn win/loss counts into an average
-        return per trade, so they must match resolver.py or the EV is wrong.
+    RESOLVED_PATH -- data/evaluation_results.parquet, written by
+        evaluate_performance.py. The only input; this module writes no files.
+    outcome -- derived column: 1 when exit_type == "WIN", else 0. Built on load
+        because the parquet carries the exit_type string rather than the old
+        resolver's binary column.
+    TAKE_PROFIT / STOP_LOSS -- +0.5% / -0.2%, legacy static brackets, used only
+        as an EV fallback for old files lacking pnl_r. The modern path computes
+        EV as mean(pnl_r), so the graded brackets are whatever the grader used.
     CRITICAL_BRIER -- 0.25. Above this the probabilities are considered badly
         calibrated and drift is declared. (The retrainer's own gate uses a
         looser 0.30 for a different target; the two numbers are not the same
         test.)
-    MINIMUM_EV -- 0.0005, i.e. the model must make at least 0.05% per trade on
-        average. Below that -- or negative -- counts as drift.
+    MINIMUM_EV -- 0.0005, i.e. the model must make a positive expected value per
+        trade (in R multiples on the modern path). Below that -- or negative --
+        counts as drift.
     PerformanceMetrics -- the computed scorecard: win rate, expected value,
         Brier score, log loss, and the raw trade/win/loss counts.
     win_rate -- wins / (wins + losses). Descriptive only; no gate reads it.
@@ -70,20 +75,23 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuration
-RESOLVED_PATH = Path("data/resolved_ledger.csv")
+# Phase 3 (src/evaluate_performance.py) writes evaluation_results.parquet;
+# data/resolved_ledger.csv was the old resolver.py output and nothing writes
+# it anymore — pointing this at the CSV made the drift→retrain branch of
+# run_pipeline.sh permanently dead (it could only exit 1).
+RESOLVED_PATH = Path("data/evaluation_results.parquet")
 
-# Bracket Parameters for EV Calculation
-# NOTE: These are legacy static-percentage brackets from the pre-V3.2 era.
-# The live system now uses ATR-dynamic brackets (SL=0.5×ATR, TP=3.0×ATR, Hold=45).
-# These constants are retained here for backward compatibility with resolved_ledger.csv
-# data produced by src/core/resolver.py, which also uses static percentage brackets.
-# They are superseded by the ATR-dynamic constants in retrainer.py / evaluate_performance.py.
+# Bracket Parameters for EV Calculation — fallback only.
+# evaluation_results.parquet carries pnl_r (R-multiples), so the modern path
+# never uses these. They are the legacy static-percentage brackets (+0.5% /
+# -0.2%) from the pre-V3.2 era, retained for any old-format file that lacks
+# pnl_r; they are superseded by the ATR-dynamic brackets in retrainer.py.
 TAKE_PROFIT = 0.005  # +0.5% (legacy static bracket — superseded by ATR-dynamic)
 STOP_LOSS = 0.002  # -0.2% (legacy static bracket — superseded by ATR-dynamic)
 
 # Drift Detection Thresholds
 CRITICAL_BRIER = 0.25
-MINIMUM_EV = 0.0005  # 0.05% minimum expected return
+MINIMUM_EV = 0.0005  # ~0 R per trade: the modern pnl_r path must be positive
 
 
 @dataclass
@@ -131,14 +139,17 @@ class DriftEvaluator:
             raise FileNotFoundError(f"Resolved ledger not found: {self.resolved_path}")
 
         logger.info(f"Loading resolved trades from {self.resolved_path}...")
-        self.data = pl.read_csv(self.resolved_path)
+        self.data = pl.read_parquet(self.resolved_path)
 
-        # Convert timestamp columns to datetime
+        if "exit_type" not in self.data.columns:
+            raise ValueError(
+                f"{self.resolved_path} has no exit_type column — "
+                "not a graded evaluation results file"
+            )
+        # WIN -> 1, everything else (LOSS, TIME_LOSS, ...) -> 0. Matches the
+        # resolver convention this module was originally written against.
         self.data = self.data.with_columns(
-            [
-                pl.col("timestamp").str.strptime(pl.Datetime, "%Y-%m-%d %H:%M:%S%.f"),
-                pl.col("exit_time").str.strptime(pl.Datetime, "%Y-%m-%d %H:%M:%S%.f"),
-            ]
+            (pl.col("exit_type") == "WIN").cast(pl.Int8).alias("outcome")
         )
 
         logger.info(f"Loaded {len(self.data):,} resolved trades")
@@ -164,13 +175,20 @@ class DriftEvaluator:
 
     def calculate_expected_value(self) -> float:
         """
-        Calculate expected value per trade.
+        Calculate expected value per trade, in R multiples.
 
-        Uses +0.5% for wins, -0.2% for losses.
+        Uses the graded pnl_r column (evaluation_results.parquet carries the
+        realised result in multiples of the stop distance). Falls back to the
+        legacy static +0.5%/-0.2% bracket approximation only when grading an
+        old-format file that predates pnl_r.
 
         Returns:
             Average return per trade
         """
+        if "pnl_r" in self.data.columns:
+            pnl_r = self.data["pnl_r"].to_numpy()
+            return float(np.mean(pnl_r)) if len(pnl_r) else 0.0
+
         outcomes = self.data["outcome"].to_numpy()
         wins = np.sum(outcomes == 1)
         losses = np.sum(outcomes == 0)
@@ -408,7 +426,7 @@ def main():
         logger.error("Ensure you have run:")
         logger.error("  1. python -m src.data.harvester")
         logger.error("  2. python -m src.replay_test")
-        logger.error("  3. python -m src.core.resolver")
+        logger.error("  3. python -m src.evaluate_performance")
         return 1
 
     except Exception as e:
