@@ -47,3 +47,4 @@ logs/status.json
 
 # Offline analysis artifacts (rescued/derived data; regenerable)
 analysis_cache/
+catboost_info/
