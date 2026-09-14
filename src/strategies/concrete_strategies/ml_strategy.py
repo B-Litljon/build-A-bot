@@ -374,6 +374,9 @@ class MLStrategy(BaseStrategy):
                     "artifact is persisted alongside the model."
                 )
 
+        # Barrier geometry request flag (must precede metadata validation)
+        self.use_barriers = _barriers_requested(use_barriers)
+
         # Validate metadata sidecar
         self._validate_metadata()
 
@@ -404,7 +407,6 @@ class MLStrategy(BaseStrategy):
         # ── learned barrier geometry (optional sidecar) ───────────────────
         # Loaded AFTER the sidecar mtimes above so a promotion that swapped
         # the whole directory is read once, at boot, from the settled files.
-        self.use_barriers = _barriers_requested(use_barriers)
         self._barrier_estimator: Optional[BarrierEstimator] = None
         self._barrier_meta_path = self.angel_path.parent / BARRIER_META_FILENAME
         self._barrier_mtime = 0.0
@@ -467,7 +469,15 @@ class MLStrategy(BaseStrategy):
 
             # Bracket enforcement — skip silently when the keys are absent
             # (pre-2026-09 artifacts predate them); raise on a real mismatch.
-            if "sl_atr_multiplier" in data or "tp_atr_multiplier" in data:
+            # When learned barrier geometry is active (use_barriers=True),
+            # instance-specific MAE/MFE barriers govern live execution brackets
+            # rather than the static profile multipliers.
+            if getattr(self, "use_barriers", False):
+                logger.info(
+                    "_validate_metadata: learned barrier geometry active (use_barriers=True) — "
+                    "dynamic MAE/MFE barriers govern live execution brackets."
+                )
+            elif "sl_atr_multiplier" in data or "tp_atr_multiplier" in data:
                 from execution.risk_manager import RiskProfile  # lazy: avoids
                 # an import cycle through execution/__init__.py at module load.
 

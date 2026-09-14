@@ -84,6 +84,10 @@ Glossary:
     oos_ledger_cols -- which columns to carry from the validation frame into
         the ledger. Missing columns are skipped, so a caller can request
         optional ones (e.g. behavior_label) without knowing the schema.
+    RETRAIN_LEARN_BARRIERS -- 1 (enabled by default). When set, fits and
+        persists BarrierEstimator (CatBoost quantile regression for MAE tail
+        and MFE median) into the model directory alongside Angel/Devil models.
+        Writes barriers_mae.pkl, barriers_mfe.pkl, and barriers_meta.json.
     MAX_HOLD_BARS -- 45. A trade that reaches neither level within 45 bars is
         labelled a loss (timeout), because capital was tied up for nothing.
     SURVIVAL_BARS -- 5. The horizon for the Devil's survival label, below.
@@ -318,6 +322,13 @@ try:
         predict_regime_probs,
         save_hmm_models,
     )
+    from src.ml.barriers.estimator import (
+        BarrierEstimator,
+        DEFAULT_TAU_MAE,
+        DEFAULT_TAU_MFE,
+        DEFAULT_RR_FLOOR,
+    )
+    from src.ml.barriers.labels import DEFAULT_HORIZON, compute_excursions
     from src.core.notification_manager import NotificationManager
 except ImportError:
     from data.factory import get_market_provider
@@ -341,6 +352,13 @@ except ImportError:
         predict_regime_probs,
         save_hmm_models,
     )
+    from ml.barriers.estimator import (
+        BarrierEstimator,
+        DEFAULT_TAU_MAE,
+        DEFAULT_TAU_MFE,
+        DEFAULT_RR_FLOOR,
+    )
+    from ml.barriers.labels import DEFAULT_HORIZON, compute_excursions
     from core.notification_manager import NotificationManager
 
 logging.basicConfig(
@@ -354,6 +372,11 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 DAYS_BACK = int(os.getenv("RETRAIN_DAYS_BACK", "60"))
+
+# Learned quantile barriers (Phase 3): when enabled (default 1), fits and
+# persists BarrierEstimator (barriers_mae.pkl, barriers_mfe.pkl,
+# barriers_meta.json) alongside the Angel and Devil classifiers.
+RETRAIN_LEARN_BARRIERS = os.getenv("RETRAIN_LEARN_BARRIERS", "1").strip() == "1"
 
 # Instruments this OANDA account cannot trade. They stay in the TRAINING basket
 # — the volatility-first basket is load-bearing (a shrink was tried and
@@ -1439,6 +1462,28 @@ def engineer_features_and_labels(
         f"Generated devil_target ({survival_bars}-bar survival): "
         f"{int(devil_targets_survival.sum())} survived / {len(devil_targets_survival)} total "
         f"({devil_targets_survival.mean():.1%} survival rate)"
+    )
+
+    # ═══════════════════════════════════════════════════════════════════
+    # EXCURSION TARGETS: Realized forward MAE / MFE (NATR-normalized)
+    # Computed per symbol before chop veto to maintain continuous price
+    # series for the forward sliding window.
+    # ═══════════════════════════════════════════════════════════════════
+    logger.info(
+        f"Computing forward MAE/MFE excursion targets (horizon={max_hold} bars)..."
+    )
+    if "symbol" in df.columns:
+        excursion_parts = []
+        for sym in df["symbol"].unique(maintain_order=True).to_list():
+            sym_df = df.filter(pl.col("symbol") == sym)
+            excursion_parts.append(compute_excursions(sym_df, horizon=max_hold))
+        df = pl.concat(excursion_parts)
+    else:
+        df = compute_excursions(df, horizon=max_hold)
+    n_resolvable = int(df["resolvable"].sum()) if "resolvable" in df.columns else 0
+    logger.info(
+        f"Generated excursion labels (mae_natr, mfe_natr): "
+        f"{n_resolvable:,} resolvable / {len(df):,} total"
     )
 
     # ═══════════════════════════════════════════════════════════════════
@@ -3364,11 +3409,104 @@ def promote_or_reject(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+def fit_and_save_barriers(
+    df: pl.DataFrame,
+    feature_cols: List[str],
+    asset_config: dict,
+) -> Optional[dict]:
+    """
+    Fit and atomically persist learned quantile barrier models.
+
+    Uses BarrierEstimator (CatBoost backend with monotonic constraints on
+    volatility) to predict instance-specific stop loss (Q_MAE) and take profit
+    (Q_MFE) distances.
+
+    Saves barriers_mae.pkl, barriers_mfe.pkl, and barriers_meta.json in the
+    model directory. Write order ensures atomic hot-reload safety: weights are
+    replaced before the meta JSON, which is replaced last. Updates metadata.json
+    with barrier provenance.
+
+    Args:
+        df: Engineered DataFrame with features and excursion labels (mae_natr, mfe_natr).
+        feature_cols: Feature columns for training.
+        asset_config: Asset configuration dictionary.
+
+    Returns:
+        The metadata dict written to barriers_meta.json, or None if skipped/failed.
+    """
+    asset_class = asset_config.get("asset_class", "equities")
+    model_dir = Path(asset_config.get("model_dir") or f"models/{asset_class}")
+    horizon = int(asset_config.get("max_hold", DEFAULT_HORIZON))
+
+    if "mae_natr" not in df.columns or "mfe_natr" not in df.columns:
+        logger.warning(
+            "[BARRIERS] Frame lacks mae_natr / mfe_natr columns — barrier fit skipped."
+        )
+        return None
+
+    y_mae = df["mae_natr"].to_numpy().astype(float)
+    y_mfe = df["mfe_natr"].to_numpy().astype(float)
+    valid_mask = np.isfinite(y_mae) & np.isfinite(y_mfe)
+    if "resolvable" in df.columns:
+        valid_mask = valid_mask & df["resolvable"].to_numpy().astype(bool)
+
+    n_valid = int(valid_mask.sum())
+    if n_valid < 100:
+        logger.warning(
+            "[BARRIERS] Only %d valid labeled rows (< 100 floor) — barrier fit skipped.",
+            n_valid,
+        )
+        return None
+
+    logger.info("=" * 70)
+    logger.info("FITTING LEARNED QUANTILE BARRIERS (MAE / MFE)")
+    logger.info("=" * 70)
+
+    family = os.getenv("BARRIER_FAMILY", "catboost").strip().lower()
+    tau_mae = float(os.getenv("BARRIER_TAU_MAE", str(DEFAULT_TAU_MAE)))
+    tau_mfe = float(os.getenv("BARRIER_TAU_MFE", str(DEFAULT_TAU_MFE)))
+    rr_floor = float(os.getenv("BARRIER_RR_FLOOR", str(DEFAULT_RR_FLOOR)))
+
+    estimator = BarrierEstimator(
+        feature_cols=feature_cols,
+        tau_mae=tau_mae,
+        tau_mfe=tau_mfe,
+        rr_floor=rr_floor,
+        family=family,
+    )
+
+    weights = generate_time_decay_weights(
+        len(df),
+        timestamps=df["timestamp"] if "timestamp" in df.columns else None,
+    )
+
+    estimator.fit(df, df, sample_weight=weights)
+    meta = estimator.save(model_dir, horizon=horizon)
+
+    metadata_path = model_dir / "metadata.json"
+    if metadata_path.exists():
+        try:
+            with open(metadata_path, "r") as f:
+                cur_meta = json.load(f)
+            cur_meta["learned_barriers"] = True
+            cur_meta["barriers"] = meta
+            metadata_temp = model_dir / "metadata_temp.json"
+            with open(metadata_temp, "w") as f:
+                json.dump(cur_meta, f, indent=2)
+            os.replace(metadata_temp, metadata_path)
+            logger.info(f"[ATOMIC] Updated {metadata_path} with learned_barriers=True")
+        except Exception as exc:
+            logger.warning(f"[BARRIERS] Failed to update {metadata_path}: {exc}")
+
+    return meta
+
+
 def save_models(
     angel_model: "lgb.LGBMClassifier",
     devil_model: "lgb.LGBMClassifier",
     asset_config: dict,
     report: Optional[ValidationReport] = None,
+    barrier_model: Optional["BarrierEstimator"] = None,
 ) -> None:
     """
     Serialize models to disk using joblib with POSIX atomic writes.
@@ -3445,6 +3583,15 @@ def save_models(
             devil_temp.unlink()
         raise
 
+    barrier_meta = None
+    if barrier_model is not None:
+        try:
+            horizon = int(asset_config.get("max_hold", DEFAULT_HORIZON))
+            barrier_meta = barrier_model.save(model_dir, horizon=horizon)
+        except Exception as e:
+            logger.error(f"[ATOMIC] Failed to serialize barrier model: {e}")
+            raise
+
     # ═══════════════════════════════════════════════════════════════════
     # ATOMIC WRITE: Metadata sidecar
     # ═══════════════════════════════════════════════════════════════════
@@ -3483,7 +3630,10 @@ def save_models(
             "fraction": HOLDOUT_FRAC,
             "bypass_reason": "disabled" if HOLDOUT_FRAC <= 0.0 else None,
         },
+        "learned_barriers": barrier_model is not None,
     }
+    if barrier_meta is not None:
+        metadata["barriers"] = barrier_meta
     if report is not None and report.holdout is not None:
         ho = report.holdout
         metadata["holdout"] = {
@@ -3940,6 +4090,17 @@ def main() -> int:
             # post-clean population the promoted models trained on.
             stats = compute_feature_stats(features_df, feature_cols)
             save_feature_stats(stats, saved_dir)
+
+            if RETRAIN_LEARN_BARRIERS:
+                try:
+                    fit_and_save_barriers(features_df, feature_cols, asset_config)
+                except Exception as e:
+                    logger.error(
+                        "[BARRIERS] Failed to fit and save learned barriers: %s",
+                        e,
+                        exc_info=True,
+                    )
+
             logger.info("=" * 70)
             logger.info(f"✅ MODELS PROMOTED ({asset_class}) — Ready for next market open")
             logger.info(f"  Models saved in: {saved_dir}/")
