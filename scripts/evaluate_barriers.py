@@ -30,6 +30,7 @@ Glossary:
         the model actually learned a 95% quantile.
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -67,7 +68,7 @@ def _augment(df: pl.DataFrame) -> pl.DataFrame:
 
 N_FOLDS = 3
 COVERAGE_FLOOR = 0.93
-TAU_MAE = 0.95
+TAU_MAE = float(os.getenv("BARRIER_TAU_MAE", "0.95"))
 
 
 def expanding_folds(n: int, n_folds: int = N_FOLDS):
@@ -82,10 +83,11 @@ def expanding_folds(n: int, n_folds: int = N_FOLDS):
 
 
 def main() -> int:
+    gran = int(os.getenv("BARRIER_GRANULARITY", "15"))
     frames = load_basket(
         ["AUD_JPY", "EUR_JPY", "GBP_JPY", "NZD_JPY", "GBP_AUD", "GBP_NZD"],
         days_back=730,
-        granularity=15,
+        granularity=gran,
         cache_dir=Path("analysis_cache/strategy_matrix"),
     )
     tagged_by_symbol = [prepare_tagged_frame(df, sym) for sym, df in frames.items()]
@@ -124,7 +126,7 @@ def main() -> int:
     y_mae = ok["mae_natr"].to_numpy()
     for fold_no, (tr_end, te_start, te_end) in enumerate(folds, 1):
         train, test = ok[:tr_end], ok[te_start:te_end]
-        est = BarrierEstimator(feature_cols=EVAL_FEATURES)
+        est = BarrierEstimator(feature_cols=EVAL_FEATURES, tau_mae=TAU_MAE)
         try:
             est.fit(train, train)
         except ValueError as e:

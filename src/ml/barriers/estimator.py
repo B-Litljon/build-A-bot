@@ -52,6 +52,7 @@ Glossary:
 """
 
 from dataclasses import dataclass
+import os
 from typing import List, Optional
 
 import numpy as np
@@ -103,6 +104,7 @@ class BarrierEstimator:
         tau_mae: float = DEFAULT_TAU_MAE,
         tau_mfe: float = DEFAULT_TAU_MFE,
         rr_floor: float = DEFAULT_RR_FLOOR,
+        family: Optional[str] = None,
     ):
         if tau_mfe >= tau_mae:
             raise ValueError("tau_mfe must be below tau_mae (median target, tail stop)")
@@ -111,11 +113,14 @@ class BarrierEstimator:
         self.tau_mfe = tau_mfe
         self.rr_floor = rr_floor
         self.feature_names_in_: List[str] = list(feature_cols)
+        self.family = (family or os.getenv("BARRIER_FAMILY", "catboost")).strip().lower()
         self._model_mae = None
         self._model_mfe = None
         # Set by fit(): True when the LightGBM path was used, False when the
         # estimator degraded to the binned fallback (no lightgbm installed).
         self.used_lightgbm_: Optional[bool] = None
+        self.used_catboost_: Optional[bool] = None
+        self.backend_: Optional[str] = None
 
     def fit(
         self,
@@ -190,6 +195,42 @@ class BarrierEstimator:
         return X
 
     def _fit_quantile(self, X, y, tau, w):
+        if self.family == "catboost":
+            try:
+                return self._fit_catboost(X, y, tau, w)
+            except ImportError:
+                pass
+        return self._fit_lightgbm(X, y, tau, w)
+
+    def _fit_catboost(self, X, y, tau, w):
+        from catboost import CatBoostRegressor
+
+        mc = [1 if c in MONOTONE_INCREASING else 0 for c in self.feature_cols]
+        params = {
+            "loss_function": f"Quantile:alpha={tau}",
+            "iterations": 250,
+            "learning_rate": 0.05,
+            "depth": 5,
+            "random_seed": 42,
+            "verbose": 0,
+        }
+        if any(mc):
+            params["monotone_constraints"] = mc
+        model = CatBoostRegressor(**params)
+        try:
+            model.fit(X, y, sample_weight=w)
+        except Exception as e:
+            if "constant" in str(e).lower() or "ignored" in str(e).lower():
+                # All features are constant (e.g. synthetic test frames); fallback to LightGBM
+                return self._fit_lightgbm(X, y, tau, w)
+            raise
+        self._audit_monotone(model, X)
+        self.used_catboost_ = True
+        self.used_lightgbm_ = False
+        self.backend_ = "catboost"
+        return model
+
+    def _fit_lightgbm(self, X, y, tau, w):
         try:
             import lightgbm as lgb
 
@@ -217,9 +258,13 @@ class BarrierEstimator:
             # construction.
             self._audit_monotone(model, X)
             self.used_lightgbm_ = True
+            self.used_catboost_ = False
+            self.backend_ = "lightgbm"
             return model
         except ImportError:
             self.used_lightgbm_ = False
+            self.used_catboost_ = False
+            self.backend_ = "binned"
             return self._fit_binned_fallback(X, y, tau)
 
     def _monotone_constraints(self):
@@ -269,12 +314,9 @@ class BarrierEstimator:
     def _predict_quantile(self, model, X, tau):
         if model is None:
             return np.full(len(X), np.nan)
-        try:
-            import lightgbm  # noqa: F401
-
+        if hasattr(model, "predict"):
             return np.asarray(model.predict(X), dtype=float)
-        except ImportError:
-            return np.asarray(model["predict"](X), dtype=float)
+        return np.asarray(model["predict"](X), dtype=float)
 
     def _fit_binned_fallback(self, X, y, tau):
         """
