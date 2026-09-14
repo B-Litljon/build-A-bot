@@ -414,6 +414,12 @@ class BarrierEstimator:
             "depth": 5,
             "random_seed": 42,
             "verbose": 0,
+            # CatBoost otherwise writes a catboost_info/ training-log directory
+            # into the CURRENT WORKING DIRECTORY, so simply running the Phase 1
+            # evaluation from the repo root dirties a tracked tree (it was
+            # committed once already, 2026-09-14). The estimator's fits are
+            # research/eval runs that must leave no trace on disk.
+            "allow_writing_files": False,
         }
         if any(mc):
             params["monotone_constraints"] = mc

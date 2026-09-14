@@ -56,10 +56,40 @@ trade?" with a specific constraint.
 > live bot would actually take. Change a gate here without changing the training
 > side and the model learns from setups it will never be offered.
 
-Note the forex profile overrides the bracket multipliers to **1.0× / 2.0×**
-(2:1), not the 0.5/3.0 defaults.
+Note the forex profile overrides the bracket multipliers to **2.0× / 4.0×**
+(2:1) — not the 0.5/3.0 defaults, and not the 1.0/2.0 it ran until 2026-08-08.
+Always read the profile rather than remembering a number.
 
-- **Imports from repo:** none (numpy only — deliberately dependency-light).
+**Learned barrier geometry (added 2026-09-14).** `calculate_bracket` takes an
+optional `barrier` payload — the per-bar NATR multiples the strategy attached at
+`strategies.base.BARRIER_GEOMETRY_KEY`. When present and usable they *replace*
+`sl_atr_multiplier` / `tp_atr_multiplier` for that bar. Substituting at the
+multiplier step is the whole design: the gates, the rounding and the sizing all
+still see a distance and cannot tell where it came from, and `last_geometry_source`
+(`"static"` / `"barrier"`) records which produced the bracket.
+
+Two things it deliberately does *not* do:
+
+- **No clamp on how wide a learned stop may be.** A learned stop is a
+  conditional quantile and can legitimately differ several-fold from the
+  constant (measured median `q_mae` ≈ 10 ATR against the static 2.0×). Widening
+  beyond 2× the static width does log at WARNING — the OANDA path trades a
+  *fixed* 1000 units and does not size by risk, so a wider stop is a
+  proportionally larger loss per stop-out and that should be visible. Inventing
+  a veto threshold here would be policy nobody calibrated.
+- **No veto on the payload's `admissible` flag.** The estimator's `rr_floor`
+  compares `Q_MFE(0.50)` with `Q_MAE(0.95)` — structurally below 1 — while the
+  floor was written for the static 4.0/2.0 payoff, so enforcing it would refuse
+  every bar (measured rr 0.28–0.30 on all three evaluation folds, 2026-09-14).
+  It travels as telemetry; a recalibrated floor belongs in a fourth gate.
+
+An unusable payload (not a mapping, missing keys, non-finite or non-positive
+multipliers) is ignored with a critical log and the static bracket is used —
+a broken sidecar must degrade, not block every entry.
+
+- **Imports from repo:** none (numpy only — deliberately dependency-light; the
+  barrier payload arrives as an argument and its key is defined in
+  `strategies.base`, not imported here).
 - **Imported by:** `src/core/retrainer.py`, `factory_orchestrator.py`,
   `oanda_forex_orchestrator.py`, `__init__.py`, `run_factory.py`,
   `run_oanda.py`, `chop_ab_test.py`, `scripts/generate_feature_stats.py`,

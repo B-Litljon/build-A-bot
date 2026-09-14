@@ -36,7 +36,7 @@ See the root [GLOSSARY.md](../GLOSSARY.md) for domain terms.
 | File | Tests | Covers |
 |---|---:|---|
 | `test_composite_fundamentals.py` | 18 | Provider chaining: first non-empty wins; a raising source is a miss, not an error |
-| `test_risk_manager.py` | 16 | The bracket floors and all three chop gates |
+| `test_risk_manager.py` | 35 | The bracket floors, all three chop gates, and the learned-barrier geometry substitution |
 | `test_oanda_forex.py` | 31 | The live bot's control flow — mostly failure paths |
 | `test_feature_stats.py` | 12 | The stats artifact and the PSI maths |
 | `test_stream_liveness.py` | 9 | What happens when the price feed goes silent |
@@ -52,7 +52,8 @@ See the root [GLOSSARY.md](../GLOSSARY.md) for domain terms.
 | `test_holdout_gate.py` | 26 | Holdout split, artifact scoring, metadata recording, the confidence-bound verdict, the boundary-tail purge, and the permanent leak guards |
 | `test_dynamic_thresholds.py` | 14 | The 2026-08-29 gate rebuild: OOF Angel-bar calibration, Devil min_child auto-scaling, CP fold-evidence bounds |
 | `test_retraining_notification.py` | 9 | The retrain Discord embed: a gate pass is not a deployment |
-| `test_ml_strategy_guards.py` | 5 | The stale-bar guard + threshold.json pinning |
+| `test_ml_strategy_guards.py` | 21 | The stale-bar guard, threshold.json pinning, sidecar reload seams, and the learned-barrier sidecar (boot refusal, units contract, promotion swap) |
+| `test_barriers.py` | 29 | Excursion labels, the quantile estimator, the monotone audit, and the artifact save/load contract |
 | `verify_warmup.py` | (1, **not collected**) | Warm-up injection |
 
 ### Tests worth understanding before changing anything
@@ -62,6 +63,15 @@ allowed *at all*. A regression here doesn't raise; it silently starts taking
 trades the system was built to refuse. Note `test_cold_start_bypasses_regime_gate`:
 with too little history the regime gate must stand down rather than veto
 everything, or a just-restarted bot freezes.
+
+`TestBarrierGeometry` in the same file (added 2026-09-14) covers the learned
+bracket substitution, and one property there is the one to keep: a payload
+**replaces** the profile multipliers, it does not compound with them
+(`test_payload_does_not_compound_with_the_profile`), and the gates must be asked
+about the substituted distance
+(`test_gate_a_asks_about_the_substituted_stop`). Both failure modes are silent —
+a doubled bracket is just "a wider stop", and a gate reading the static distance
+admits trades whose real stop is eaten by the spread.
 
 **`test_oanda_forex.py`** — the failure-path collection.
 `test_rapid_breach_ticks_close_once` (quotes arrive far faster than a close

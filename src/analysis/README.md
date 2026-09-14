@@ -179,6 +179,11 @@ Execution realism, all three from the 2026-09-02 review:
   Gate B alone vetoes the bottom 20% of the volatility window — roughly 60% of
   the tagger's `*_low` band — so a gateless run scores a population the live bot
   would never take.
+- a strategy's learned barrier payload
+  (`Signal.metadata["barrier_geometry"]`) is **passed through to
+  `calculate_bracket` exactly as the live orchestrator passes it**, so replaying
+  a barrier-enabled model measures the brackets the bot would actually place.
+  Inert for every library strategy, which attach no payload.
 
 `spread_alphas` gives a per-instrument toll mirroring Gate A's own proxy; the
 shipped alphas span 0.072–0.903, a 12.6× range one flat constant cannot cover.

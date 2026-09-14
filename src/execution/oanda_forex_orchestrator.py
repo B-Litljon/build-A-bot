@@ -131,6 +131,14 @@ Glossary:
         on a parked record so the bracket can be rebuilt later. The distances
         are what the cost gate approved, so re-anchoring them on the real
         fill price does not reopen that gate.
+    barrier= (calculate_bracket kwarg) -- learned geometry handed through from
+        the signal's metadata (strategies.base.BARRIER_GEOMETRY_KEY). This
+        orchestrator is a PASS-THROUGH: it does not decide whether geometry is
+        learned or static, it only stops dropping the payload on the floor
+        before the RiskManager sees it. The entry log line records which source
+        produced the bracket, because a soak running fixed 1000-unit positions
+        needs to know when the stop it is being handed came out several-fold
+        wider than the constant.
 
     ── entry guards (added 2026-07-30 after the first multi-fill day) ──
     _reentry_cooldown -- OANDA_REENTRY_COOLDOWN_SECONDS: how long after an

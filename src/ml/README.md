@@ -149,3 +149,25 @@ validation with that fitted model.
 - **Imported by:** `src/core/retrainer.py`,
   `src/strategies/concrete_strategies/ml_strategy.py`.
 - **Writes:** a joblib dict saved next to the Angel/Devil models.
+
+### `barriers/` — `labels.py` + `estimator.py` (learned bracket geometry)
+MAE/MFE excursion labels and the two quantile regressions that turn them into
+per-bar stop/target distances — the replacement for the static 2.0×/4.0× ATR
+bracket. `labels.compute_excursions` computes each label per symbol and returns
+null for any row whose forward window is incomplete (including windows that
+contain a gap bar). `BarrierEstimator` fits `Q_MAE(0.95)` for the stop and
+`Q_MFE(0.50)` for the target, CatBoost-first because its quantile loss accepts
+`monotone_constraints` (LightGBM's rejects them, so that path is
+audit-enforced instead). `save`/`load` are the live sidecar contract:
+`barriers_mae.pkl` + `barriers_mfe.pkl` + `barriers_meta.json`, meta written
+last, label horizon declared.
+
+**Serving it live is gated twice**: `BARRIER_GEOMETRY_ENABLED` must be set on
+the strategy side, and `scripts/evaluate_barriers.py` must have passed — it has
+not, as of 2026-09-14 (fold 3 MAE coverage 0.905 against a 0.93 floor). See the
+package README for the verdict table.
+- **Imported by:** `scripts/evaluate_barriers.py`,
+  `src/strategies/concrete_strategies/ml_strategy.py` (behind the switch),
+  tests.
+- **Writes:** `models/<dir>/barriers_{mae,mfe}.pkl` + `barriers_meta.json` via
+  `save()`. Nothing in the retrainer writes them yet.

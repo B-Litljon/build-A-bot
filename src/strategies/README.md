@@ -30,7 +30,20 @@ Two things about this `Signal` worth knowing:
   same value as `raw_sl_distance`, and no execution path consumes it — target
   sizing belongs to the `RiskManager`'s own multipliers, deliberately, so live
   brackets always match the ones the model was trained against. Vestigial
-  field; verified by tracing every reference.
+  field; verified by tracing every reference. (A learned barrier payload
+  carries its own target, but it travels in `metadata`, not through this field.)
+
+`base.py` also defines **`BARRIER_GEOMETRY_KEY`** (`"barrier_geometry"`), the
+one `Signal.metadata` key that is a contract rather than a diagnostic. It
+carries the learned bracket geometry — `sl_atr_mult` / `tp_atr_mult` as NATR
+multiples, plus `rr`, `admissible`, `tau_mae`, `tau_mfe` and `backend` for
+telemetry — which `RiskManager` substitutes for its static profile multipliers.
+It lives here, beside the `Signal` that carries it, because three layers need
+the same string and only one may own it: the producer
+(`concrete_strategies/ml_strategy.py`), the consumer
+(`execution/risk_manager.py`, which must stay numpy-only) and the offline replay
+(`analysis/strategy_backtester.py`, which keeps execution imports out of module
+scope).
 
 Its `generate_signals` docstring still says "18-feature", which is **stale** —
 the live set is 22 columns (23 with `cost_ratio`).
@@ -76,16 +89,25 @@ Two runtime behaviours worth knowing:
   probabilities, so an operator can tell the model is alive during long
   no-trade stretches. (Individual rejections log at debug level and are
   normally invisible.) Tunable via `MLSTRATEGY_HEARTBEAT_EVERY_N`.
+- **Learned barrier geometry (2026-09-14)** — when enabled
+  (`BARRIER_GEOMETRY_ENABLED=1` or `use_barriers=True`), it loads the
+  `ml.barriers` quantile sidecar from the model dir and attaches per-bar
+  stop/target multiples to `Signal.metadata[BARRIER_GEOMETRY_KEY]`. **OFF by
+  default**, and fail-loud when enabled without a usable artifact set. See
+  `concrete_strategies/README.md` for the switch and the reload seam.
 
 - **Imports from repo:** `strategies.base`, `core.notification_manager`,
-  `ml.feature_pipeline`, `ml.features.v3_features`, `ml.regimes.hmm_regime`,
+  `ml.barriers.estimator`, `ml.barriers.labels`, `ml.feature_pipeline`,
+  `ml.features.v3_features`, `ml.regimes.hmm_regime`,
   `ml.trainers.v3_rf_trainer`.
 - **Imported by:** `concrete_strategies/__init__.py`,
   `ml_factory_strategy.py`, `src/execution/oanda_forex_orchestrator.py`,
   `run_oanda.py`, `tests/`.
 - **Reads:** `models/<asset_class>/angel_latest.pkl`, `devil_latest.pkl`,
-  `threshold.json`, `metadata.json`, `spread_alphas.json`, and
-  `hmm_latest.pkl` when regime features are enabled. **Writes:** nothing.
+  `threshold.json`, `metadata.json`, `spread_alphas.json`,
+  `barriers_mae.pkl` + `barriers_mfe.pkl` + `barriers_meta.json` when the
+  barrier sidecar is enabled, and `hmm_latest.pkl` when regime features are
+  enabled. **Writes:** nothing.
 
 ### `ml_factory_strategy.py`
 `MLFactoryStrategy` — a thin subclass that presets `warmup_period=260` and

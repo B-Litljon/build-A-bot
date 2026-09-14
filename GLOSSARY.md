@@ -194,8 +194,30 @@ near 1.09. `atr_abs = close × natr_14 / 100`.
 **bracket / SL / TP** — the stop-loss and take-profit levels placed either side
 of an entry. Sized as multiples of NATR, so they adapt to how much the
 instrument is actually moving. Equities default 0.5× / 3.0× (a 6:1 payoff);
-**the forex profile overrides this to 1.0× / 2.0×** (2:1) — always check the
-profile rather than the module constants.
+**the forex profile overrides this to 2.0× / 4.0×** (2:1) — it ran 1.0× / 2.0×
+until 2026-08-08. Always check the profile rather than the module constants.
+
+**MAE / MFE (maximum adverse / favourable excursion)** — how far a trade ran
+against you, and how far in your favour, over a fixed forward window, expressed
+as a multiple of the entry bar's ATR. The training targets of the barrier
+models. *(`src/ml/barriers/labels.py`)*
+
+**learned barrier geometry / quantile barrier** — a per-bar replacement for the
+bracket's static multiples, learned as conditional quantiles of the forward
+excursion: the stop is `Q_MAE(0.95)`, the 95th-percentile adverse walk a trade
+tolerates, and the target `Q_MFE(0.50)`, the median favourable walk. Both are
+NATR multiples, so they substitute for `sl_atr_multiplier` /
+`tp_atr_multiplier` and everything downstream — the gates, rounding, sizing —
+is unchanged. Travels on `Signal.metadata["barrier_geometry"]`
+(`BARRIER_GEOMETRY_KEY`) and is **OFF by default**
+(`BARRIER_GEOMETRY_ENABLED=1` to serve it). Two gates stand in front of it: the
+switch, and the Phase 1 promotion verdict in `scripts/evaluate_barriers.py`,
+which as of 2026-09-14 **fails** (fold 3 coverage 0.905 against a 0.93 floor)
+even though the learned stop beats the static constant on pinball loss on every
+fold. *(`src/ml/barriers/`)* — see GLOSSARY-worthy caveat in
+`src/execution/README.md`: the OANDA path trades fixed 1000 units and does not
+size by risk, so a wider learned stop is a proportionally larger loss per
+stop-out.
 
 **alpha / `spread_atr_alpha`** — trading cost expressed as a fraction of a
 typical move. Dimensionless: 0.07 means the toll is 7% of a normal move (cheap);
