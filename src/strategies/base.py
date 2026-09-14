@@ -24,7 +24,14 @@ Glossary:
         so that live brackets always match the ones the model was trained
         against. Treat this field as vestigial.
     metadata -- free-form dict; the ML strategy puts angel_prob, devil_prob and
-        diagnostics here for logging and Discord alerts.
+        diagnostics here for logging and Discord alerts. One key is a real
+        contract rather than a diagnostic — see BARRIER_GEOMETRY_KEY.
+    BARRIER_GEOMETRY_KEY -- the metadata key carrying LEARNED bracket geometry
+        ("barrier_geometry"): the per-bar NATR-multiple stop/target pair from
+        ml.barriers.BarrierEstimator, which RiskManager substitutes for its
+        static profile multipliers. Defined here, beside the Signal it travels
+        on, because execution and analysis both read it and neither may import
+        the strategy implementation to get it.
     BaseStrategy -- the contract: implement generate_signals(df) -> Signal|None.
     params -- whatever kwargs the strategy was constructed with, kept for
         logging and reproducibility.
@@ -43,6 +50,15 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Dict, Any, Optional
 import polars as pl
+
+# Signal.metadata key carrying learned bracket geometry. Lives here, next to the
+# Signal that carries it, because three layers need the same string and only one
+# of them may own it: the producer (strategies.concrete_strategies.ml_strategy),
+# the consumer (execution.risk_manager, which must stay import-light) and the
+# offline replay (analysis.strategy_backtester, which keeps execution out of
+# module scope). An import of strategies.base is the cheapest of those edges and
+# pulls nothing but polars.
+BARRIER_GEOMETRY_KEY = "barrier_geometry"
 
 
 @dataclass

@@ -113,13 +113,40 @@ Glossary:
         because Alpaca reports crypto funds in the cash field.
     $50 minimum notional -- anything smaller returns 0.0 and the trade is
         skipped, to avoid pointless dust positions.
+
+    ── Learned barrier geometry (optional) ──
+    barrier -- the LEARNED geometry payload passed to calculate_bracket (read
+        from Signal.metadata["barrier_geometry"]): per-bar NATR multiples from
+        ml.barriers.BarrierEstimator that REPLACE sl_atr_multiplier /
+        tp_atr_multiplier for that bar. Substituting at the multiplier step is
+        what keeps one code path — the gates, the rounding and the sizing all
+        still see a distance and cannot tell where it came from. An unusable
+        payload is IGNORED with a critical log rather than vetoing the trade:
+        the static bracket is a validated fallback, so a broken sidecar should
+        degrade, not block every entry.
+    last_geometry_source -- "static" or "barrier": which one produced the most
+        recent bracket. Telemetry for the orchestrator's entry log.
+    _barrier_multipliers -- payload validation; returns (sl_mult, tp_mult) or
+        None to mean "use the static profile".
+    BARRIER_WIDTH_WARN -- |log2(learned / static)| above which a substitution
+        logs at WARNING. A conditional quantile may legitimately differ
+        several-fold from the constant, but the OANDA path trades a FIXED 1000
+        units — it does not size by risk (see GLOSSARY) — so a wider learned
+        stop is a proportionally larger loss per stop-out, and that should be
+        visible in the log rather than reconstructed later.
+    rr_floor / admissible -- carried in the payload as telemetry only, NOT
+        enforced here. The estimator's floor compares Q_MFE(0.50) with
+        Q_MAE(0.95), which is structurally below 1, so enforcing a 2.0 floor
+        live would veto every bar (measured 2026-09-14: rr 0.28-0.30 on all
+        three evaluation folds). Making it a gate belongs behind a floor
+        recalibrated for that tau pair.
 """
 
 import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, time as dtime, timezone
-from typing import Optional, Sequence, Tuple
+from typing import Mapping, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -163,6 +190,19 @@ GATE_SPREAD = "spread"  # Gate A — transaction-cost floor
 GATE_REGIME = "regime"  # Gate B — low-volatility regime floor
 GATE_STATIC = "static"  # legacy static floor (equities / no regime context)
 GATE_TIME = "time"      # Gate C — time-of-day blackout (e.g. NY 5pm rollover)
+
+# Geometry provenance: which multipliers produced a bracket. "static" is the
+# RiskProfile constants; "barrier" is the learned per-bar quantile pair from the
+# ml.barriers sidecar (see the module glossary). The payload arrives as an
+# argument — keyed by strategies.base.BARRIER_GEOMETRY_KEY in Signal.metadata —
+# so this module needs no import to find it and stays numpy-only.
+GEOMETRY_STATIC = "static"
+GEOMETRY_BARRIER = "barrier"
+
+# |log2(learned stop / static stop)| above which a substitution is logged at
+# WARNING instead of INFO: a 2x-or-wider change in stop distance is a 2x-or-
+# wider change in loss per stop-out on a path that does not size by risk.
+BARRIER_WIDTH_WARN = 1.0
 
 # Gate C blackout is anchored to America/New_York so it tracks the 5pm rollover
 # across DST (≈21:00 UTC in summer, ≈22:00 UTC in winter). A fixed UTC hour
@@ -310,6 +350,9 @@ class RiskManager:
         # Which gate vetoed the most recent calculate_bracket() call (read by
         # the orchestrator for split telemetry). GATE_NONE when it passed.
         self.last_veto_gate: str = GATE_NONE
+        # Which multipliers produced the most recent bracket: GEOMETRY_STATIC
+        # or GEOMETRY_BARRIER. Read by the orchestrator's entry log.
+        self.last_geometry_source: str = GEOMETRY_STATIC
 
     def calculate_bracket(
         self,
@@ -320,6 +363,7 @@ class RiskManager:
         spread_fresh: bool = False,
         regime_series: Optional[Sequence[float]] = None,
         timestamp: Optional[datetime] = None,
+        barrier: Optional[Mapping] = None,
     ) -> Optional[Tuple[float, float]]:
         """
         Apply multipliers and the chop filter to raw ATR volatility.
@@ -336,10 +380,26 @@ class RiskManager:
         ``regime_series`` holds recent NATR scalars (percent) for ``symbol``,
         newest last. ``spread`` is the live absolute bid-ask spread; when not
         ``spread_fresh`` a volatility-scaled proxy is used instead.
+
+        ``barrier`` is the optional learned geometry payload from the strategy
+        (``Signal.metadata["barrier_geometry"]``). When present and usable its
+        ``sl_atr_mult`` / ``tp_atr_mult`` replace the profile's static
+        multipliers for this bar; every gate still runs, and still runs on the
+        *substituted* stop, so "does this stop pay for the spread / is this bar
+        too quiet" is asked of the distance actually being placed.
         """
         self.last_veto_gate = GATE_NONE
-        sl_dist = raw_atr * self.profile.sl_atr_multiplier
-        tp_dist = raw_atr * self.profile.tp_atr_multiplier
+        self.last_geometry_source = GEOMETRY_STATIC
+
+        sl_mult = self.profile.sl_atr_multiplier
+        tp_mult = self.profile.tp_atr_multiplier
+        learned = self._barrier_multipliers(barrier, symbol)
+        if learned is not None:
+            sl_mult, tp_mult = learned
+            self.last_geometry_source = GEOMETRY_BARRIER
+
+        sl_dist = raw_atr * sl_mult
+        tp_dist = raw_atr * tp_mult
 
         def _bracket() -> Tuple[float, float]:
             return (
@@ -372,6 +432,105 @@ class RiskManager:
             )
             return None
         return _bracket()
+
+    def _barrier_multipliers(
+        self, barrier: Optional[Mapping], symbol: Optional[str]
+    ) -> Optional[Tuple[float, float]]:
+        """
+        Validate a learned geometry payload; return (sl_mult, tp_mult) or None.
+
+        None means "use the static profile" and covers both "no payload" and
+        "unusable payload" — the caller cannot tell those apart, by design,
+        because both must place a bracket. The reason goes to the log here.
+
+        Telemetry keys the strategy also sends (rr, admissible, tau_mae,
+        tau_mfe, backend, source) are deliberately not required: only the two
+        numbers that size the bracket are load-bearing, so adding a field
+        upstream can never break live execution.
+
+        ``admissible`` is reported, never enforced — the estimator's rr_floor
+        was written for the static 4.0/2.0 payoff while it scores
+        Q_MFE(0.50)/Q_MAE(0.95), a ratio structurally below 1, so enforcing it
+        here would veto every trade (measured rr 0.28-0.30 on all three
+        evaluation folds, 2026-09-14).
+        """
+        if barrier is None:
+            return None
+        if not isinstance(barrier, Mapping):
+            logger.critical(
+                "[%s] barrier geometry payload is %s, not a mapping — ignoring "
+                "it and using the static bracket",
+                symbol or "unknown",
+                type(barrier).__name__,
+            )
+            return None
+        try:
+            sl_mult = float(barrier["sl_atr_mult"])
+            tp_mult = float(barrier["tp_atr_mult"])
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.critical(
+                "[%s] barrier geometry payload has no usable "
+                "sl_atr_mult/tp_atr_mult (%s) — ignoring it and using the "
+                "static bracket",
+                symbol or "unknown",
+                exc,
+            )
+            return None
+        if not (np.isfinite(sl_mult) and np.isfinite(tp_mult)):
+            logger.critical(
+                "[%s] barrier geometry payload is non-finite "
+                "(sl=%r tp=%r) — ignoring it and using the static bracket",
+                symbol or "unknown",
+                sl_mult,
+                tp_mult,
+            )
+            return None
+        if sl_mult <= 0.0 or tp_mult <= 0.0:
+            logger.critical(
+                "[%s] barrier geometry payload is non-positive "
+                "(sl=%.6f tp=%.6f) — a zero or inverted bracket is not "
+                "tradeable; using the static bracket",
+                symbol or "unknown",
+                sl_mult,
+                tp_mult,
+            )
+            return None
+
+        static_sl = self.profile.sl_atr_multiplier
+        rr = barrier.get("rr")
+        width = (
+            abs(float(np.log2(sl_mult / static_sl)))
+            if static_sl and static_sl > 0
+            else 0.0
+        )
+        if width >= BARRIER_WIDTH_WARN:
+            # Not a veto: a conditional quantile may legitimately differ from a
+            # constant. But on the OANDA path the position is a fixed 1000
+            # units, so a wider stop is a proportionally larger loss per
+            # stop-out and the operator should see the ratio, not infer it.
+            logger.warning(
+                "[%s] learned barrier stop %.3fx vs static %.3fx "
+                "(%.2fx wider) — fixed-unit path does not size by risk, so "
+                "this scales the loss per stop-out; rr=%s admissible=%s",
+                symbol or "unknown",
+                sl_mult,
+                static_sl,
+                (sl_mult / static_sl) if static_sl else float("nan"),
+                f"{float(rr):.3f}" if rr is not None else "n/a",
+                barrier.get("admissible"),
+            )
+        else:
+            logger.info(
+                "[%s] learned barrier geometry in use: sl=%.3fx tp=%.3fx "
+                "(static %.3fx/%.3fx) rr=%s",
+                symbol or "unknown",
+                sl_mult,
+                tp_mult,
+                static_sl,
+                self.profile.tp_atr_multiplier,
+                f"{float(rr):.3f}" if rr is not None else "n/a",
+            )
+        return sl_mult, tp_mult
 
     def _static_floor(self, entry_price: float, symbol: Optional[str]) -> float:
         """Legacy pip / percent floor (used when no regime context is given)."""

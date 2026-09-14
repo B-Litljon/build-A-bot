@@ -92,6 +92,32 @@ Glossary:
         Exists so an operator can see the model is alive and evaluating during
         long stretches with no trades -- rejections themselves log at debug
         level and are normally invisible.
+
+    ── Learned barrier geometry (optional sidecar) ──
+    use_barriers -- whether this strategy serves LEARNED stop/target geometry.
+        Constructor argument, defaulting from BARRIER_GEOMETRY_ENABLED; OFF
+        unless asked for, so a soak keeps running the static profile
+        multipliers until someone deliberately enables the learned ones on
+        evidence.
+    _barrier_estimator -- the loaded BarrierEstimator (ml.barriers), or None
+        when the sidecar is off. Two quantile models: SL <- Q_MAE(tau_mae),
+        TP <- Q_MFE(tau_mfe).
+    _barrier_mtime -- the mtime of barriers_meta.json, the reload trigger. The
+        META alone is watched because save() writes both pickles before it, so
+        seeing a new meta means a complete matching pair (see estimator.save).
+    _load_barriers -- reads the sidecar and REFUSES to boot on a missing,
+        unparsable or horizon-mismatched set. Fail-loud is deliberate: an
+        operator who enabled learned stops and silently got static ones could
+        not tell, which is the same trap the cost_ratio/HMM guards close.
+    _barrier_geometry -- one bar's learned geometry as the payload the
+        orchestrator hands to RiskManager, in NATR MULTIPLES (the same units as
+        RiskProfile.sl_atr_multiplier) so the learned quantiles substitute for
+        the static constants and every downstream step -- rounding, the three
+        gates, sizing -- stays on one code path.
+    BARRIER_GEOMETRY_KEY -- the Signal.metadata key that payload travels
+        under (defined in strategies.base, so execution and the offline
+        backtester can read it without importing this module).
+    BARRIER_GEOMETRY_ENABLED -- "1" serves learned geometry; unset/0 does not.
 """
 
 import json
@@ -108,7 +134,7 @@ import polars as pl
 
 warnings.filterwarnings("ignore", message=".*join_asof.*")
 
-from strategies.base import BaseStrategy, Signal
+from strategies.base import BARRIER_GEOMETRY_KEY, BaseStrategy, Signal
 from core import events
 from core.notification_manager import NotificationManager
 from core.thresholds import ANGEL_THRESHOLD as DEFAULT_ANGEL_THRESHOLD
@@ -116,6 +142,11 @@ from core.thresholds import ANGEL_THRESHOLD as DEFAULT_ANGEL_THRESHOLD
 # a module-level import here cycles through execution/__init__.py.
 
 # CRITICAL: Import FeaturePipeline to prevent training/inference skew
+from ml.barriers.estimator import (
+    BARRIER_META_FILENAME,
+    BarrierEstimator,
+)
+from ml.barriers.labels import DEFAULT_HORIZON
 from ml.feature_pipeline import FeaturePipeline
 from ml.features.v3_features import (
     V3BaseFeatures,
@@ -131,6 +162,32 @@ from ml.regimes.hmm_regime import (
 from ml.trainers.v3_rf_trainer import V3RandomForestTrainer
 
 logger = logging.getLogger(__name__)
+
+ENV_BARRIER_GEOMETRY_ENABLED = "BARRIER_GEOMETRY_ENABLED"
+
+# Features a barrier model may read from the served frame beyond the Angel's own
+# schema: `close` is needed for the NATR%->price conversion and is present in
+# the pipeline output, but is deliberately not a model feature (absolute prices
+# are leakage), so it is not in feature_names_in_.
+_BARRIER_FRAME_ONLY_COLS = frozenset({"close"})
+
+
+def _barriers_requested(explicit: Optional[bool] = None) -> bool:
+    """
+    Resolve the barrier sidecar switch: explicit argument first, then
+    BARRIER_GEOMETRY_ENABLED. Anything unset/0/false/no/off means OFF.
+
+    Default OFF is the point, not an accident: the learned geometry is only
+    promotable once it has beaten the static bracket on every evaluation fold,
+    and the served Devil's labels still encode the static multiples. An off
+    sidecar makes this class behave exactly as it did before the barriers
+    existed, which is what keeps a live soak safe across a restart onto this
+    branch.
+    """
+    if explicit is not None:
+        return bool(explicit)
+    raw = os.getenv(ENV_BARRIER_GEOMETRY_ENABLED, "0").strip().lower()
+    return raw not in ("0", "false", "no", "off", "")
 
 
 def _close_enough(a: float, b: float, rel_tol: float = 1e-6) -> bool:
@@ -157,6 +214,11 @@ class MLStrategy(BaseStrategy):
         Probability threshold for Devil to approve a trade (default: 0.50).
     warmup_period : int
         Minimum candles required before trading (default: 260).
+    use_barriers : bool | None
+        Serve learned quantile barrier geometry instead of the profile's static
+        stop/target multipliers. None (the default) defers to
+        BARRIER_GEOMETRY_ENABLED, which is OFF unless set — see the module
+        glossary.
     """
 
     def __init__(
@@ -172,6 +234,7 @@ class MLStrategy(BaseStrategy):
         angel_trainer=None,
         devil_trainer=None,
         regime_window: int = 260,  # must match RiskProfile.regime_window
+        use_barriers: Optional[bool] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -337,6 +400,23 @@ class MLStrategy(BaseStrategy):
         # _pair_pending: which side we are waiting for ("angel"/"devil"/None).
         self._pair_mixed = False
         self._pair_pending = None
+
+        # ── learned barrier geometry (optional sidecar) ───────────────────
+        # Loaded AFTER the sidecar mtimes above so a promotion that swapped
+        # the whole directory is read once, at boot, from the settled files.
+        self.use_barriers = _barriers_requested(use_barriers)
+        self._barrier_estimator: Optional[BarrierEstimator] = None
+        self._barrier_meta_path = self.angel_path.parent / BARRIER_META_FILENAME
+        self._barrier_mtime = 0.0
+        if self.use_barriers:
+            self._barrier_estimator = self._load_barriers()
+            self._barrier_mtime = self._barrier_meta_mtime()
+        else:
+            logger.info(
+                "Barrier geometry OFF (%s unset) — stop/target distances come "
+                "from the static profile multipliers",
+                ENV_BARRIER_GEOMETRY_ENABLED,
+            )
 
         # Heartbeat state: every N bars per symbol, log a summary of the
         # angel_prob distribution. Lets the operator see the model is
@@ -512,6 +592,157 @@ class MLStrategy(BaseStrategy):
             )
             return None, 0.0
 
+    def _barrier_meta_mtime(self) -> float:
+        """mtime of the barrier meta sidecar, or 0.0 when it does not exist."""
+        return (
+            os.path.getmtime(self._barrier_meta_path)
+            if self._barrier_meta_path.exists()
+            else 0.0
+        )
+
+    def _load_barriers(self) -> BarrierEstimator:
+        """
+        Load the learned barrier sidecar from the model directory.
+
+        Three files travel together — barriers_mae.pkl, barriers_mfe.pkl and
+        barriers_meta.json — beside the Angel/Devil pickles, so a model dir
+        stays self-describing and a promotion moves the weights and the
+        geometry contract as one unit.
+
+        Fail-loud, in the same spirit as the cost_ratio and HMM guards: dynamic
+        geometry was explicitly requested (BARRIER_GEOMETRY_ENABLED=1 or
+        use_barriers=True), so an absent or inconsistent artifact set is a boot
+        error, never a silent fall back to the static bracket. An operator who
+        asked for learned stops and got static ones has no way to tell.
+
+        Two contracts are checked beyond "the files parse":
+
+        * the horizon. The learned stop is the quantile of a walk N bars long;
+          serving it under a different execution lifetime sizes the bracket off
+          a distribution the trade never experiences.
+        * the feature vocabulary. Every feature the barrier model reads must be
+          one the served feature schema produces, or the geometry is being fed
+          a column some other build computed.
+        """
+        model_dir = self.angel_path.parent
+        est = BarrierEstimator.load(model_dir)
+
+        if est.horizon_ != DEFAULT_HORIZON:
+            raise RuntimeError(
+                f"Barrier artifact in {model_dir} was labelled at a "
+                f"{est.horizon_}-bar horizon but this tree's execution "
+                f"lifetime is {DEFAULT_HORIZON} bars "
+                "(ml.barriers.labels.DEFAULT_HORIZON). Refit at the served "
+                "horizon — do not scale a bracket off the wrong walk length."
+            )
+
+        unknown = [
+            c
+            for c in est.feature_cols
+            if c not in self.feature_names and c not in _BARRIER_FRAME_ONLY_COLS
+        ]
+        if unknown:
+            raise RuntimeError(
+                f"Barrier artifact in {model_dir} reads features the served "
+                f"schema does not carry: {unknown}. The Angel's schema is what "
+                "the live pipeline produces; a barrier model fitted on "
+                "anything else would predict on a column this build does not "
+                "compute."
+            )
+        if "natr_14" not in self.feature_names:
+            raise RuntimeError(
+                "Barrier geometry needs 'natr_14' — it is the conversion from "
+                "the model's NATR-space quantiles to a price distance, and the "
+                f"served schema ({model_dir}) does not carry it."
+            )
+        return est
+
+    def _barrier_geometry(self, features_df: pl.DataFrame) -> Optional[dict]:
+        """
+        Learned barrier geometry for the newest bar, as the payload execution
+        consumes — or None to leave the static bracket in place.
+
+        The multipliers returned are NATR multiples, exactly the units of
+        RiskProfile.sl_atr_multiplier / tp_atr_multiplier. That is the whole
+        integration: the learned quantiles substitute for the two static
+        constants and nothing else about bracket sizing changes, so rounding,
+        the three gates and position sizing stay on one code path whether the
+        geometry is learned or static.
+
+        Returns None (static bracket) when the sidecar is off, when prediction
+        raises, or when the estimator has not been fitted. It does NOT withhold
+        geometry over `admissible`: that flag compares Q_MFE(0.50) against
+        Q_MAE(0.95), a ratio that is structurally below 1, while its floor was
+        written for the static 4.0/2.0 payoff — measured 2026-09-14 on the
+        cached basket, rr came out 0.28–0.30 on every fold, i.e. no bar is ever
+        admissible, so vetoing on it would silently disable the feature
+        outright. The flag and its rr travel in the payload as telemetry until
+        the floor is calibrated against the tau pair (see llm_reports).
+        """
+        est = self._barrier_estimator
+        if est is None:
+            return None
+        try:
+            # tail(1): the models are row-independent, so one bar's features
+            # are enough — predicting the whole buffer every bar would burn
+            # CPU proportional to the warm-up window for identical numbers.
+            out = est.predict(features_df.tail(1))[0]
+        except Exception as exc:
+            logger.error(
+                "[barrier] prediction failed (%s) — static bracket this bar", exc
+            )
+            return None
+        return {
+            "source": "barrier",
+            "sl_atr_mult": float(out.q_mae),
+            "tp_atr_mult": float(out.q_mfe),
+            "rr": float(out.rr),
+            "admissible": bool(out.admissible),
+            "tau_mae": float(est.tau_mae),
+            "tau_mfe": float(est.tau_mfe),
+            "backend": est.backend_,
+        }
+
+    def _reload_barriers_if_changed(self) -> None:
+        """
+        Swap in a newly promoted barrier artifact set, hot.
+
+        Triggered by the META's mtime alone. save() writes both pickles before
+        the meta and the meta is replaced last, so a bar that sees a new meta
+        reads a complete, matching pair; a pickle replaced on its own is
+        invisible here deliberately, because there is no way to tell which of
+        the two quantile models a half-written set actually holds.
+
+        A failed reload KEEPS the previously loaded estimator and alerts —
+        never a silent disable. Stale geometry that passed its audit is better
+        than none, and much better than a half-read pair, which is the same
+        policy the Angel/Devil reload follows.
+        """
+        mtime = self._barrier_meta_mtime()
+        if mtime <= self._barrier_mtime:
+            return
+        try:
+            est = self._load_barriers()
+        except Exception as exc:
+            msg = (
+                "[HOT-RELOAD] barrier artifact set in "
+                f"{self.angel_path.parent} is unreadable ({exc}) — keeping the "
+                "previously loaded geometry until a complete set lands."
+            )
+            logger.critical(msg)
+            self.notification_manager.send_system_message(msg)
+            return
+        with self._reload_lock:
+            self._barrier_estimator = est
+        self._barrier_mtime = mtime
+        msg = (
+            "🔄 [HOT-RELOAD] Learned barrier geometry ingested: "
+            f"backend={est.backend_} tau_mae={est.tau_mae:.2f} "
+            f"tau_mfe={est.tau_mfe:.2f} horizon={est.horizon_} bars"
+        )
+        logger.critical(msg)
+        self.notification_manager.send_system_message(msg)
+
     @property
     def warmup_period(self) -> int:
         """Returns minimum candles required for indicators to warm up."""
@@ -664,6 +895,10 @@ class MLStrategy(BaseStrategy):
                 )
                 logger.critical(msg)
                 self.notification_manager.send_system_message(msg)
+
+            # ── barrier sidecar reload (own mtime, same reasoning) ────────
+            if self.use_barriers:
+                self._reload_barriers_if_changed()
 
             # Send notification if any model was reloaded
             if reloaded:
@@ -886,12 +1121,38 @@ class MLStrategy(BaseStrategy):
             # TA-Lib NATR is a percentage; convert to absolute ATR
             atr_abs = (natr_value / 100.0) * current_price
 
+            # Learned geometry, when the sidecar is on. These are NATR
+            # multiples: RiskManager multiplies them by the same raw ATR the
+            # static profile multipliers would have used, so the learned
+            # quantiles REPLACE 2.0x/4.0x rather than compounding with them.
+            geometry = self._barrier_geometry(features_df)
+            if geometry:
+                geometry_note = (
+                    f"barrier sl={geometry['sl_atr_mult']:.3f}x "
+                    f"tp={geometry['tp_atr_mult']:.3f}x "
+                    f"(rr={geometry['rr']:.2f}, {geometry['backend']})"
+                )
+            else:
+                geometry_note = "static profile multipliers"
+
+            # Telemetry for the emitted bar, computed into locals first: the
+            # events sink sits on the bar path, and a source-level test forbids
+            # arithmetic or indexing inside an emit() call (test_events.py).
+            # The keys are always present and null when the sidecar is off, so
+            # a consumer's schema does not change with the switch.
+            geometry_source = "barrier" if geometry else "static"
+            sl_atr_mult = geometry["sl_atr_mult"] if geometry else None
+            tp_atr_mult = geometry["tp_atr_mult"] if geometry else None
+            barrier_rr = geometry["rr"] if geometry else None
+            barrier_admissible = geometry["admissible"] if geometry else None
+
             logger.info(
                 f"[{symbol}] ANGEL & DEVIL AGREEMENT | "
                 f"Price={current_price:.2f} | "
                 f"Angel Prob: {angel_prob:.2f} | "
                 f"Devil Prob: {devil_prob:.2f} | "
-                f"raw_ATR={atr_abs:.4f}"
+                f"raw_ATR={atr_abs:.4f} | "
+                f"geometry: {geometry_note}"
             )
 
             events.emit(
@@ -904,20 +1165,29 @@ class MLStrategy(BaseStrategy):
                 outcome="agreement",
                 proposed=True,
                 atr=round(atr_abs, 6),
+                geometry=geometry_source,
+                sl_atr_mult=sl_atr_mult,
+                tp_atr_mult=tp_atr_mult,
+                barrier_rr=barrier_rr,
+                barrier_admissible=barrier_admissible,
             )
+
+            metadata = {
+                "symbol": symbol,
+                "angel_prob": float(angel_prob),
+                "devil_prob": float(devil_prob),
+                "atr_abs": atr_abs,
+                "timestamp": df["timestamp"].tail(1)[0],
+            }
+            if geometry:
+                metadata[BARRIER_GEOMETRY_KEY] = geometry
 
             return Signal(
                 direction="long",
                 entry_price=current_price,
                 raw_sl_distance=atr_abs,
                 raw_tp_distance=atr_abs,
-                metadata={
-                    "symbol": symbol,
-                    "angel_prob": float(angel_prob),
-                    "devil_prob": float(devil_prob),
-                    "atr_abs": atr_abs,
-                    "timestamp": df["timestamp"].tail(1)[0],
-                },
+                metadata=metadata,
             )
 
         except Exception as e:

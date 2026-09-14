@@ -219,7 +219,13 @@ from core import events
 from core.notification_manager import NotificationManager
 from data.oanda_provider import OandaMarketProvider, _to_oanda_symbol
 from execution.oanda_order_manager import OandaOrderManager, OrderCloseError
-from execution.risk_manager import GATE_REGIME, GATE_SPREAD, GATE_TIME, RiskManager
+from execution.risk_manager import (
+    GATE_REGIME,
+    GATE_SPREAD,
+    GATE_TIME,
+    RiskManager,
+)
+from strategies.base import BARRIER_GEOMETRY_KEY
 from strategies.concrete_strategies.ml_strategy import MLStrategy
 
 logger = logging.getLogger(__name__)
@@ -1384,6 +1390,12 @@ class OandaForexOrchestrator:
                 spread_fresh=spread_fresh,
                 regime_series=self._regime_natr.get(symbol),
                 timestamp=datetime.now(timezone.utc),
+                # Learned geometry, when the strategy attached it: per-bar
+                # NATR quantile multiples that replace the static profile
+                # constants. Absent on every path whose strategy does not
+                # produce it (the whole rule-based library), in which case
+                # this is None and nothing changes.
+                barrier=(signal.metadata or {}).get(BARRIER_GEOMETRY_KEY),
             )
             if bracket:
                 sl_dist, tp_dist = bracket
@@ -1393,6 +1405,13 @@ class OandaForexOrchestrator:
                 else:  # short
                     sl_price = signal.entry_price + sl_dist
                     tp_price = signal.entry_price - tp_dist
+                logger.info(
+                    "[%s] bracket %.6f / %.6f (geometry=%s)",
+                    symbol,
+                    sl_dist,
+                    tp_dist,
+                    getattr(self._risk_manager, "last_geometry_source", "static"),
+                )
 
         if sl_price is None or tp_price is None:
             gate = getattr(self._risk_manager, "last_veto_gate", GATE_SPREAD)

@@ -40,7 +40,7 @@ import numpy as np
 import polars as pl
 from scipy.stats import beta
 
-from strategies.base import BaseStrategy, Signal
+from strategies.base import BARRIER_GEOMETRY_KEY, BaseStrategy, Signal
 from analysis.behavior_matrix import DEFAULT_TOLL_R, _profit_factor
 
 if TYPE_CHECKING:  # pragma: no cover - annotation only, never imported at runtime
@@ -269,6 +269,14 @@ def run_backtest(
                 spread_fresh=False,          # offline: use the volatility proxy
                 regime_series=regime_window,
                 timestamp=timestamps[entry_idx] if use_real_timestamps else None,
+                # Same learned-geometry hand-off the live orchestrator makes, so
+                # a replay of a barrier-enabled model measures the brackets the
+                # bot would actually place. Inert for every library strategy
+                # (they attach no payload), which is why this stays a pure
+                # pass-through rather than a re-implementation.
+                barrier=(getattr(signal, "metadata", None) or {}).get(
+                    BARRIER_GEOMETRY_KEY
+                ),
             )
             if bracket is None:
                 gate = getattr(risk_manager, "last_veto_gate", "unknown")

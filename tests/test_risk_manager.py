@@ -37,6 +37,11 @@ Glossary:
         values changed. These are the numbers the model is trained against;
         if they move, retrainer.get_asset_config feeds different labels to the
         Devil and train/serve skew follows silently.
+    TestBarrierGeometry -- the learned-geometry substitution. A barrier payload
+        must REPLACE the profile multipliers (not compound with them), the
+        gates must be asked about the substituted distance rather than the
+        static one, and any unusable payload must degrade to the static bracket
+        instead of raising on the entry path.
 """
 
 # Add src to path
@@ -46,12 +51,16 @@ sys.path.insert(0, str(project_root / "src"))
 from execution.risk_manager import (
     COUPLING_LOOSEN,
     COUPLING_TIGHTEN,
+    GATE_NONE,
     GATE_REGIME,
     GATE_SPREAD,
+    GEOMETRY_BARRIER,
+    GEOMETRY_STATIC,
     RiskManager,
     RiskProfile,
     coupled_keff,
 )
+from strategies.base import BARRIER_GEOMETRY_KEY
 
 
 def _forex_profile(**overrides):
@@ -278,6 +287,165 @@ class TestDynamicHybridFloor(unittest.TestCase):
         # JPY pip floor = 2.0 * 0.01 = 0.02; sl_dist 0.5*0.03=... uses mult 1.0 → 0.015 < 0.02
         self.assertIsNone(rm.calculate_bracket(155.0, 0.015, symbol="USD_JPY"))
         self.assertIsNotNone(rm.calculate_bracket(155.0, 0.05, symbol="USD_JPY"))
+
+
+class TestBarrierGeometry(unittest.TestCase):
+    """
+    Learned barrier geometry (ml.barriers sidecar) entering the bracket path.
+
+    The contract under test: a payload replaces the profile's static
+    multipliers for that bar, the three gates see the SUBSTITUTED stop (a
+    learned stop too tight to pay the spread must still be refused), and a
+    broken payload degrades to the static bracket rather than raising — a
+    telemetry-shaped bug in a sidecar must never sit on the order path.
+    """
+
+    _SERIES = [1.0] * 100  # warm, flat: Gate B never fires, pctile rank 1.0
+
+    def _payload(self, **overrides):
+        base = {
+            "source": "barrier",
+            "sl_atr_mult": 1.0,
+            "tp_atr_mult": 2.0,
+            "rr": 0.29,
+            "admissible": False,
+            "tau_mae": 0.95,
+            "tau_mfe": 0.50,
+            "backend": "catboost",
+        }
+        base.update(overrides)
+        return base
+
+    def test_payload_replaces_static_multipliers(self):
+        """sl/tp come from the payload, not from sl_atr_multiplier."""
+        rm = RiskManager(_forex_profile())  # static 1.0 / 2.0
+        res = rm.calculate_bracket(
+            150.0, 0.5, symbol="GBP_JPY",
+            spread=0.001, spread_fresh=True, regime_series=self._SERIES,
+            barrier=self._payload(sl_atr_mult=3.0, tp_atr_mult=6.0),
+        )
+        self.assertEqual(res, (1.5, 3.0))
+        self.assertEqual(rm.last_geometry_source, GEOMETRY_BARRIER)
+        self.assertEqual(rm.last_veto_gate, GATE_NONE)
+
+    def test_payload_does_not_compound_with_the_profile(self):
+        """1.0x learned != 1.0x learned x 1.0x profile — substitution, not
+        multiplication. A test that cannot tell those apart would pass on a
+        silently doubled bracket."""
+        rm = RiskManager(_forex_profile())
+        res = rm.calculate_bracket(
+            150.0, 0.5, symbol="GBP_JPY",
+            spread=0.001, spread_fresh=True, regime_series=self._SERIES,
+            barrier=self._payload(sl_atr_mult=1.0, tp_atr_mult=2.0),
+        )
+        self.assertEqual(res, (0.5, 1.0))
+
+    def test_gate_a_asks_about_the_substituted_stop(self):
+        """Same raw ATR and spread: the static stop passes, a learned stop
+        tight enough to be eaten by the spread must be vetoed."""
+        rm = RiskManager(_forex_profile())
+        # static sl_dist = 0.5 * 1.0 = 0.5 > 1.5*0.001; learned = 0.5*0.001 = 0.0005
+        self.assertIsNotNone(
+            rm.calculate_bracket(
+                150.0, 0.5, symbol="GBP_JPY",
+                spread=0.001, spread_fresh=True, regime_series=self._SERIES,
+            )
+        )
+        self.assertEqual(rm.last_geometry_source, GEOMETRY_STATIC)
+        self.assertIsNone(
+            rm.calculate_bracket(
+                150.0, 0.5, symbol="GBP_JPY",
+                spread=0.001, spread_fresh=True, regime_series=self._SERIES,
+                barrier=self._payload(sl_atr_mult=0.001),
+            )
+        )
+        self.assertEqual(rm.last_veto_gate, GATE_SPREAD)
+
+    def test_gate_b_still_fires_under_learned_geometry(self):
+        rm = RiskManager(_forex_profile())
+        res = rm.calculate_bracket(
+            150.0, 0.5, symbol="GBP_JPY",
+            spread=0.001, spread_fresh=True,
+            regime_series=[1.0] * 99 + [0.05],  # current is the window minimum
+            barrier=self._payload(),
+        )
+        self.assertIsNone(res)
+        self.assertEqual(rm.last_veto_gate, GATE_REGIME)
+
+    def test_inadmissible_payload_is_not_a_veto(self):
+        """admissible=False travels as telemetry only: the estimator's rr_floor
+        scores Q_MFE(0.50)/Q_MAE(0.95), which is structurally below 1, so
+        enforcing it live would refuse every bar. Measured rr 0.28-0.30 across
+        all three evaluation folds on 2026-09-14."""
+        rm = RiskManager(_forex_profile())
+        res = rm.calculate_bracket(
+            150.0, 0.5, symbol="GBP_JPY",
+            spread=0.001, spread_fresh=True, regime_series=self._SERIES,
+            barrier=self._payload(rr=0.10, admissible=False),
+        )
+        self.assertIsNotNone(res)
+        self.assertEqual(rm.last_geometry_source, GEOMETRY_BARRIER)
+
+    def test_unusable_payloads_degrade_to_static(self):
+        """Every malformed shape must leave a tradeable static bracket."""
+        rm = RiskManager(_forex_profile())
+        for bad in (
+            "not-a-mapping",
+            {"tp_atr_mult": 2.0},                      # missing sl
+            {"sl_atr_mult": "wide", "tp_atr_mult": 2.0},
+            {"sl_atr_mult": float("nan"), "tp_atr_mult": 2.0},
+            {"sl_atr_mult": float("inf"), "tp_atr_mult": 2.0},
+            {"sl_atr_mult": 0.0, "tp_atr_mult": 2.0},  # zero-width stop
+            {"sl_atr_mult": -3.0, "tp_atr_mult": 2.0}, # inverted bracket
+        ):
+            res = rm.calculate_bracket(
+                150.0, 0.5, symbol="GBP_JPY",
+                spread=0.001, spread_fresh=True, regime_series=self._SERIES,
+                barrier=bad,
+            )
+            self.assertEqual(
+                res, (0.5, 1.0), f"payload {bad!r} should have been ignored"
+            )
+            self.assertEqual(rm.last_geometry_source, GEOMETRY_STATIC)
+
+    def test_provenance_resets_each_call(self):
+        """A barrier bar followed by a payload-less bar must not keep claiming
+        learned provenance — the orchestrator logs this per entry."""
+        rm = RiskManager(_forex_profile())
+        rm.calculate_bracket(
+            150.0, 0.5, symbol="GBP_JPY", spread=0.001, spread_fresh=True,
+            regime_series=self._SERIES, barrier=self._payload(),
+        )
+        self.assertEqual(rm.last_geometry_source, GEOMETRY_BARRIER)
+        rm.calculate_bracket(
+            150.0, 0.5, symbol="GBP_JPY", spread=0.001, spread_fresh=True,
+            regime_series=self._SERIES,
+        )
+        self.assertEqual(rm.last_geometry_source, GEOMETRY_STATIC)
+
+    def test_payload_key_matches_the_signal_contract(self):
+        """The metadata key is defined once (strategies.base); execution reads
+        whatever the caller hands it. Pin the string so a rename cannot leave
+        an orchestrator looking up a key nobody writes."""
+        self.assertEqual(BARRIER_GEOMETRY_KEY, "barrier_geometry")
+
+    def test_no_regime_series_still_honours_a_payload(self):
+        """Equities-style path (static floor, no vol context): the learned
+        stop is still the one floored."""
+        rm = RiskManager(_forex_profile(min_sl_pips=2.0))
+        # JPY pip floor 0.02; learned 0.015 < floor -> static floor veto
+        self.assertIsNone(
+            rm.calculate_bracket(
+                155.0, 0.015, symbol="USD_JPY",
+                barrier=self._payload(sl_atr_mult=1.0),
+            )
+        )
+        self.assertIsNotNone(
+            rm.calculate_bracket(
+                155.0, 0.05, symbol="USD_JPY",
+                barrier=self._payload(sl_atr_mult=1.0),
+            )
+        )
 
 
 class TestProductionForexProfile(unittest.TestCase):

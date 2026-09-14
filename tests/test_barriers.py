@@ -11,12 +11,17 @@ Glossary:
     _synth -- a deterministic sine-wave price frame with known volatility, so
         label expectations can be computed by hand.
     _flat -- a constant-price frame where every excursion is exactly 0.
+    TestPersistence -- the live sidecar contract: exact round-trip, and a
+        refusal on an incomplete or horizon-less artifact set.
 """
 
 import sys
+import tempfile
 import unittest
 from io import StringIO
 from pathlib import Path
+
+import json
 
 import numpy as np
 import polars as pl
@@ -402,6 +407,116 @@ class TestFallbackMonotonicity(unittest.TestCase):
         )
         self.assertTrue(np.isfinite(preds).all())
         self.assertTrue(np.all(preds == preds[0]))
+
+
+class TestPersistence(unittest.TestCase):
+    """
+    The live sidecar contract: save()/load() must round-trip a fitted
+    estimator EXACTLY, and refuse to hand back something half-loaded.
+
+    What this pins is not "pickle works" but the three properties the live
+    strategy depends on: identical predictions after a reload (a promotion that
+    shifted geometry by a rounding step would be invisible in a log), a refusal
+    on an incomplete or horizon-less artifact set (an artifact whose label
+    window is undeclared cannot be served into a bracket), and a picklable
+    degraded backend (the no-lightgbm path used a closure, which cannot be
+    pickled, so the fallback was previously unservable live).
+    """
+
+    def _fitted(self, df=None):
+        df = df if df is not None else _synth(900)
+        labels = compute_excursions(df, horizon=45)
+        est = BarrierEstimator(feature_cols=_features(df))
+        try:
+            est.fit(df, labels)
+        except ValueError as e:
+            if "monotonicity" in str(e):
+                self.skipTest("synthetic regime refused by the audit")
+            raise
+        return est, df
+
+    def test_round_trip_predictions_are_identical(self):
+        est, df = self._fitted()
+        with tempfile.TemporaryDirectory() as td:
+            est.save(td, horizon=45)
+            restored = BarrierEstimator.load(td)
+        before = est.predict(df.tail(1))[0]
+        after = restored.predict(df.tail(1))[0]
+        self.assertEqual(before, after)
+        self.assertEqual(restored.tau_mae, est.tau_mae)
+        self.assertEqual(restored.tau_mfe, est.tau_mfe)
+        self.assertEqual(restored.feature_names_in_, est.feature_names_in_)
+        self.assertEqual(restored.backend_, est.backend_)
+        self.assertEqual(restored.horizon_, 45)
+
+    def test_meta_is_written_last(self):
+        """The live reload triggers on the meta's mtime alone, so the two
+        pickles must land first — otherwise a bar could read a new contract
+        against stale weights (or the reverse)."""
+        est, _ = self._fitted()
+        with tempfile.TemporaryDirectory() as td:
+            est.save(td, horizon=45)
+            p = Path(td)
+            meta = (p / "barriers_meta.json").stat().st_mtime
+            for name in ("barriers_mae.pkl", "barriers_mfe.pkl"):
+                self.assertLessEqual((p / name).stat().st_mtime, meta)
+
+    def test_save_before_fit_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(RuntimeError):
+                BarrierEstimator(feature_cols=["natr_14"]).save(td)
+
+    def test_load_requires_the_whole_set(self):
+        est, _ = self._fitted()
+        for missing in ("barriers_mae.pkl", "barriers_mfe.pkl", "barriers_meta.json"):
+            with tempfile.TemporaryDirectory() as td:
+                est.save(td, horizon=45)
+                (Path(td) / missing).unlink()
+                with self.assertRaises(FileNotFoundError):
+                    BarrierEstimator.load(td)
+
+    def test_load_refuses_undeclared_horizon(self):
+        """No horizon in the meta means the label window is unknown; serving it
+        would size a bracket off a walk length the trade never experiences."""
+        est, _ = self._fitted()
+        with tempfile.TemporaryDirectory() as td:
+            meta = est.save(td, horizon=45)
+            meta.pop("horizon")
+            (Path(td) / "barriers_meta.json").write_text(json.dumps(meta))
+            with self.assertRaises(ValueError):
+                BarrierEstimator.load(td)
+
+    def test_load_refuses_empty_feature_cols(self):
+        est, _ = self._fitted()
+        with tempfile.TemporaryDirectory() as td:
+            meta = est.save(td, horizon=45)
+            meta["feature_cols"] = []
+            (Path(td) / "barriers_meta.json").write_text(json.dumps(meta))
+            with self.assertRaises(ValueError):
+                BarrierEstimator.load(td)
+
+    def test_binned_fallback_is_picklable(self):
+        """The degraded backend was a closure and could not be pickled at all;
+        it is a module-level handle now, so an artifact fitted without
+        lightgbm/catboost still survives the round trip."""
+        est = BarrierEstimator(feature_cols=["natr_14", "rsi_14"])
+        X = np.column_stack([np.linspace(0.1, 1.5, 200), np.full(200, 50.0)])
+        y = 0.2 + X[:, 0]  # monotone in natr, so the ladder is already isotone
+        est._model_mae = est._fit_binned_fallback(X, y, tau=0.95)
+        est._model_mfe = est._fit_binned_fallback(X, y, tau=0.50)
+        est.backend_ = "binned"
+        df = pl.DataFrame(
+            {
+                "natr_14": [0.3, 0.9],
+                "rsi_14": [50.0, 50.0],
+                "close": [150.0, 150.0],  # predict() converts NATR% -> price
+            }
+        )
+        with tempfile.TemporaryDirectory() as td:
+            est.save(td, horizon=45)
+            restored = BarrierEstimator.load(td)
+        self.assertEqual(restored.backend_, "binned")
+        self.assertEqual(est.predict(df), restored.predict(df))
 
 
 if __name__ == "__main__":
