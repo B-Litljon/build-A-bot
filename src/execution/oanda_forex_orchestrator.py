@@ -64,7 +64,8 @@ Glossary:
         if it sealed while the stream was down and is still fresh. Before this
         existed, bars sealing during an outage were fetched into the buffer
         but never evaluated (~6 of 15 would-be signals died in these gaps
-        during the 2026-07 soak).
+        during the 2026-07 soak). Emits _emit_status after scoring each
+        symbol (finally: even a failed evaluation refreshes telemetry).
     _seam_catchup_max_age -- SEAM_CATCHUP_MAX_AGE_SECONDS; how stale a missed
         bar may be and still be scored. -1 (default) = one bar period,
         0 disables catch-up.
@@ -73,6 +74,9 @@ Glossary:
         incomplete), but it has sealed by then, so its complete version is
         re-fetched from REST and scored. Costs one evaluation per symbol per
         reconnect if absent -- measured at 5/symbol in 16h on 2026-07-28.
+        Emits _emit_status after scoring so status.json stays fresh during
+        stream outages (the watchdog would otherwise see stale telemetry and
+        restart a recovering soak).
     _seam_backfill_attempts / _seam_backfill_retry_delay --
         SEAM_BACKFILL_ATTEMPTS (3, 0 disables) and SEAM_BACKFILL_RETRY_DELAY
         (2s). REST can lag the bar seal by a second or two.
@@ -1292,6 +1296,10 @@ class OandaForexOrchestrator:
                     "[%s] Seam backfill evaluation failed: %s",
                     symbol, e, exc_info=True,
                 )
+            # Status must stay fresh across reconnects: the watchdog reads
+            # status.json mtime, and a stream outage that this backfill
+            # survived would otherwise look stale and trigger a restart.
+            self._emit_status()
             return
 
         logger.warning(
@@ -1970,6 +1978,11 @@ class OandaForexOrchestrator:
                 logger.error(
                     "[%s] Seam catch-up failed: %s", norm_sym, e, exc_info=True
                 )
+            finally:
+                # Same liveness argument as _backfill_seam_bar: bars scored
+                # while the stream is down must keep status.json fresh, or
+                # the watchdog restarts a healthy soak mid-recovery.
+                self._emit_status()
 
     def _reconnect_delay(self, attempt: int) -> float:
         """

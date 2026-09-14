@@ -92,7 +92,10 @@ Things worth knowing:
   it has sealed, so the complete version is re-fetched from REST and scored
   (`SEAM_BACKFILL_ATTEMPTS`, `SEAM_BACKFILL_RETRY_DELAY`). Measured cost
   without it: 5 lost evaluations per symbol in the first 16h of the
-  2026-07-28 soak, ~8% of bars.
+  2026-07-28 soak, ~8% of bars. Both seam paths emit `_emit_status` after
+  scoring (added 2026-09-10) so `status.json` stays fresh through stream
+  outages — the watchdog reads its mtime, and a recovering soak used to look
+  stale and get restarted mid-recovery.
 - **Reconnect backoff** — jittered exponential, 5s base / 60s cap, reset after
   120s of healthy streaming (`OANDA_RECONNECT_*`). The cap sits below the
   liveness watchdog's 60s flatten threshold, so backing off never leaves a

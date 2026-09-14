@@ -1,0 +1,15 @@
+family=lightgbm
+  gate_passed=False  reasons=['EV -0.875000 < 0.0005 threshold', 'Fold 3 PF point estimate 0.0000 on 1 trades, but 95% lower bound 0.0000 < 1.2 — the most recent regime cannot prove it beats break-even', 'Pooled fold PF 95% lower bound 0.0073 < 1.2 (evidence: 1 wins / 14 trades across 3 folds)', 'Pooled OOS trades 14 < backstop floor 30 (= 30 × (1 − chop_veto_rate 0.0%)) — too few trades for any statistical claim']
+  mean_brier=0.1500  mean_ev=-0.875000
+  pooled PF lb=0.0073 (wins=1/trades=14)
+  fold3  PF lb=0.0000
+  angel bar=0.3855 devil bar(F3 calibration froze into report)
+  fold1: brier=0.3250 ev=-0.625000 win=0.625 trades=8 macro_wins=1
+  fold2: brier=0.1201 ev=-1.000000 win=0.800 trades=5 macro_wins=0
+  fold3: brier=0.0048 ev=-1.000000 win=1.000 trades=1 macro_wins=0
+  band 0.20-0.30: win=nan n=0
+  band 0.30-0.35: win=nan n=0
+  band 0.35-0.40: win=0.000 n=4
+  band 0.40-0.50: win=0.278 n=18
+  band 0.50-1.01: win=0.000 n=1
+  band >=0.40: win=0.263 n=19
