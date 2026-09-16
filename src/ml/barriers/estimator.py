@@ -56,6 +56,22 @@ Glossary:
         refuses an artifact that disagrees rather than sizing a bracket off a
         horizon the trade never experiences. None until load() — fit() cannot
         know it, because the labels frame does not carry it.
+    verdict / verdict_ -- the PROMOTION EVIDENCE recorded beside the weights
+        (per-fold pinball vs the static constant, MAE coverage, pass/fail, eval
+        date) and its restored form. Optional, because artifacts predate it;
+        the consumer decides what absence means (currently: serve with a
+        warning), while a recorded FAIL is a refusal. ``_validate_verdict``
+        refuses to WRITE a verdict without a boolean ``passed`` — an artifact
+        carrying an unreadable verdict-shaped blob looks evidenced, which is
+        worse than carrying none.
+    q_mae_scale -- conformal-style inflation of the STOP side only, recorded
+        in the meta and applied in predict() before rr/admissible are computed.
+        1.0 = the raw fitted quantile. It exists because the raw Q_MAE(0.95)
+        under-covers the most recent regime (measured coverage 0.951/0.937/0.912
+        across expanding folds, floor 0.93), with the shortfall concentrated in
+        the QUIET volatility deciles; a per-decile calibration cumulative-maxed
+        to stay non-decreasing reached 0.954/0.974/0.942. A positive scalar
+        preserves the monotone response, so the fit-time audit stays valid.
     rr_floor -- minimum implied reward:risk for a BarrierOutput to be
         tradeable. Reported at predict time (outputs below it are flagged,
         not hidden) so a pre-trade veto can see honest numbers.
@@ -78,7 +94,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Mapping, Optional
 
 import joblib
 import numpy as np
@@ -122,6 +138,31 @@ class BarrierOutput:
     q_mfe: float
     rr: float
     admissible: bool
+
+
+def _validate_verdict(verdict: Mapping) -> dict:
+    """
+    Check a promotion verdict before it is written into the meta.
+
+    Fail-loud at WRITE time, because a malformed verdict is worse than none: an
+    artifact carrying a verdict-shaped blob that nothing can read looks
+    evidenced. Only ``passed`` is required (a bool, the yes/no the promotion
+    gate turns on); everything else — per-fold numbers, the eval date, the
+    feature vocabulary, the evaluation row count — passes through untouched so
+    the evidence a future agent needs is recorded even though its schema is not
+    this module's to fix.
+    """
+    if not isinstance(verdict, Mapping):
+        raise ValueError(
+            f"barrier verdict must be a mapping, got {type(verdict).__name__}"
+        )
+    if "passed" not in verdict or not isinstance(verdict["passed"], bool):
+        raise ValueError(
+            "barrier verdict must carry a boolean 'passed' — it is the one "
+            "field the promotion gate is read from, and a verdict without it "
+            "records evidence nobody can act on"
+        )
+    return {str(k): v for k, v in dict(verdict).items()}
 
 
 class _BinnedLadder:
@@ -188,6 +229,22 @@ class BarrierEstimator:
         # restored by load() from the artifact meta and checked against the
         # execution lifetime by whoever serves the geometry.
         self.horizon_: Optional[int] = None
+        # Conformal-style inflation applied to the STOP side only (never the
+        # target). 1.0 = the raw fitted quantile. It exists because the raw
+        # Q_MAE(0.95) under-covers the most recent regime: measured coverage
+        # 0.951/0.937/0.912 across expanding folds against a nominal 0.95 and a
+        # 0.93 floor (2026-09-14), with the shortfall concentrated in the QUIET
+        # volatility deciles. A per-decile calibration cumulative-maxed to stay
+        # non-decreasing reached 0.954/0.974/0.942 — i.e. it passes a gate the
+        # raw fit fails — and a positive scalar cannot break the
+        # monotonicity-by-construction guarantee. Recorded in the meta by
+        # save(), restored by load(); validated positive.
+        self.q_mae_scale: float = 1.0
+        # The promotion evidence recorded beside the weights, or None when the
+        # artifact carries none. Restored by load(); the SERVING POLICY (refuse
+        # a recorded FAIL, warn on unknown) belongs to the caller, not here —
+        # this module's job is to hand back what the artifact actually says.
+        self.verdict_: Optional[dict] = None
 
     def fit(
         self,
@@ -219,9 +276,18 @@ class BarrierEstimator:
         return self
 
     def predict(self, df: pl.DataFrame) -> List[BarrierOutput]:
-        """Barrier geometry for each row of df, in the same order."""
+        """
+        Barrier geometry for each row of df, in the same order.
+
+        The stop side is multiplied by ``q_mae_scale`` (1.0 unless the artifact
+        recorded a calibration) BEFORE ``rr`` and ``admissible`` are computed,
+        so the payload reports the ratio of the geometry actually served rather
+        than of the raw fit. A positive scalar preserves the monotone response,
+        which is why the fit-time audit stays valid under it.
+        """
         X = self._X(df)
-        q_mae = np.maximum(self._predict_quantile(self._model_mae, X, self.tau_mae), 1e-6)
+        raw_q_mae = np.maximum(self._predict_quantile(self._model_mae, X, self.tau_mae), 1e-6)
+        q_mae = raw_q_mae * self.q_mae_scale
         q_mfe = np.maximum(self._predict_quantile(self._model_mfe, X, self.tau_mfe), 0.0)
         natr = df["natr_14"].to_numpy().astype(float)
         close = df["close"].to_numpy().astype(float)
@@ -252,7 +318,13 @@ class BarrierEstimator:
 
     # ── persistence (the live sidecar contract) ────────────────────────────
 
-    def save(self, model_dir, horizon: int = DEFAULT_HORIZON) -> dict:
+    def save(
+        self,
+        model_dir,
+        horizon: int = DEFAULT_HORIZON,
+        verdict: Optional[Mapping] = None,
+        q_mae_scale: Optional[float] = None,
+    ) -> dict:
         """
         Persist both quantile models + the meta contract into ``model_dir``.
 
@@ -270,7 +342,16 @@ class BarrierEstimator:
 
         ``horizon`` is recorded, never inferred: it is the forward-window
         length the labels were built at, and it must match the execution
-        lifetime the geometry is served into. Returns the meta it wrote.
+        lifetime the geometry is served into.
+
+        ``verdict`` is the PROMOTION EVIDENCE for this artifact — the output of
+        ``scripts/evaluate_barriers.py`` (per-fold pinball vs static, MAE
+        coverage, pass/fail) — recorded so the artifact carries its own reason
+        to be served. Without it an artifact says what it contains and nothing
+        about whether it earned promotion, and a retrain can stamp
+        "learned_barriers: true" on weights whose gate never ran. Optional for
+        backward compatibility; the consumer treats an absent verdict as
+        "unknown" and a recorded FAIL as a refusal. Returns the meta it wrote.
         """
         if self._model_mae is None or self._model_mfe is None:
             raise RuntimeError(
@@ -303,6 +384,18 @@ class BarrierEstimator:
             ],
             "trained_at": datetime.now(timezone.utc).isoformat(),
         }
+        if verdict is not None:
+            meta["verdict"] = _validate_verdict(verdict)
+        if q_mae_scale is not None:
+            scale = float(q_mae_scale)
+            if not np.isfinite(scale) or scale <= 0.0:
+                raise ValueError(
+                    f"q_mae_scale must be a positive finite number, got "
+                    f"{q_mae_scale!r} — a zero or negative scale would flatten "
+                    "or invert every stop this artifact produces"
+                )
+            self.q_mae_scale = scale
+        meta["q_mae_scale"] = float(self.q_mae_scale)
         meta_path = model_dir / BARRIER_META_FILENAME
         temp_meta = meta_path.with_suffix(meta_path.suffix + ".tmp")
         temp_meta.write_text(json.dumps(meta, indent=2, sort_keys=True))
@@ -372,15 +465,34 @@ class BarrierEstimator:
         est.used_catboost_ = est.backend_ == "catboost"
         est.used_lightgbm_ = est.backend_ == "lightgbm"
         est.horizon_ = int(meta["horizon"])
+        stored_scale = meta.get("q_mae_scale", 1.0)
+        try:
+            stored_scale = float(stored_scale)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"{meta_path} carries an unreadable 'q_mae_scale' "
+                f"({stored_scale!r}) — refusing rather than silently serving "
+                "an unscaled stop"
+            )
+        if not np.isfinite(stored_scale) or stored_scale <= 0.0:
+            raise ValueError(
+                f"{meta_path} records q_mae_scale={stored_scale!r}; a "
+                "non-positive scale would flatten or invert every stop"
+            )
+        est.q_mae_scale = stored_scale
+        est.verdict_ = meta.get("verdict") if isinstance(meta.get("verdict"), dict) else None
         logger.info(
             "BarrierEstimator restored from %s: backend=%s tau_mae=%.2f "
-            "tau_mfe=%.2f horizon=%d features=%d",
+            "tau_mfe=%.2f horizon=%d features=%d q_mae_scale=%.4f verdict=%s",
             model_dir,
             est.backend_,
             est.tau_mae,
             est.tau_mfe,
             est.horizon_,
             len(est.feature_cols),
+            est.q_mae_scale,
+            "none recorded" if est.verdict_ is None
+            else ("PASS" if est.verdict_.get("passed") else "FAIL"),
         )
         return est
 

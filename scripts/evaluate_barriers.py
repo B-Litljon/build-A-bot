@@ -28,10 +28,19 @@ Glossary:
     coverage -- fraction of labelled bars whose realised MAE stayed at or
         under the predicted 95th-percentile stop; the empirical check that
         the model actually learned a 95% quantile.
+    verdict -- the machine-readable result (per-fold pinball/coverage/pass, the
+        eval date, the feature vocabulary, the floors) printed on the
+        VERDICT_JSON line and written to BARRIER_VERDICT_OUT when set. It is
+        what belongs in barriers_meta.json via BarrierEstimator.save(verdict=),
+        because a recorded FAIL is what makes the live loader refuse an
+        artifact. Written atomically (temp + replace) like every other artifact
+        here; the evaluator stays read-only when no path is given.
 """
 
+import json
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -39,7 +48,11 @@ import polars as pl
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from ml.barriers.estimator import BarrierEstimator, static_baseline_loss  # noqa: E402
+from ml.barriers.estimator import (  # noqa: E402
+    DEFAULT_TAU_MFE,
+    BarrierEstimator,
+    static_baseline_loss,
+)
 from ml.barriers.labels import DEFAULT_HORIZON, compute_excursions, pinball_loss  # noqa: E402
 from analysis.build_strategy_matrix import load_basket, prepare_tagged_frame  # noqa: E402
 
@@ -124,6 +137,7 @@ def main() -> int:
 
     all_pass = True
     y_mae = ok["mae_natr"].to_numpy()
+    fold_rows = []
     for fold_no, (tr_end, te_start, te_end) in enumerate(folds, 1):
         train, test = ok[:tr_end], ok[te_start:te_end]
         est = BarrierEstimator(feature_cols=EVAL_FEATURES, tau_mae=TAU_MAE)
@@ -132,6 +146,13 @@ def main() -> int:
         except ValueError as e:
             print(f"fold {fold_no}: FIT FAILED: {e}")
             all_pass = False
+            fold_rows.append({
+                "fold": fold_no,
+                "n_train": int(len(train)),
+                "n_test": int(len(test)),
+                "fit_failed": str(e),
+                "passed": False,
+            })
             continue
         preds = est.predict(test)
         q = np.array([p.q_mae for p in preds])
@@ -142,6 +163,17 @@ def main() -> int:
         beat = learned_pl < static_pl
         covered = coverage >= COVERAGE_FLOOR
         all_pass &= beat and covered
+        fold_rows.append({
+            "fold": fold_no,
+            "n_train": int(len(train)),
+            "n_test": int(len(test)),
+            "pinball_learned": round(float(learned_pl), 6),
+            "pinball_static": round(float(static_pl), 6),
+            "beat_static": bool(beat),
+            "coverage": round(coverage, 6),
+            "coverage_ok": bool(covered),
+            "passed": bool(beat and covered),
+        })
         print(f"fold {fold_no}: n_train={len(train):>6} n_test={len(test):>6}  "
               f"pinball learned={learned_pl:.4f} static={static_pl:.4f} "
               f"{'BEAT' if beat else 'LOST'}  coverage={coverage:.3f} "
@@ -150,6 +182,37 @@ def main() -> int:
     print("\nVERDICT:", "PASS — learned barriers win every fold with adequate "
           "coverage" if all_pass else
           "FAIL — static bracket stays (promotion blocked, prior weights stand)")
+
+    # Machine-readable verdict, so the artifact can carry its own promotion
+    # evidence: BarrierEstimator.save(..., verdict=json.load(path)) records it
+    # in barriers_meta.json, and the live loader REFUSES a recorded FAIL.
+    # Printed either way; written only when a path is given, because the
+    # evaluator is otherwise read-only with respect to the tree.
+    verdict = {
+        "passed": bool(all_pass),
+        "artifact": "barriers",
+        "eval_script": "scripts/evaluate_barriers.py",
+        "eval_date": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "granularity_minutes": gran,
+        "days_back": 730,
+        "symbols": sorted(set(syms)),
+        "rows": int(n),
+        "feature_cols": list(EVAL_FEATURES),
+        "tau_mae": TAU_MAE,
+        "tau_mfe": DEFAULT_TAU_MFE,
+        "coverage_floor": COVERAGE_FLOOR,
+        "static_sl_mult": 2.0,
+        "folds": fold_rows,
+    }
+    verdict_out = os.getenv("BARRIER_VERDICT_OUT", "").strip()
+    if verdict_out:
+        target = Path(verdict_out)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temp = target.with_suffix(target.suffix + ".tmp")
+        temp.write_text(json.dumps(verdict, indent=2, sort_keys=True))
+        temp.replace(target)
+        print(f"verdict written to {target}")
+    print("VERDICT_JSON " + json.dumps(verdict, sort_keys=True))
     return 0 if all_pass else 2
 
 

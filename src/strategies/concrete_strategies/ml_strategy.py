@@ -172,6 +172,32 @@ ENV_BARRIER_GEOMETRY_ENABLED = "BARRIER_GEOMETRY_ENABLED"
 _BARRIER_FRAME_ONLY_COLS = frozenset({"close"})
 
 
+def _verdict_summary(verdict: dict) -> str:
+    """
+    One line of a barrier promotion verdict, for a log or an exception.
+
+    Reads only the fields worth naming and tolerates the rest, because the
+    verdict is written by the producer (``scripts/evaluate_barriers.py
+    --verdict-out``) and its schema is not this module's to enforce beyond the
+    boolean ``passed`` that the refusal turns on.
+    """
+    parts = []
+    folds = verdict.get("folds")
+    if isinstance(folds, list) and folds:
+        coverages = [
+            f.get("coverage") for f in folds if isinstance(f, dict)
+        ]
+        coverages = [c for c in coverages if isinstance(c, (int, float))]
+        if coverages:
+            parts.append(
+                "coverage " + "/".join(f"{c:.3f}" for c in coverages)
+            )
+    for key in ("eval_date", "granularity", "rows", "coverage_floor"):
+        if verdict.get(key) is not None:
+            parts.append(f"{key}={verdict[key]}")
+    return ", ".join(parts) if parts else "no detail recorded"
+
+
 def _barriers_requested(explicit: Optional[bool] = None) -> bool:
     """
     Resolve the barrier sidecar switch: explicit argument first, then
@@ -471,11 +497,38 @@ class MLStrategy(BaseStrategy):
             # (pre-2026-09 artifacts predate them); raise on a real mismatch.
             # When learned barrier geometry is active (use_barriers=True),
             # instance-specific MAE/MFE barriers govern live execution brackets
-            # rather than the static profile multipliers.
+            # rather than the static profile multipliers, so a profile-vs-
+            # metadata mismatch is EXPECTED and the check stands down.
+            #
+            # Standing down is not the same as "nothing to see": the Devil is
+            # trained on a label built from the STATIC multiples
+            # (retrainer.py:1469, `_compute_devil_survival_target(sl_mult=2.0)`),
+            # so serving learned brackets runs the selection model against a
+            # geometry its conviction was never fitted on — the exact class of
+            # train/serve skew the branch below exists to catch. Report the pair
+            # rather than skipping in silence; the direction of that error is
+            # NOT known (a wider stop survives more often, a closer target hits
+            # more often), which is why it must be visible in the log.
+            # See llm_reports/m2m-prompts/2026-09-14_barrier-live-seam.md.
             if getattr(self, "use_barriers", False):
-                logger.info(
-                    "_validate_metadata: learned barrier geometry active (use_barriers=True) — "
-                    "dynamic MAE/MFE barriers govern live execution brackets."
+                from execution.risk_manager import RiskProfile  # lazy: avoids
+                # an import cycle through execution/__init__.py at module load.
+
+                profile = RiskProfile.for_asset_class(self.asset_class)
+                trained_sl = data.get("sl_atr_multiplier")
+                trained_tp = data.get("tp_atr_multiplier")
+                logger.warning(
+                    "_validate_metadata: learned barrier geometry active — "
+                    "bracket check STOOD DOWN. Profile runs %sx/%sx; this "
+                    "artifact's Devil was labelled at %sx/%sx. A learned "
+                    "bracket is a different walk than the one the Devil's "
+                    "conviction was fitted on (see Phase 3 option A/B in the "
+                    "handoff), so do not read the Devil's approval bar as "
+                    "calibrated for the geometry actually placed.",
+                    profile.sl_atr_multiplier,
+                    profile.tp_atr_multiplier,
+                    trained_sl,
+                    trained_tp,
                 )
             elif "sl_atr_multiplier" in data or "tp_atr_multiplier" in data:
                 from execution.risk_manager import RiskProfile  # lazy: avoids
@@ -633,9 +686,47 @@ class MLStrategy(BaseStrategy):
         * the feature vocabulary. Every feature the barrier model reads must be
           one the served feature schema produces, or the geometry is being fed
           a column some other build computed.
+
+        And one piece of EVIDENCE, which is the difference between "this
+        artifact exists" and "this artifact earned promotion":
+
+        * a recorded verdict. Artifacts carry the Phase 1 gate's result in
+          ``barriers_meta.json`` (see ``BarrierEstimator.save(verdict=...)``).
+          A recorded FAIL is a REFUSAL here — the gate that decides whether
+          learned geometry may replace the static bracket is not advisory, and
+          a producer that keeps writing artifacts after a failed gate (a
+          retrain hook fires off the Angel/Devil gate, not off the barrier
+          gate) must not thereby get them served. An artifact with NO recorded
+          verdict is served with a warning: absence is "unknown", and every
+          artifact written before this field existed is in that state.
         """
         model_dir = self.angel_path.parent
         est = BarrierEstimator.load(model_dir)
+
+        verdict = est.verdict_
+        if verdict is not None and not verdict.get("passed", False):
+            raise RuntimeError(
+                f"Barrier artifact in {model_dir} records a FAILED promotion "
+                f"verdict ({_verdict_summary(verdict)}). The learned geometry "
+                "must beat the static bracket on every evaluation fold with "
+                "adequate coverage before it may replace the profile "
+                "multipliers — refit and re-run scripts/evaluate_barriers.py, "
+                "or leave the static bracket in place."
+            )
+        if verdict is None:
+            logger.warning(
+                "Barrier artifact in %s carries NO promotion verdict — serving "
+                "it on trust. Re-run the producer so the gate result is "
+                "recorded beside the weights (scripts/evaluate_barriers.py "
+                "--verdict-out).",
+                model_dir,
+            )
+        else:
+            logger.info(
+                "Barrier artifact in %s records a PASSED promotion verdict (%s)",
+                model_dir,
+                _verdict_summary(verdict),
+            )
 
         if est.horizon_ != DEFAULT_HORIZON:
             raise RuntimeError(

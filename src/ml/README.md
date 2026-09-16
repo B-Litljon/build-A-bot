@@ -162,9 +162,13 @@ audit-enforced instead). `save`/`load` are the live sidecar contract:
 `barriers_mae.pkl` + `barriers_mfe.pkl` + `barriers_meta.json`, meta written
 last, label horizon declared.
 
-**Serving it live is gated twice**: `BARRIER_GEOMETRY_ENABLED` must be set on
-the strategy side, and `scripts/evaluate_barriers.py` must have passed — it has
-not, as of 2026-09-14 (fold 3 MAE coverage 0.905 against a 0.93 floor). See the
+**Serving it live is gated twice.** `BARRIER_GEOMETRY_ENABLED` must be set on
+the strategy side, and the artifact must not record a FAILED promotion verdict:
+`scripts/evaluate_barriers.py` prints a `VERDICT_JSON` line (and writes it to
+`BARRIER_VERDICT_OUT`), `BarrierEstimator.save(verdict=...)` embeds it in
+`barriers_meta.json`, and the live loader refuses anything that is not PASS. The
+gate currently FAILS — fold 3 MAE coverage 0.905 against a 0.93 floor,
+re-measured 2026-09-14 — so a serving artifact does not exist yet. See the
 package README for the verdict table.
 - **Imported by:** `scripts/evaluate_barriers.py`,
   `src/strategies/concrete_strategies/ml_strategy.py` (behind the switch),

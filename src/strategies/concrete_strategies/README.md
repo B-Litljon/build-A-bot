@@ -48,6 +48,14 @@ things about it matter operationally:
   reads a complete matching pair; a pickle replaced on its own stays invisible.
   A failed reload KEEPS the previously loaded geometry and alerts rather than
   silently disabling it.
+- **A recorded FAILED promotion verdict is a refusal.** The artifact carries the
+  Phase 1 gate's result in `barriers_meta.json` (written by the retrainer from
+  `scripts/evaluate_barriers.py --verdict-out`, i.e. `BARRIER_VERDICT_OUT`), and
+  the loader raises on it — because the retrainer's barrier hook fires off the
+  **Angel/Devil** gate, not off the barrier gate, so artifacts already exist
+  whose barrier gate failed. An artifact with **no** recorded verdict is served
+  with a warning: absence is "unknown", which is the state of every artifact
+  written before the field existed.
 
 The payload travels in `Signal.metadata[BARRIER_GEOMETRY_KEY]` as NATR
 multiples, i.e. `RiskManager` multiplies them by the same raw ATR the static

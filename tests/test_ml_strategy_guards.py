@@ -464,6 +464,128 @@ class TestBarrierSidecar(unittest.TestCase):
             self.assertAlmostEqual(s._barrier_estimator.tau_mae, 0.95, places=6)
             s.notification_manager.send_system_message.assert_called()
 
+    # ── promotion verdict: the artifact's own reason to be served ─────────
+
+    def test_recorded_fail_verdict_is_refused_at_boot(self):
+        """The Phase 1 gate is not advisory. A retrain hook fires off the
+        Angel/Devil gate rather than the barrier gate, so artifacts can exist
+        whose gate FAILED — and those must not reach a live bracket."""
+        with tempfile.TemporaryDirectory() as td:
+            est, _ = self._fit_and_save(td)
+            est.save(
+                td,
+                horizon=DEFAULT_HORIZON,
+                verdict={"passed": False, "folds": [{"fold": 3, "coverage": 0.905}]},
+            )
+            s = self._bare(td)
+            with self.assertRaises(RuntimeError) as ctx:
+                s._load_barriers()
+            self.assertIn("FAILED promotion verdict", str(ctx.exception))
+            # The recorded numbers travel with the refusal, so the log says
+            # what failed rather than only that something did.
+            self.assertIn("0.905", str(ctx.exception))
+
+    def test_recorded_pass_verdict_serves(self):
+        with tempfile.TemporaryDirectory() as td:
+            est, _ = self._fit_and_save(td)
+            est.save(td, horizon=DEFAULT_HORIZON, verdict={"passed": True})
+            s = self._bare(td)
+            loaded = s._load_barriers()
+            self.assertTrue(loaded.verdict_["passed"])
+            self.assertIsNotNone(loaded.horizon_)
+
+    def test_absent_verdict_serves_with_a_warning(self):
+        """Absence is "unknown", not "pass" and not a refusal: every artifact
+        written before the field existed is in this state, and refusing them
+        would break the sidecar for artifacts that were validated by hand."""
+        with tempfile.TemporaryDirectory() as td:
+            self._fit_and_save(td)
+            s = self._bare(td)
+            # MLStrategy.__module__, not a hardcoded name: this test file imports
+            # the module as `src.strategies....` while the live entry points
+            # import it as `strategies....`, so a literal name silently catches
+            # nothing.
+            with self.assertLogs(MLStrategy.__module__, level="WARNING") as logs:
+                loaded = s._load_barriers()
+            self.assertIsNone(loaded.verdict_)
+            self.assertTrue(
+                any("NO promotion verdict" in line for line in logs.output),
+                logs.output,
+            )
+
+    def test_verdict_summary_is_readable_from_folds(self):
+        from strategies.concrete_strategies.ml_strategy import _verdict_summary
+
+        line = _verdict_summary(
+            {
+                "passed": False,
+                "eval_date": "2026-09-14T20:00:00+00:00",
+                "coverage_floor": 0.93,
+                "folds": [
+                    {"fold": 1, "coverage": 0.953},
+                    {"fold": 2, "coverage": 0.934},
+                    {"fold": 3, "coverage": 0.905},
+                ],
+            }
+        )
+        self.assertIn("0.953/0.934/0.905", line)
+        self.assertIn("coverage_floor=0.93", line)
+        # And it must not raise on a verdict that carries nothing but the
+        # boolean — the refusal path must never become its own failure.
+        self.assertEqual(_verdict_summary({"passed": False}), "no detail recorded")
+
+    def test_bracket_check_stands_down_but_reports_the_skew(self):
+        """With learned geometry active the profile-vs-metadata bracket check
+        cannot apply — but the mismatch it would have caught is the Devil's
+        label geometry, so the numbers must appear rather than vanish.
+
+        The Devil is trained on `devil_target`, built from the STATIC multiples
+        (retrainer.py:1469); a learned bracket is a different walk than the one
+        its conviction was fitted on, and the direction of that error is not
+        known. A silent stand-down is how that gets forgotten.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            Path(td, "metadata.json").write_text(
+                json.dumps(
+                    {
+                        "asset_class": "forex",
+                        "sl_atr_multiplier": 1.0,
+                        "tp_atr_multiplier": 2.0,
+                    }
+                )
+            )
+            s = MLStrategy.__new__(MLStrategy)
+            s.asset_class = "forex"
+            s.angel_path = Path(td) / "angel_latest.pkl"
+            s.use_barriers = True
+            with self.assertLogs(MLStrategy.__module__, level="WARNING") as logs:
+                s._validate_metadata()  # must NOT raise: 1.0/2.0 vs profile 2.0/4.0
+            joined = "\n".join(logs.output)
+            self.assertIn("bracket check STOOD DOWN", joined)
+            self.assertIn("1.0", joined)  # the artifact's trained pair
+            self.assertIn("2.0", joined)  # ...and the profile it is served under
+
+    def test_bracket_check_still_refuses_when_barriers_are_off(self):
+        """The guard is only ever bypassed for a declared reason: with the
+        sidecar off, a mismatched artifact is still refused outright."""
+        with tempfile.TemporaryDirectory() as td:
+            Path(td, "metadata.json").write_text(
+                json.dumps(
+                    {
+                        "asset_class": "forex",
+                        "sl_atr_multiplier": 1.0,
+                        "tp_atr_multiplier": 2.0,
+                    }
+                )
+            )
+            s = MLStrategy.__new__(MLStrategy)
+            s.asset_class = "forex"
+            s.angel_path = Path(td) / "angel_latest.pkl"
+            s.use_barriers = False
+            with self.assertRaises(RuntimeError) as ctx:
+                s._validate_metadata()
+            self.assertIn("Bracket mismatch", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()
