@@ -147,6 +147,42 @@ are suppressing it".
 - **Reads:** a model dir (pickles + `feature_stats.json` + metadata) and live
   history via OANDA REST. **Writes:** nothing.
 
+### `angel_bar_frontier.py` — "could this model pass its own gate at ANY bar?"
+
+`validate_candidate` says *why* a run failed; it does not say whether any setting
+could have succeeded. Those are different questions, and the second one decides
+between "keep tuning" and "this model has no certifiable edge".
+
+The gate wants two things at once — enough pooled trades (a chop-scaled backstop,
+23 on the reference basket) **and** a pooled PF 95% lower bound ≥ 1.2 — and the
+retrainer's bar is chosen to MAXIMISE EV over a quantile grid of the OOF scores,
+which parks it at the thin top of the distribution. This script replaces that one
+choice with a fixed population quantile ("approve the top X%"), which dissolves the
+trade-count problem, and then measures what happens to the evidence.
+
+Reference run (cached M15 basket, 226,992 engineered rows): **0 of 6 points satisfy
+both criteria**; win rate never exceeds 0.273 against a 0.333 break-even, the PF
+lower bound never exceeds **0.7271** against 1.2, and the binding rejection becomes
+`EV < 0.0005` at every point. VERDICT: **unreachable** — and that is a statement
+about the model's evidence, not its configuration. The tool prints that sentence
+itself, because the tempting response to an unreachable gate is to loosen a
+threshold, which manufactures a pass without an edge.
+
+Exit 0 when some bar satisfies both criteria, 2 when none does (the retrainer's
+"trained but rejected" convention). Cache-only on purpose — deterministic, no
+network — so it needs `src/analysis/build_strategy_matrix.py` to have populated
+`analysis_cache/strategy_matrix/`.
+
+> ⚠️ It prints the HTF pairing it used, and you should read that line. `M<gran>`
+> alone does not determine it: `get_asset_config`'s default assumes **M1** (`"5m"`),
+> so an M15 caller that reuses `cfg` for feature engineering silently trains on the
+> wrong higher-timeframe features. The mapping here mirrors
+> `run_oanda.py`'s `_GRANULARITY_PROFILES`.
+
+- **Imports from repo:** `core.retrainer`, `execution.risk_manager`.
+- **Reads:** `analysis_cache/strategy_matrix/<SYM>_M<gran>.parquet`.
+- **Writes:** nothing (it monkeypatches one function in-process and restores it).
+
 ### `bake_spread_alphas.py`
 Turns observation into configuration: parses `SPREAD_CALIB` lines out of a soak
 log and writes a per-instrument trading-cost table, replacing the single
