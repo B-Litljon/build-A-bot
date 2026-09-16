@@ -52,8 +52,11 @@ See the root [GLOSSARY.md](../GLOSSARY.md) for domain terms.
 | `test_holdout_gate.py` | 26 | Holdout split, artifact scoring, metadata recording, the confidence-bound verdict, the boundary-tail purge, and the permanent leak guards |
 | `test_dynamic_thresholds.py` | 14 | The 2026-08-29 gate rebuild: OOF Angel-bar calibration, Devil min_child auto-scaling, CP fold-evidence bounds |
 | `test_retraining_notification.py` | 9 | The retrain Discord embed: a gate pass is not a deployment |
-| `test_ml_strategy_guards.py` | 21 | The stale-bar guard, threshold.json pinning, sidecar reload seams, and the learned-barrier sidecar (boot refusal, units contract, promotion swap) |
-| `test_barriers.py` | 29 | Excursion labels, the quantile estimator, the monotone audit, and the artifact save/load contract |
+| `test_ml_strategy_guards.py` | 27 | The stale-bar guard, threshold.json pinning, sidecar reload seams, and the learned-barrier sidecar (boot refusal, units contract, promotion swap, promotion-verdict refusal) |
+| `test_alpaca_timeframe.py` | 7 | Bar-size → Alpaca timeframe mapping; regression test for the defect that made H4/D1 requests impossible (minute amounts cap at 59, Day/Week take amount 1 only) |
+| `test_base_rate_benchmark.py` | 6 | The gate's edge-over-random benchmark: the macro base rate is the mean on the population given, non-finite outcomes are dropped, an unlabelled frame returns nan (never 0.0), and the report carries it per fold and pooled |
+| `test_devil_label_switch.py` | 6 | `RETRAIN_DEVIL_LABEL`: default preserves the shipping label, `macro` selects the validated one, typos warn and fall back, read per call |
+| `test_barriers.py` | 39 | Excursion labels, the quantile estimator, the monotone audit, and the artifact contract (save/load, promotion verdict, stop calibration) |
 | `verify_warmup.py` | (1, **not collected**) | Warm-up injection |
 
 ### Tests worth understanding before changing anything

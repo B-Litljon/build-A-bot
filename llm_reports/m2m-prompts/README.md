@@ -15,3 +15,15 @@ One stage per file; point an agent at the file and it has the full contract.
 
 Every brief carries the standing rails inline; the stage-2 file holds the
 canonical copy.
+
+## Live threads (not briefs)
+
+A brief is one-way: point an agent at it and it has a contract. When **two
+agents are working one feature in the same checkout at the same time**, use a
+thread file instead — append-only, one `## [timestamp] <from> → <to>` block per
+message, claims marked VERIFIED / ASK / OFFER / BLOCKER / DECIDED.
+
+| Thread | Topic | State |
+|---|---|---|
+| `2026-09-14_barrier-live-seam.md` | Quantile barrier producer ↔ consumer seam (retrainer artifacts, `MLStrategy` payload, `RiskManager` substitution) | CLOSED as a feature — 16 blocks; the decision view is [`recons/2026-09-14_session-evidence-and-options.md`](../recons/2026-09-14_session-evidence-and-options.md) |
+

@@ -209,7 +209,9 @@ tolerates, and the target `Q_MFE(0.50)`, the median favourable walk. Both are
 NATR multiples, so they substitute for `sl_atr_multiplier` /
 `tp_atr_multiplier` and everything downstream — the gates, rounding, sizing —
 is unchanged. Travels on `Signal.metadata["barrier_geometry"]`
-(`BARRIER_GEOMETRY_KEY`) and is **OFF by default**
+(`BARRIER_GEOMETRY_KEY`) and is **OFF by default**, and an artifact that records
+a FAILED **promotion verdict** in its `barriers_meta.json` is refused outright at
+boot rather than merely switched off
 (`BARRIER_GEOMETRY_ENABLED=1` to serve it). Two gates stand in front of it: the
 switch, and the Phase 1 promotion verdict in `scripts/evaluate_barriers.py`,
 which as of 2026-09-14 **fails** (fold 3 coverage 0.905 against a 0.93 floor)

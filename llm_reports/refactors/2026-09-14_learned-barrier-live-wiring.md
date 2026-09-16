@@ -344,3 +344,44 @@ the switch off the live path is bit-identical to before.
   `src/strategies/concrete_strategies/README.md`, `src/execution/README.md`,
   `src/analysis/README.md`, `GLOSSARY.md` (bracket multipliers corrected to
   2.0×/4.0× while adding the new entries).
+
+---
+
+## Addendum (same day, 13:20 PDT) — the follow-up list above is partly stale
+
+Two of the open items in **Risk & follow-ups** were closed by the other agent's
+Phase 3 commit (`f0d6508`) and by this session's follow-up work. Read the live
+thread (`llm_reports/m2m-prompts/2026-09-14_barrier-live-seam.md`) for the
+current state; do not act on the list above without checking it.
+
+- **"No producer exists"** (item 2) is no longer true. `retrainer.py` now labels
+  excursions per symbol at `horizon=max_hold` (45 for forex — the report
+  `recons/2026-09-14_sidecar-h4-and-risk-sizing.md` states H=32, which is a typo;
+  the code passes `max_hold`) and persists the barrier artifact set behind
+  `RETRAIN_LEARN_BARRIERS` (default on). ⚠️ That hook fires off the Angel/Devil
+  gate, **not** off `scripts/evaluate_barriers.py`.
+- **A promotion verdict is now recorded and enforced.** `save(verdict=...)` →
+  `barriers_meta.json`; the live loader REFUSES a recorded FAIL and warns on an
+  absent verdict; `evaluate_barriers.py` emits the verdict machine-readably
+  (`VERDICT_JSON` / `BARRIER_VERDICT_OUT`); the producer reads it from
+  `RETRAIN_BARRIER_VERDICT`. Verified end to end against a real gate run.
+- **Superseded by the session's decision view:**
+  [`recons/2026-09-14_session-evidence-and-options.md`](../recons/2026-09-14_session-evidence-and-options.md)
+  — same day, sixteen rounds later. The wiring described in this report is correct,
+  tested and **off**; the feature itself does not earn promotion (the learned
+  conditioning is worth +0.0037R over a constant wide bracket). The full-vocabulary
+  experiment this report's addendum calls "worth running next" **was run**: the
+  gate fails on an artifact-shaped evaluation too (fold 3 coverage 0.9124 with 17
+  features against 0.905 with the evaluator's two), so the evaluator's vocabulary
+  was never the cause.
+- **New evidence on item 1.** The gate fails at **H4 as well** — coverage
+  0.928/0.912/0.850 across the three folds against the 0.93 floor, i.e. worse
+  than M15 (which fails only fold 3). It still beats the static constant on
+  pinball loss on every fold at both timeframes. Caveat that matters: the gate
+  fits its own two-feature estimator on the cached basket, so **no served-shaped
+  artifact has yet been evaluated against the static baseline with its own
+  vocabulary** — that is the experiment worth running next, ahead of further
+  timeframe sweeps.
+- Also fixed: `V3RandomForestTrainer.feature_names_in_` now reads CatBoost's
+  `feature_names_` as well, without which the H4 CatBoost candidate could not
+  boot at all (`tests/test_trainer_schema.py` pins it).
