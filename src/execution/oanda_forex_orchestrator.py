@@ -139,6 +139,10 @@ Glossary:
         produced the bracket, because a soak running fixed 1000-unit positions
         needs to know when the stop it is being handed came out several-fold
         wider than the constant.
+    _risk_sizing -- RISK_SIZING_ENABLED: when True and geometry is learned
+        (barrier), scales trade_units inversely with stop-loss width via
+        RiskManager.calculate_forex_units to preserve constant dollar risk.
+        Defaults to OFF (0).
 
     ── entry guards (added 2026-07-30 after the first multi-fill day) ──
     _reentry_cooldown -- OANDA_REENTRY_COOLDOWN_SECONDS: how long after an
@@ -199,7 +203,15 @@ Glossary:
     _check_stream_liveness / _liveness_watchdog -- the backstop: force a
         reconnect and FLATTEN exposure if the feed goes quiet. Critical because
         stops are software-enforced -- a dead feed means an unwatched position,
-        so the safe response is to hold nothing.
+        so the safe response is to hold nothing. Gated since 2026-09-15 on
+        risk_manager.scheduled_market_pause: silence during the daily 5pm-ET
+        rollover or the Friday-close-to-Sunday-reopen weekend is EXPECTED, and
+        responding to it flattens positions that are legitimately held across
+        the rollover. During a pause this returns early (one INFO line, watchdog
+        still re-armed); it never suppresses a genuine outage outside a pause.
+    _liveness_pause_logged -- which scheduled pause has already been logged, so
+        a 48-hour weekend is one INFO line instead of ~12,674 CRITICALs. None
+        when not in a pause.
     _stream_with_retry -- reconnect loop around the blocking stream.
     _notify -- fires Discord posts off the event loop; they are blocking HTTP
         calls with a 5s timeout and must never block the loop.
@@ -231,12 +243,26 @@ from execution.risk_manager import (
     GATE_REGIME,
     GATE_SPREAD,
     GATE_TIME,
+    GEOMETRY_BARRIER,
+    GEOMETRY_STATIC,
     RiskManager,
+    scheduled_market_pause,
 )
 from strategies.base import BARRIER_GEOMETRY_KEY
 from strategies.concrete_strategies.ml_strategy import MLStrategy
 
 logger = logging.getLogger(__name__)
+
+ENV_RISK_SIZING_ENABLED = "RISK_SIZING_ENABLED"
+
+
+def _risk_sizing_requested(explicit: Optional[bool] = None) -> bool:
+    """Resolve the risk sizing switch: explicit argument first, then
+    RISK_SIZING_ENABLED. Anything unset/0/false/no/off means OFF."""
+    if explicit is not None:
+        return bool(explicit)
+    raw = os.getenv(ENV_RISK_SIZING_ENABLED, "0").strip().lower()
+    return raw not in ("0", "false", "no", "off", "")
 
 
 class OandaForexOrchestrator:
@@ -274,6 +300,7 @@ class OandaForexOrchestrator:
         warmup_period: Optional[int] = None,
         flatten_on_exit: bool = True,
         notifier: Optional[NotificationManager] = None,
+        risk_sizing: Optional[bool] = None,
     ):
         self._symbols = symbols
         self._provider = provider
@@ -282,6 +309,7 @@ class OandaForexOrchestrator:
         self._risk_manager = risk_manager
         self._units_per_trade = units_per_trade
         self._flatten_on_exit = flatten_on_exit
+        self._risk_sizing = _risk_sizing_requested(risk_sizing)
 
         self._warmup = warmup_period or strategy.warmup_period
         self._max_bars = self._warmup * 2
@@ -479,6 +507,10 @@ class OandaForexOrchestrator:
         # One-shot alert per liveness incident (the probe runs every 10s and
         # an hours-long outage must not spam Discord). Re-armed when healthy.
         self._liveness_alert_fired = False
+        # Which scheduled pause we have already logged about (2026-09-15), so a
+        # 35-minute rollover or a 48-hour weekend logs one INFO line each rather
+        # than 12,674 CRITICALs. None = not currently in a pause.
+        self._liveness_pause_logged: Optional[str] = None
 
     # ── notifications ─────────────────────────────────────────────────
 
@@ -727,6 +759,7 @@ class OandaForexOrchestrator:
                     },
                     "config": {
                         "units": self._units_per_trade,
+                        "risk_sizing": self._risk_sizing,
                         "cooldown_s": self._reentry_cooldown,
                         "max_per_ccy": self._max_per_currency,
                         "angel_thr": getattr(self._strategy, "angel_threshold", None),
@@ -1455,10 +1488,36 @@ class OandaForexOrchestrator:
             return
 
         # ── derive signed target units ──
+        trade_units = self._units_per_trade
+        if (
+            self._risk_sizing
+            and self._risk_manager is not None
+            and getattr(self._risk_manager, "last_geometry_source", GEOMETRY_STATIC) == GEOMETRY_BARRIER
+        ):
+            static_sl = getattr(
+                self._risk_manager,
+                "last_static_sl_dist",
+                getattr(signal, "raw_sl_distance", getattr(signal, "raw_atr", 0.001)) * getattr(self._risk_manager.profile, "sl_atr_multiplier", 1.0),
+            )
+            trade_units = self._risk_manager.calculate_forex_units(
+                base_units=self._units_per_trade,
+                static_sl_distance=static_sl,
+                actual_sl_distance=sl_dist,
+            )
+            logger.info(
+                "[%s] Risk-sized units: %d -> %d (static_sl=%.5f actual_sl=%.5f ratio=%.2fx)",
+                symbol,
+                self._units_per_trade,
+                trade_units,
+                static_sl,
+                sl_dist,
+                static_sl / sl_dist if sl_dist > 0 else 1.0,
+            )
+
         target_units = (
-            self._units_per_trade
+            trade_units
             if signal.direction == "long"
-            else -self._units_per_trade
+            else -trade_units
         )
 
         # ── guard: same-direction re-entry / mark reversal in flight ──
@@ -2094,6 +2153,34 @@ class OandaForexOrchestrator:
         REST and the pricing stream are separate connections, so the
         flatten very likely still works even when the stream is wedged.
         """
+        # ── Scheduled pauses are not outages (2026-09-15) ──
+        # Forex stops ticking for ~35 minutes at the daily 5pm-ET rollover and
+        # from Friday 17:00 ET to Sunday 17:00 ET over the weekend. Price silence
+        # during those windows is EXPECTED, and responding to it is not free: the
+        # forced reconnect restores nothing (there is nothing to restore) and,
+        # with a position open, the flatten below closes a live trade at the
+        # moment spreads blow out tenfold. Measured cost of not gating this: on
+        # 2026-09-11..13 the weekend produced 12,674 CRITICAL lines, 14 alert
+        # incidents and a price clock reading 51,072s (14.2h) of "silence".
+        #
+        # Nothing is skipped permanently: the first probe after the reopen runs
+        # this same path with prices flowing, so a stream that genuinely died
+        # during the pause is caught within one threshold of the reopen.
+        pause = scheduled_market_pause()
+        if pause is not None:
+            if self._liveness_pause_logged != pause:
+                logger.info(
+                    "Feed quiet during the scheduled %s — no action: prices are not "
+                    "expected until the market reopens. Watchdog stays armed for a "
+                    "real outage after that.",
+                    pause,
+                )
+                self._liveness_pause_logged = pause
+            # Re-arm, so the first GENUINE outage after the pause still alerts.
+            self._liveness_alert_fired = False
+            return
+        self._liveness_pause_logged = None
+
         down_secs = self._provider.stream_down_seconds
         price_age = self._provider.seconds_since_last_price
         message_age = self._provider.seconds_since_last_message
@@ -2249,6 +2336,7 @@ class OandaForexOrchestrator:
             symbols=self._symbols,
             granularity=getattr(self._provider, "_stream_gran", None),
             units=self._units_per_trade,
+            risk_sizing=self._risk_sizing,
             warmup=self._warmup,
             cooldown_s=self._reentry_cooldown,
             max_per_ccy=self._max_per_currency,

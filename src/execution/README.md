@@ -161,9 +161,20 @@ Things worth knowing:
   lookup may drop anything, because an API blip that silently muted the whole
   basket would be far worse than the odd rejection. Dropping *everything*
   aborts startup instead of running a bot that can't place an order.
-- **Liveness watchdog** — 60s of silence (OANDA heartbeats every ~5s) means the
-  feed is dead, so it reconnects **and flattens exposure**. Correct, given
-  software-enforced stops.
+- **Liveness watchdog** — 60s of price silence (OANDA heartbeats every ~5s) means
+  the feed is dead, so it reconnects **and flattens exposure**. Correct, given
+  software-enforced stops — but only while prices are *expected*. Forex stops
+  ticking for ~35 minutes at the daily 5pm-ET rollover and from Friday 17:00 ET
+  to Sunday 17:00 ET, and an ungated watchdog reads both as an outage: on
+  2026-09-11..13 the weekend produced **12,674 CRITICAL lines, 14 alert
+  incidents and 12 futile reconnects**, with the price clock reaching 51,072s
+  (14.2h) of "silence" while every line correctly said "no positions held". The
+  flatten was the real hazard — positions *are* held across the rollover (Gate C
+  blocks only new entries) — so the probe now returns early inside a scheduled
+  pause (`risk_manager.scheduled_market_pause`), logging one INFO line per pause
+  and leaving the watchdog armed for a genuine outage after the reopen.
+  Holidays are not covered: a wrong calendar is worse than none, so a holiday
+  pause still alerts.
 - **Spread calibration (`SPREAD_CALIB`)** — samples the real spread once per
   sealed bar, off the fast path, so the placeholder cost assumption (α = 0.15)
   can be replaced with measured per-instrument values. This is what

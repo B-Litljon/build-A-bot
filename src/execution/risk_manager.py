@@ -59,6 +59,14 @@ Glossary:
     Gate B (regime, GATE_REGIME) -- rejects when current volatility sits in the
         bottom regime_pctile (20%) of its own recent window. A market too quiet
         to move cannot reach the target before the hold limit expires.
+    scheduled_market_pause -- names the SCHEDULED market pause in effect right
+        now (PAUSE_WEEKEND, PAUSE_DAILY_ROLLOVER, or None), anchored to
+        America/New_York so it tracks DST. Exists because silence during a pause
+        is not a fault: the liveness watchdog consumed it as one for a whole
+        weekend (12,674 CRITICALs, 14 alerts) and would have flattened live
+        positions held across the daily rollover.
+    WEEKLY_CLOSE_ET / WEEKLY_OPEN_ET -- Friday 17:00 / Sunday 17:00 New York:
+        the forex weekly close and reopen. Pause windows, not trading hours.
     Gate C (time, GATE_TIME) -- rejects everything inside a daily blackout
         window, default 16:55-17:30 New York (_DEFAULT_BLACKOUT_ET). This is
         the daily rollover, when spreads briefly blow out roughly tenfold.
@@ -214,6 +222,77 @@ except Exception:  # pragma: no cover — tzdata missing
     _NY_TZ = None
 
 
+# ── Scheduled market pauses ────────────────────────────────────────────────
+# Forex does not tick every minute of every day: it pauses for ~35 minutes at
+# the daily 5pm-ET rollover and for the whole weekend, from Friday 17:00 ET to
+# Sunday 17:00 ET. Both are SCHEDULED, and both look exactly like a dead feed to
+# anything that measures price silence.
+#
+# This matters beyond log noise. On 2026-09-11..13 the soak's liveness watchdog
+# treated the weekend closure as an outage: 12,674 CRITICAL lines, 14 alert
+# incidents, 12 futile reconnect attempts, and a price clock that reached 51,072s
+# (14.2 hours) of "silence" — while the market was shut and every line correctly
+# reported "no positions held". The same rule flattens open positions, and
+# positions ARE legitimately held across the rollover (Gate C blocks only new
+# ENTRIES in that window), so the watchdog would have closed live trades during
+# the daily rollover at the moment spreads blow out tenfold.
+WEEKLY_CLOSE_ET = dtime(17, 0)   # Friday — forex weekly close
+WEEKLY_OPEN_ET = dtime(17, 0)    # Sunday — weekly reopen
+PAUSE_DAILY_ROLLOVER = "daily rollover"
+PAUSE_WEEKEND = "weekend closure"
+
+
+def scheduled_market_pause(
+    when: "Optional[datetime]" = None, spec: "Optional[str]" = None
+) -> "Optional[str]":
+    """
+    Name the SCHEDULED market pause in effect at ``when``, or None if prices are
+    expected.
+
+    Returns ``PAUSE_WEEKEND`` (Friday 17:00 ET → Sunday 17:00 ET) or
+    ``PAUSE_DAILY_ROLLOVER`` (inside the Gate C blackout window, default
+    16:55-17:30 ET), else None. ``when`` defaults to now; naive is assumed UTC.
+    The window is anchored to America/New_York so it tracks the 5pm rollover and
+    the Friday close across DST — a fixed UTC hour drifts by one hour twice a
+    year. ``spec`` overrides the rollover window (defaults to
+    ``RISK_BLACKOUT_ET``, then ``_DEFAULT_BLACKOUT_ET``), so an operator who
+    retunes the toxic-spread window retunes this with it.
+
+    Fail-safe direction: if the zoneinfo database is unavailable we cannot know
+    the local time, so this returns None — "prices expected" — which keeps the
+    liveness watchdog fully armed. Suppressing it by mistake costs an unwatched
+    position; not suppressing it costs spurious alerts and flattening, both of
+    which are visible and recoverable.
+
+    NOT covered: exchange holidays. Those are irregular per-year dates, and a
+    wrong calendar is worse than none — a holiday pause still alerts.
+    """
+    if _NY_TZ is None:
+        return None
+    ts = when if when is not None else datetime.now(timezone.utc)
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    ny = ts.astimezone(_NY_TZ)
+
+    weekday = ny.weekday()          # Mon=0 .. Sun=6
+    hm = ny.time()
+    if (
+        (weekday == 4 and hm >= WEEKLY_CLOSE_ET)   # Friday after the close
+        or weekday == 5                            # all Saturday
+        or (weekday == 6 and hm < WEEKLY_OPEN_ET)  # Sunday before the reopen
+    ):
+        return PAUSE_WEEKEND
+
+    window = _parse_blackout_et(
+        spec if spec is not None else os.getenv(ENV_BLACKOUT_ET, _DEFAULT_BLACKOUT_ET)
+    )
+    if window is None:
+        return None
+    start, end = window
+    inside = (start <= hm < end) if start <= end else (hm >= start or hm < end)
+    return PAUSE_DAILY_ROLLOVER if inside else None
+
+
 def _parse_blackout_et(spec: str) -> "Optional[Tuple[dtime, dtime]]":
     """Parse ``"HH:MM-HH:MM"`` (America/New_York) → (start, end); None if bad."""
     try:
@@ -353,6 +432,10 @@ class RiskManager:
         # Which multipliers produced the most recent bracket: GEOMETRY_STATIC
         # or GEOMETRY_BARRIER. Read by the orchestrator's entry log.
         self.last_geometry_source: str = GEOMETRY_STATIC
+        # Distances from the most recent calculate_bracket() call:
+        # static (profile-based) and actual (substituted if learned geometry was applied).
+        self.last_static_sl_dist: Optional[float] = None
+        self.last_actual_sl_dist: Optional[float] = None
 
     def calculate_bracket(
         self,
@@ -390,9 +473,13 @@ class RiskManager:
         """
         self.last_veto_gate = GATE_NONE
         self.last_geometry_source = GEOMETRY_STATIC
+        self.last_static_sl_dist = None
+        self.last_actual_sl_dist = None
 
         sl_mult = self.profile.sl_atr_multiplier
         tp_mult = self.profile.tp_atr_multiplier
+        self.last_static_sl_dist = round(raw_atr * sl_mult, self.profile.round_precision)
+
         learned = self._barrier_multipliers(barrier, symbol)
         if learned is not None:
             sl_mult, tp_mult = learned
@@ -400,6 +487,7 @@ class RiskManager:
 
         sl_dist = raw_atr * sl_mult
         tp_dist = raw_atr * tp_mult
+        self.last_actual_sl_dist = round(sl_dist, self.profile.round_precision)
 
         def _bracket() -> Tuple[float, float]:
             return (
@@ -655,6 +743,35 @@ class RiskManager:
             return 0.01
         return 0.0001
 
+    def calculate_forex_units(
+        self,
+        base_units: int,
+        static_sl_distance: float,
+        actual_sl_distance: float,
+        min_units: int = 100,
+        max_units: Optional[int] = None,
+    ) -> int:
+        """
+        Scale forex position units inversely with stop-loss width.
+
+        Preserves constant dollar risk per stop-out:
+            units = round(base_units * (static_sl_distance / actual_sl_distance))
+
+        When learned barriers predict wider stops (e.g. 7.5x ATR vs static 2.0x ATR),
+        units are scaled down so the wider stop does NOT multiply total dollar loss.
+        Clamped to [min_units, max_units].
+        """
+        if actual_sl_distance <= 0 or static_sl_distance <= 0:
+            return base_units
+
+        width_ratio = static_sl_distance / actual_sl_distance
+        target = int(round(base_units * width_ratio))
+
+        if max_units is None:
+            max_units = int(base_units * 2)
+
+        return int(np.clip(target, min_units, max_units))
+
     def calculate_quantity(
         self,
         equity: float,
@@ -673,7 +790,7 @@ class RiskManager:
         """
         # 05192026: shouldn't apply to forex trades
         risk_dollars = equity * self.profile.risk_per_trade
-        risk_per_share = entry_price - sl_price
+        risk_per_share = abs(entry_price - sl_price)
 
         if risk_per_share <= 0:
             return 0.0
