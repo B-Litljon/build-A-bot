@@ -245,5 +245,92 @@ class TestStrategyLearnedBarrierMetadataValidation(unittest.TestCase):
             self.assertIn("Bracket mismatch", str(ctx.exception))
 
 
+class TestBarrierPromotionVerdictRecording(unittest.TestCase):
+    """
+    The producer must record the PROMOTION VERDICT beside the weights, because
+    the barrier fit hook fires off the Angel/Devil gate rather than off
+    `scripts/evaluate_barriers.py` — so an artifact can exist whose barrier gate
+    never ran, and the live loader refuses a recorded FAIL.
+
+    Pinned here: `RETRAIN_BARRIER_VERDICT` is read and embedded; an unreadable,
+    mismatched or verdict-shaped-but-unusable file records NOTHING (never a
+    claim); and no bad sidecar kills a completed retrain.
+    """
+
+    def _cfg(self, tmp, max_hold=30):
+        model_dir = Path(tmp) / "verdict_dir"
+        model_dir.mkdir(parents=True, exist_ok=True)
+        (model_dir / "metadata.json").write_text(json.dumps({"asset_class": "forex"}))
+        return model_dir, {
+            "asset_class": "forex",
+            "model_dir": str(model_dir),
+            "max_hold": max_hold,
+        }
+
+    def _frame(self):
+        raw = _make_synthetic_ohlc(n_bars=350)
+        feat_df, _, _ = engineer_features_and_labels(raw, max_hold=30)
+        return feat_df
+
+    def test_verdict_is_embedded_when_pointed_at_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            verdict_path = Path(tmp) / "verdict.json"
+            verdict_path.write_text(json.dumps({
+                "passed": False,
+                "eval_date": "2026-09-14T20:11:00+00:00",
+                "coverage_floor": 0.93,
+                "folds": [{"fold": 3, "coverage": 0.905}],
+            }))
+            model_dir, cfg = self._cfg(tmp)
+            with mock.patch.dict(os.environ, {"RETRAIN_BARRIER_VERDICT": str(verdict_path)}):
+                meta = fit_and_save_barriers(self._frame(), ["natr_14", "vol_rel"], cfg)
+            self.assertIsNotNone(meta)
+            self.assertEqual(meta["verdict"]["passed"], False)
+            self.assertEqual(meta["verdict"]["folds"][0]["coverage"], 0.905)
+            # and it reaches metadata.json, which is what a human reads
+            on_disk = json.loads((model_dir / "metadata.json").read_text())
+            self.assertEqual(on_disk["barriers"]["verdict"]["passed"], False)
+
+    def test_unset_env_records_no_verdict(self):
+        """Absence must read as absence — not as a pass."""
+        with tempfile.TemporaryDirectory() as tmp:
+            _, cfg = self._cfg(tmp)
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("RETRAIN_BARRIER_VERDICT", None)
+                meta = fit_and_save_barriers(self._frame(), ["natr_14", "vol_rel"], cfg)
+            self.assertIsNotNone(meta)
+            self.assertNotIn("verdict", meta)
+
+    def test_unusable_verdict_files_record_nothing_and_do_not_raise(self):
+        """Unreadable, non-JSON, or lacking a boolean `passed`: all three mean
+        "no evidence", and none of them may kill a completed retrain."""
+        for payload in (
+            "{not json",
+            '"PASS"',
+            json.dumps({"folds": []}),
+            json.dumps({"passed": "yes"}),
+        ):
+            with tempfile.TemporaryDirectory() as tmp:
+                verdict_path = Path(tmp) / "verdict.json"
+                verdict_path.write_text(payload)
+                _, cfg = self._cfg(tmp)
+                with mock.patch.dict(
+                    os.environ, {"RETRAIN_BARRIER_VERDICT": str(verdict_path)}
+                ):
+                    meta = fit_and_save_barriers(self._frame(), ["natr_14", "vol_rel"], cfg)
+                self.assertIsNotNone(meta, payload)
+                self.assertNotIn("verdict", meta, payload)
+
+    def test_missing_file_records_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, cfg = self._cfg(tmp)
+            with mock.patch.dict(
+                os.environ, {"RETRAIN_BARRIER_VERDICT": str(Path(tmp) / "nope.json")}
+            ):
+                meta = fit_and_save_barriers(self._frame(), ["natr_14", "vol_rel"], cfg)
+            self.assertIsNotNone(meta)
+            self.assertNotIn("verdict", meta)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -37,20 +37,66 @@ is still scored (Fold 3 models, diagnostic only, recorded in the logs and on
 `ValidationReport.holdout.diagnostic_only`); the fold verdict stands. Exit
 code 2 means "trained but rejected", which is a healthy outcome, not a crash.
 
+**The gate now reports EDGE OVER RANDOM (added 2026-09-14).** `_macro_base_rate`
+computes what a random long entry would have won on the same bars under the same
+bracket, and every gate log now prints it per fold and pooled, with the difference:
+`[Fold N] EDGE OVER RANDOM: macro win X vs base rate Y -> +Z`. It is **reported, not
+gated** — the verdict is unchanged — because the measurement that motivated it is
+that a PF lower bound can be cleared by a *zero-skill* model whenever the base rate is
+high: on the H4 CatBoost candidate the metals approvals won 57.1% against their
+period's base rate of 56.6% (+0.005, p=0.50) inside a regime where a 2:1 long bracket
+won 56.6% against a 33.3% break-even. Conversely a skilled model in a 20%-base period
+would be rejected. `ValidationReport.pooled_base_rate` and `.edge_over_random` carry
+the pooled pair; `FoldMetrics.base_rate` the per-fold. Read it before reading PF.
+
+**Learned barriers ride along on promotion (added 2026-09-14).** When
+`RETRAIN_LEARN_BARRIERS=1` (the default), a passing retrain also fits the two
+`ml.barriers` quantile regressions on the same engineered frame — excursion
+labels are computed per symbol at `horizon=max_hold` (45 for forex), so the
+labelled walk length equals the execution lifetime — and persists
+`barriers_mae.pkl` / `barriers_mfe.pkl` / `barriers_meta.json` into the model
+dir, meta last, then stamps `learned_barriers: true` plus the barrier meta into
+`metadata.json`.
+
+⚠️ **That hook fires off the Angel/Devil gate, not off the barrier gate.** The
+gate that decides whether learned geometry may *replace* the static bracket is
+`scripts/evaluate_barriers.py`, a separate run over the M15 basket — so
+artifacts can exist whose own gate failed. `RETRAIN_BARRIER_VERDICT` is how that
+evidence travels: point it at the JSON from
+`BARRIER_VERDICT_OUT=<path> python scripts/evaluate_barriers.py` and the verdict
+is recorded in `barriers_meta.json`, which is what `MLStrategy._load_barriers`
+reads to **refuse** an artifact recording FAIL (and to warn about one recording
+nothing). Unset or unreadable → no verdict is recorded, never a claim.
+
 - **Imports from repo:** `src.data.factory` (`get_market_provider`),
   `src.data.market_provider`, `src.execution.risk_manager` (`RiskProfile`,
   `coupled_keff`, `_chop_filter_enabled` — this is what keeps the training-time
-  chop veto identical to the live one), `src.ml.feature_pipeline`,
+  chop veto identical to the live one), `src.ml.barriers`,
+  `src.ml.feature_pipeline`,
   `src.ml.feature_stats`, `src.ml.features.v3_features`,
   `src.ml.regimes.hmm_regime`, `src.core.notification_manager`.
 - **Imported by:** `tests/test_retrainer_output_dir.py`,
-  `tests/test_holdout_gate.py`. Otherwise run as a script
-  (`python -m src.core.retrainer`) from `run_pipeline.sh` Phase 5.
+  `tests/test_holdout_gate.py`, `tests/test_retrainer_barriers.py`. Otherwise run
+  as a script (`python -m src.core.retrainer`) from `run_pipeline.sh` Phase 5.
 - **Reads:** bars from the configured provider (network); optionally a spread
-  table JSON named by `RETRAIN_SPREAD_TABLE`.
+  table JSON named by `RETRAIN_SPREAD_TABLE` and a barrier promotion verdict
+  named by `RETRAIN_BARRIER_VERDICT`.
+- **`RETRAIN_DEVIL_LABEL`** — `survival` (default, and what has always shipped)
+  or `macro`: the label the Devil is trained and Brier-scored on. `macro` is the
+  validated fix for a measured defect — the shipping survival-trained Devil scores
+  AUC **0.4722** against the 45-bar bracket outcome the live path actually bets on
+  (0.4564 in the held-out window) while the macro-trained one scores **0.5839**
+  (0.5806 held out), and the two scores are anti-correlated at −0.166. Same defect
+  class as the 2026-09-09 gate-EV fix, one level down. Read per call via
+  `devil_label_col()`, so it is not subject to the import-order bug that once
+  silently ignored `RETRAIN_DAYS_BACK`. ⚠️ `BRIER_THRESHOLD`'s rationale is
+  label-specific (it was raised for the survival base rate), so re-derive it if
+  this is flipped.
 - **Writes** (into `model_dir`, default `models/<asset_class>/`, all atomically):
   `angel_latest.pkl`, `devil_latest.pkl`, `metadata.json`, `threshold.json`,
-  `feature_stats.json`, and `spread_alphas.json` when the cost experiment is on.
+  `feature_stats.json`, `barriers_mae.pkl` + `barriers_mfe.pkl` +
+  `barriers_meta.json` (barriers, when enabled), and `spread_alphas.json` when
+  the cost experiment is on.
   `metadata.json` records the holdout fraction, date range, and metrics (or the
   bypass reason when the holdout is disabled/empty).
 

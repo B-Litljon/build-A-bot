@@ -88,9 +88,24 @@ Glossary:
         persists BarrierEstimator (CatBoost quantile regression for MAE tail
         and MFE median) into the model directory alongside Angel/Devil models.
         Writes barriers_mae.pkl, barriers_mfe.pkl, and barriers_meta.json.
+        NOTE this hook fires off the ANGEL/DEVIL validation gate, not off the
+        barrier promotion gate in scripts/evaluate_barriers.py, so artifacts
+        can exist whose barrier gate failed — which is what the verdict below
+        is for.
+    RETRAIN_BARRIER_VERDICT -- path to a promotion verdict written by
+        ``scripts/evaluate_barriers.py BARRIER_VERDICT_OUT=<path>``. When set
+        and readable it is recorded in barriers_meta.json, and the live loader
+        REFUSES an artifact that records FAIL. Unset/unreadable means the
+        artifact carries no verdict: the loader then serves it with a warning,
+        because absence is "unknown" rather than evidence.
     MAX_HOLD_BARS -- 45. A trade that reaches neither level within 45 bars is
         labelled a loss (timeout), because capital was tied up for nothing.
     SURVIVAL_BARS -- 5. The horizon for the Devil's survival label, below.
+    RETRAIN_DEVIL_LABEL -- "survival" (default, what ships) or "macro": which
+        label the Devil is trained and Brier-scored on. "macro" is the validated
+        fix — the shipping survival-trained Devil is anti-informative about the
+        served bracket (AUC 0.4722 vs 0.5839 measured 2026-09-14). See
+        devil_label_col() for the numbers and the reasoning.
     ANGEL_THRESHOLD -- imported from core.thresholds (0.40 unless the env var
         overrides at process start). Minimum Angel probability for a bar to count as a
         proposed trade. 2026-08-29: when the env var is NOT set this is now a
@@ -140,6 +155,21 @@ Glossary:
         raw (wins, trades) evidence via _holdout_pf_lower_bound.
     FoldMetrics.macro_wins -- per-fold macro (45-bar bracket) wins among
         scored approvals; pooled across folds for the CP instrument.
+    _macro_base_rate -- what a RANDOM long entry would have won on the same
+        bars under the same bracket: the macro outcome's mean over the
+        population it is given, dropping non-finite rows and returning nan
+        (never 0.0) for an unlabelled frame. The benchmark a fold's win rate
+        has to beat before it means anything — a PF lower bound can be cleared
+        by a zero-skill model when the base rate is high, and a skilled one
+        rejected when it is low.
+    FoldMetrics.base_rate / ValidationReport.pooled_base_rate -- that
+        benchmark per fold (on the fold's own tradeable bars) and pooled,
+        weighted by each fold's bar count. Reported telemetry; the verdict does
+        not read it.
+    ValidationReport.edge_over_random -- pooled fold win rate minus
+        pooled_base_rate: the one number that separates skill from a
+        favourable regime. Negative means the model did worse than taking
+        every bar.
     production_angel_threshold -- ValidationReport field: the Angel bar the
         returned models were trained with (calibrated or env-fixed). main()
         threads it to the holdout scoring, threshold.json, and metadata.json.
@@ -377,6 +407,50 @@ DAYS_BACK = int(os.getenv("RETRAIN_DAYS_BACK", "60"))
 # persists BarrierEstimator (barriers_mae.pkl, barriers_mfe.pkl,
 # barriers_meta.json) alongside the Angel and Devil classifiers.
 RETRAIN_LEARN_BARRIERS = os.getenv("RETRAIN_LEARN_BARRIERS", "1").strip() == "1"
+
+# Which label the Devil is trained AND scored on.
+ENV_DEVIL_LABEL = "RETRAIN_DEVIL_LABEL"
+DEVIL_LABEL_DEFAULT = "survival"
+
+
+def devil_label_col() -> str:
+    """
+    The column the Devil is trained and Brier-scored against.
+
+    ``survival`` (the default, and what has always shipped) is ``devil_target``:
+    "did price avoid a ``sl_mult`` x ATR stop for ``survival_bars`` (5) bars".
+    ``macro`` is ``devil_target_macro``: "did TP hit before SL inside
+    ``max_hold`` (45) bars at the served bracket" — the outcome the live path
+    actually bets on.
+
+    Why the switch exists, measured 2026-09-14 (honest OOF probabilities,
+    chronological 5-fold, 227k rows): a Devil trained on the survival label
+    scores AUC **0.4722** against the MACRO outcome — below chance, and **0.4564**
+    in the held-out final window — while the same model trained on the macro
+    label scores **0.5839** / **0.5806**. The two scores are *anti-correlated*
+    (−0.166), i.e. the shipping stage is currently scoring close to the opposite
+    of what predicts the bracket. Same defect class as the gate-EV fix of
+    2026-09-09 (item 20 of the 2026-09-08 audit), one level down: the metric was
+    corrected, the model's target was not.
+
+    Default is ``survival`` so a retrain changes nothing until someone opts in —
+    this is a training-semantics change and it belongs to a deliberate retrain
+    batch, not to import order. Read from the environment at CALL time rather
+    than bound at import for exactly that reason (a module-level constant read at
+    import is what silently ignored ``RETRAIN_DAYS_BACK`` in the H4 candidate
+    script). An unrecognised value falls back to the default and warns.
+    """
+    raw = os.getenv(ENV_DEVIL_LABEL, DEVIL_LABEL_DEFAULT).strip().lower()
+    if raw in ("macro", "devil_target_macro", "bracket", "45"):
+        return "devil_target_macro"
+    if raw in ("survival", "devil_target", "survival_bars", "5", ""):
+        return "devil_target"
+    logger.warning(
+        "[DEVIL] %s=%r is not a recognised label — using %r. "
+        "Accepted: survival (devil_target), macro (devil_target_macro).",
+        ENV_DEVIL_LABEL, raw, DEVIL_LABEL_DEFAULT,
+    )
+    return "devil_target"
 
 # Instruments this OANDA account cannot trade. They stay in the TRAINING basket
 # — the volatility-first basket is load-bearing (a shrink was tried and
@@ -829,6 +903,11 @@ class FoldMetrics:
     # raw (wins, trades) evidence the pooled Clopper-Pearson PF lower bound
     # is computed from. 0 on the degenerate worst-case paths.
     macro_wins: int = 0
+    # What a random long entry would have won on the same fold's tradeable bars,
+    # under the same bracket. The benchmark this fold's macro win rate has to beat
+    # to mean anything (see _macro_base_rate). nan when the frame carries no
+    # label; 0.0 on the degenerate worst-case paths, where it is unused.
+    base_rate: float = float("nan")
 
 
 @dataclass
@@ -891,6 +970,12 @@ class ValidationReport:
     # value. Written into threshold.json on promotion; MLStrategy prefers the
     # pinned value over the constant, keeping train/serve symmetry.
     production_angel_threshold: float = 0.0
+    # Pooled edge over the bracket's own base rate: the fold win rate minus what a
+    # random long entry would have won on the same bars, pooled across folds. The
+    # one number that separates skill from a favourable regime — see
+    # _macro_base_rate for the measurement that motivated it.
+    pooled_base_rate: float = float("nan")
+    edge_over_random: float = float("nan")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1684,7 +1769,8 @@ def refit_models(
     # Extract base features and targets
     X_base = df[feature_cols].to_numpy()
     y_angel = df["angel_target"].to_numpy()
-    y_devil = df["devil_target"].to_numpy()
+    devil_col = devil_label_col()
+    y_devil = df[devil_col].to_numpy()
 
     logger.info(f"Training samples: {len(X_base):,}")
     logger.info(f"Base features: {feature_cols}")
@@ -2119,6 +2205,31 @@ def _find_optimal_angel_threshold(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+def _macro_base_rate(df: pl.DataFrame) -> float:
+    """
+    The macro bracket's BASE RATE on a population: what a random long entry at the
+    same bars would have won, under the served bracket convention.
+
+    This is the benchmark a fold's win rate has to beat before it means anything, and
+    until 2026-09-14 the gate did not compute it. Measured on the H4 CatBoost
+    candidate: its metals approvals won 57.1% against a period base rate of 56.6%
+    (+0.005, p=0.50 — no selectivity at all) inside a regime where a 2:1 long bracket
+    won 56.6% against a 33.3% break-even, i.e. the regime alone cleared a 1.2 PF lower
+    bound. A gate scoring ABSOLUTE win rate and PF will therefore pass a zero-skill
+    model in a high-base-rate period and reject a skilled one in a low-base-rate
+    period. Reported, not yet gated: this is telemetry so the promotion decision can
+    see the difference between skill and weather.
+
+    Non-finite outcomes are dropped; an empty or label-less frame returns nan rather
+    than a misleading 0.0.
+    """
+    if "devil_target_macro" not in df.columns or df.height == 0:
+        return float("nan")
+    y = df["devil_target_macro"].to_numpy().astype(float)
+    y = y[np.isfinite(y)]
+    return float(y.mean()) if y.size else float("nan")
+
+
 def _tradeable_scoring_mask(
     val_df: pl.DataFrame,
     signal_mask: np.ndarray,
@@ -2238,7 +2349,7 @@ def _evaluate_holdout(
 
     X_base = holdout_df[angel_features].to_numpy()
     y_angel = holdout_df["angel_target"].to_numpy()
-    y_devil = holdout_df["devil_target"].to_numpy()
+    y_devil = holdout_df[devil_label_col()].to_numpy()
     y_devil_macro = holdout_df["devil_target_macro"].to_numpy()
 
     if angel_threshold is None:
@@ -2693,6 +2804,9 @@ def validate_candidate(
     ]
 
     fold_metrics: List[FoldMetrics] = []
+    # (base rate, tradeable rows) per fold — pooled at the end into the edge-over-
+    # random summary. See _macro_base_rate.
+    base_rate_samples: List[tuple] = []
 
     # Placeholders for Fold 3 outputs (used for PF gate and fallback)
     fold3_angel: Optional["lgb.LGBMClassifier"] = None
@@ -2787,7 +2901,9 @@ def validate_candidate(
         # ─────────────────────────────────────────────────────────────
         X_val_base = val_df[feature_cols].to_numpy()
         y_val_angel = val_df["angel_target"].to_numpy()
-        y_val_devil = val_df["devil_target"].to_numpy()  # survival (5-bar)
+        # The Devil's own label — survival by default, macro under
+        # RETRAIN_DEVIL_LABEL=macro (see devil_label_col).
+        y_val_devil = val_df[devil_label_col()].to_numpy()
         y_val_devil_macro = val_df["devil_target_macro"].to_numpy()  # macro (45-bar)
 
         # Stage 1: Angel inference
@@ -3097,10 +3213,33 @@ def validate_candidate(
             macro_win_rate * (tp_mult / sl_mult) - (1.0 - macro_win_rate)
         )
 
+        # ── the benchmark the win rate has to beat: random longs, same bars ──
+        # Scored on the same tradeable population the fold's metrics use, so the
+        # comparison is like-for-like. Reported, not gated (see _macro_base_rate for
+        # why a PF lower bound alone cannot tell skill from a favourable regime).
+        base_rows = (
+            val_df.filter(~pl.col("symbol").is_in(list(UNTRADEABLE_SYMBOLS)))
+            if UNTRADEABLE_SYMBOLS
+            else val_df
+        )
+        fold_base_rate = _macro_base_rate(base_rows)
+        fold_edge = (
+            macro_win_rate - fold_base_rate
+            if np.isfinite(fold_base_rate)
+            else float("nan")
+        )
+        base_rate_samples.append((fold_base_rate, base_rows.height))
+
         logger.info(
             f"[Fold {fold_number}] "
             f"Brier={brier:.4f} | EV={ev:.6f} | WR={win_rate:.1%} | "
             f"Trades={n_devil_approved}"
+        )
+        logger.info(
+            f"[Fold {fold_number}] EDGE OVER RANDOM: macro win {macro_win_rate:.4f} vs "
+            f"base rate {fold_base_rate:.4f} -> {fold_edge:+.4f} "
+            f"({base_rows.height:,} tradeable bars). A positive PF is worth nothing "
+            f"unless this is positive."
         )
 
         fm = FoldMetrics(
@@ -3113,6 +3252,7 @@ def validate_candidate(
             devil_approved_trades=n_devil_approved,
             win_rate=win_rate,
             macro_wins=fold_macro_wins,
+            base_rate=fold_base_rate,
         )
         fold_metrics.append(fm)
 
@@ -3176,6 +3316,35 @@ def validate_candidate(
     )
     fold3_pf_lb = _holdout_pf_lower_bound(
         fold3_macro_wins, final_total_trades, sl_mult, tp_mult
+    )
+
+    # ── pooled edge over the bracket's own base rate ──
+    # Weighted by each fold's tradeable bar count, because a fold with more bars
+    # describes more of the market. The pooled win rate is the scored approvals'.
+    _br = [(r, n) for r, n in base_rate_samples if np.isfinite(r)]
+    if _br:
+        _w = sum(n for _, n in _br)
+        pooled_base_rate = (
+            float(sum(r * n for r, n in _br) / _w) if _w > 0
+            else float(np.mean([r for r, _ in _br]))
+        )
+    else:
+        pooled_base_rate = float("nan")
+    pooled_macro_win_rate = (
+        pooled_oos_wins / pooled_oos_trades if pooled_oos_trades > 0 else float("nan")
+    )
+    edge_over_random = (
+        pooled_macro_win_rate - pooled_base_rate
+        if np.isfinite(pooled_base_rate) and np.isfinite(pooled_macro_win_rate)
+        else float("nan")
+    )
+    logger.info(
+        "EDGE OVER RANDOM (pooled): macro win %.4f vs base rate %.4f -> %+.4f "
+        "on %d trades. This is the metric that separates skill from a favourable "
+        "regime; a PF lower bound above %.2f can be cleared by a zero-skill model "
+        "when the base rate is high.",
+        pooled_macro_win_rate, pooled_base_rate, edge_over_random, pooled_oos_trades,
+        PROFIT_FACTOR_THRESHOLD,
     )
 
     rejection_reasons: List[str] = []
@@ -3285,6 +3454,8 @@ def validate_candidate(
         pooled_pf_lower_bound=pooled_pf_lb,
         fold3_pf_lower_bound=fold3_pf_lb,
         production_angel_threshold=production_angel_threshold,
+        pooled_base_rate=pooled_base_rate,
+        edge_over_random=edge_over_random,
     )
 
     return (
@@ -3409,6 +3580,75 @@ def promote_or_reject(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+ENV_BARRIER_VERDICT = "RETRAIN_BARRIER_VERDICT"
+
+
+def _load_barrier_verdict() -> Optional[dict]:
+    """
+    Read the barrier PROMOTION VERDICT to record beside the weights.
+
+    The barrier fit hook runs off the Angel/Devil validation gate, so nothing
+    about the artifact's own fitness has been established by the time it is
+    written — ``scripts/evaluate_barriers.py`` is the gate that decides whether
+    learned geometry may replace the static bracket, and it is a separate run
+    (it evaluates the M15 basket, not this model's frame). Its output is
+    therefore an INPUT here, not something this function can re-derive.
+    ``RETRAIN_BARRIER_VERDICT`` points at it.
+
+    Failure policy, deliberately soft in two directions: an unset, unreadable
+    or malformed verdict records NOTHING and warns, because killing a completed
+    retrain over a missing sidecar is worse than a serve-time warning; but the
+    artifact never CLAIMS evidence it does not have, and a verdict that parses
+    and says ``passed: false`` is recorded as-is so the live loader refuses it.
+    """
+    raw = os.getenv(ENV_BARRIER_VERDICT, "").strip()
+    if not raw:
+        logger.warning(
+            "[BARRIERS] %s is unset — the artifact will carry NO promotion "
+            "verdict. That is servable (with a warning) but it is not "
+            "evidence: run scripts/evaluate_barriers.py with "
+            "BARRIER_VERDICT_OUT=<path> and point %s at the result.",
+            ENV_BARRIER_VERDICT,
+            ENV_BARRIER_VERDICT,
+        )
+        return None
+    path = Path(raw)
+    try:
+        verdict = json.loads(path.read_text())
+    except Exception as exc:
+        logger.warning(
+            "[BARRIERS] promotion verdict %s is unreadable (%s) — recording "
+            "none rather than a claim",
+            path,
+            exc,
+        )
+        return None
+    if not isinstance(verdict, dict) or not isinstance(verdict.get("passed"), bool):
+        logger.warning(
+            "[BARRIERS] promotion verdict %s has no boolean 'passed' — "
+            "recording none; a verdict-shaped blob nothing can act on is "
+            "worse than no verdict",
+            path,
+        )
+        return None
+    if verdict["passed"]:
+        logger.info(
+            "[BARRIERS] recording PASSED promotion verdict from %s "
+            "(%d folds, coverage floor %s)",
+            path,
+            len(verdict.get("folds") or []),
+            verdict.get("coverage_floor"),
+        )
+    else:
+        logger.warning(
+            "[BARRIERS] the recorded promotion gate FAILED (%s) — writing the "
+            "artifact anyway for research, and recording the failure so the "
+            "live loader REFUSES to serve it",
+            path,
+        )
+    return verdict
+
+
 def fit_and_save_barriers(
     df: pl.DataFrame,
     feature_cols: List[str],
@@ -3481,7 +3721,7 @@ def fit_and_save_barriers(
     )
 
     estimator.fit(df, df, sample_weight=weights)
-    meta = estimator.save(model_dir, horizon=horizon)
+    meta = estimator.save(model_dir, horizon=horizon, verdict=_load_barrier_verdict())
 
     metadata_path = model_dir / "metadata.json"
     if metadata_path.exists():
