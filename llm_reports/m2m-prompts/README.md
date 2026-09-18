@@ -16,6 +16,17 @@ One stage per file; point an agent at the file and it has the full contract.
 Every brief carries the standing rails inline; the stage-2 file holds the
 canonical copy.
 
+## Legacy ledger threads (pre-2026-09)
+
+The `2026-06-*` … `2026-08-*` files predate this folder: they lived in the
+top-level `m2m_prompts/` directory (removed 2026-09-17) as a ledger of
+model-to-model handoffs — the *input* counterpart to `llm_reports/` outputs,
+kept so a dispatched instruction could be diffed against the commit it
+produced. Each carries frontmatter with `to`, `from`, `status`
+(drafted → dispatched → completed → verified), and a `result_commit` two-way
+link: the prompt points to the commit, the commit points back to the prompt.
+New work uses the append-only **live thread** convention below instead.
+
 ## Live threads (not briefs)
 
 A brief is one-way: point an agent at it and it has a contract. When **two
