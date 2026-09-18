@@ -540,7 +540,8 @@ class TestBarrierSidecar(unittest.TestCase):
         label geometry, so the numbers must appear rather than vanish.
 
         The Devil is trained on `devil_target`, built from the STATIC multiples
-        (retrainer.py:1469); a learned bracket is a different walk than the one
+        (core/retrainer/_labels.py — was retrainer.py:1469 pre-split); a learned
+        bracket is a different walk than the one
         its conviction was fitted on, and the direction of that error is not
         known. A silent stand-down is how that gets forgotten.
         """

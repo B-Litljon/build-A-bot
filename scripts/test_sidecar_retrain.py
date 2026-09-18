@@ -25,6 +25,7 @@ sys.path.insert(0, ".")
 sys.path.insert(0, "src")
 
 import core.retrainer as R
+from core.retrainer import _data as data_mod  # fetch_training_data lives here post-2026-09-16 split
 from ml.barriers.estimator import (
     BARRIER_MAE_FILENAME,
     BARRIER_META_FILENAME,
@@ -90,7 +91,7 @@ def main():
     logger.info("=" * 70)
 
     with mock.patch.dict(os.environ, env_overrides), \
-         mock.patch.object(R, "fetch_training_data", return_value=raw_data):
+         mock.patch.object(data_mod, "fetch_training_data", return_value=raw_data):
         exit_code = R.main()
 
     logger.info(f"Retrainer completed with exit code: {exit_code}")

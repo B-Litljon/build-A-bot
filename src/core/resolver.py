@@ -33,7 +33,7 @@ Glossary:
     OUTPUT_PATH -- data/resolved_ledger.csv, this module's only output.
     TP_MULTIPLIER / SL_MULTIPLIER -- the legacy fixed brackets, +0.5% and
         -0.2% of entry price. Superseded in production by ATR-scaled brackets
-        (see retrainer.py); kept so old ledgers stay reproducible.
+        (see core/retrainer/_labels.py); kept so old ledgers stay reproducible.
     TradeOutcome -- what happened to one signal: the two bracket levels, where
         and when it actually exited, how long it was held, and the verdict.
     TradeOutcome.outcome -- the ground-truth label: 1 = win, 0 = loss. This is

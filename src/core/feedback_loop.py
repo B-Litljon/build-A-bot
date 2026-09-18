@@ -85,7 +85,7 @@ RESOLVED_PATH = Path("data/evaluation_results.parquet")
 # evaluation_results.parquet carries pnl_r (R-multiples), so the modern path
 # never uses these. They are the legacy static-percentage brackets (+0.5% /
 # -0.2%) from the pre-V3.2 era, retained for any old-format file that lacks
-# pnl_r; they are superseded by the ATR-dynamic brackets in retrainer.py.
+# pnl_r; they are superseded by the ATR-dynamic brackets in core/retrainer/_labels.py.
 TAKE_PROFIT = 0.005  # +0.5% (legacy static bracket — superseded by ATR-dynamic)
 STOP_LOSS = 0.002  # -0.2% (legacy static bracket — superseded by ATR-dynamic)
 

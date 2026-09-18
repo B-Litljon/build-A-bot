@@ -28,6 +28,7 @@ import polars as pl
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from core import retrainer as R  # noqa: E402
+from core.retrainer import _common as common  # noqa: E402  (constants live here post-2026-09-16 split)
 
 
 def _proposed(symbols):
@@ -107,7 +108,7 @@ class TestTradeableScoringMask(unittest.TestCase):
     def test_empty_untradeable_set_restores_old_behaviour(self):
         val_df, sig = _proposed(["XAU_USD", "GBP_JPY"])
         approved = np.array([True, True])
-        with mock.patch.object(R, "UNTRADEABLE_SYMBOLS", frozenset()):
+        with mock.patch.object(common, "UNTRADEABLE_SYMBOLS", frozenset()):
             scored, excluded = R._tradeable_scoring_mask(val_df, sig, approved)
         self.assertEqual(excluded, 0)
         self.assertIs(scored, approved)
@@ -163,7 +164,10 @@ class TestBehaviorVetoIsOffByDefault(unittest.TestCase):
             with mock.patch.dict(
                 "os.environ", {"RETRAIN_BEHAVIOR_VETO": "trend_high, range_low"}
             ):
-                reloaded = importlib.reload(R)
+                # The constant lives in _common since the 2026-09-16 package
+                # split, so the env re-read has to reload that module (reloading
+                # the facade re-imports, it does not recompute, the env read).
+                reloaded = importlib.reload(common)
                 self.assertEqual(
                     reloaded.BEHAVIOR_VETO_LABELS,
                     frozenset({"trend_high", "range_low"}),
@@ -171,12 +175,12 @@ class TestBehaviorVetoIsOffByDefault(unittest.TestCase):
         finally:
             # Restore OUTSIDE the patch, or the reload re-reads the patched env
             # and leaks a non-empty veto into every later test.
-            importlib.reload(R)
-        self.assertEqual(R.BEHAVIOR_VETO_LABELS, frozenset())
+            importlib.reload(common)
+        self.assertEqual(common.BEHAVIOR_VETO_LABELS, frozenset())
 
     def test_metadata_declares_the_required_gate(self):
         """metadata.json must carry behavior_veto so a served model is checkable."""
-        src = (Path(__file__).resolve().parents[1] / "src/core/retrainer.py").read_text()
+        src = (Path(__file__).resolve().parents[1] / "src/core/retrainer/_persist.py").read_text()  # save_models lived here since the 2026-09-16 split
         self.assertIn('"behavior_veto": sorted(BEHAVIOR_VETO_LABELS)', src)
 
 
