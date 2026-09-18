@@ -14,11 +14,6 @@ Glossary:
     webhook_url -- the Discord incoming-webhook URL, taken from the
         DISCORD_WEBHOOK_URL environment variable unless passed explicitly.
         None/unset disables every send in this class.
-    send_trade_alert -- entry/exit embed for the Alpaca path. Takes a
-        ``core.signal.Signal`` and reads angel_prob, devil_prob, sl_price,
-        tp_price and expected_pct_growth out of its ``metadata`` dict.
-        On close actions metadata may also carry ``close_price`` and
-        ``hit_level`` ("TP"/"SL"), which replace the price line.
     send_oanda_trade_alert -- the same idea for the forex path, but takes loose
         primitives instead of a Signal, because the OANDA strategy emits the
         other Signal shape (``strategies.base.Signal``). Keyword-only.
@@ -74,71 +69,6 @@ class NotificationManager:
         if not self.webhook_url:
             logger.warning("DISCORD_WEBHOOK_URL not set. Notifications disabled.")
 
-    def send_trade_alert(self, signal, action: str = "ENTRY"):
-        """Sends a formatted Meta-Labeling trade alert to Discord."""
-        from core.signal import (
-            SignalType,
-        )  # lazy import — only needed in live orchestrator context
-
-        if not self.webhook_url:
-            return
-
-        if action == "ENTRY":
-            title = f"🎯 UNIVERSAL SCALPER: {signal.type.value} {signal.symbol}"
-            color = 0x00FF00 if signal.type == SignalType.BUY else 0xFF0000
-        else:
-            title = f"🏁 TRADE CLOSED: {signal.symbol}"
-            color = 0x00A2FF
-
-        close_price = signal.metadata.get("close_price") if action != "ENTRY" else None
-        if close_price is not None:
-            description = f"💵 **Close Price:** ${close_price:.2f}\n"
-            if signal.price:
-                description += f"📥 **Entry Price:** ${signal.price:.2f}\n"
-            hit = signal.metadata.get("hit_level")
-            if hit:
-                emoji = "🚀" if hit == "TP" else "🛑"
-                description += f"{emoji} **{hit} HIT**\n"
-        else:
-            description = f"💵 **Price:** ${signal.price:.2f}\n"
-
-        # Check for Meta-Labeling data
-        if "angel_prob" in signal.metadata and "devil_prob" in signal.metadata:
-            angel_pct = signal.metadata["angel_prob"] * 100
-            devil_pct = signal.metadata["devil_prob"] * 100
-            description += f"👼 **Angel (Direction):** {angel_pct:.1f}%\n"
-            description += f"😈 **Devil (Conviction):** {devil_pct:.1f}%\n"
-        else:
-            description += f"📊 **Confidence:** {signal.confidence * 100:.1f}%\n"
-
-        # Append Stop Loss and Take Profit for both entry and close alerts
-        if (
-            "sl_price" in signal.metadata
-            and "tp_price" in signal.metadata
-        ):
-            description += f"\n🛑 **Stop Loss:** ${signal.metadata['sl_price']:.4f}\n"
-            description += f"🚀 **Take Profit:** ${signal.metadata['tp_price']:.4f}\n"
-            if action == "ENTRY" and "expected_pct_growth" in signal.metadata:
-                description += f"📈 **Projected Growth:** {signal.metadata['expected_pct_growth']:.2f}%\n"
-
-        payload = {
-            "username": "Build-A-Bot Executive",
-            "embeds": [
-                {
-                    "title": title,
-                    "description": description,
-                    "color": color,
-                    "footer": {"text": f"Timestamp: {signal.timestamp}"},
-                }
-            ],
-        }
-
-        try:
-            response = requests.post(self.webhook_url, json=payload, timeout=5)
-            response.raise_for_status()
-        except Exception as e:
-            logger.error(f"Failed to send Discord notification: {e}")
-
     def send_system_message(self, message: str):
         """Sends generic system status updates."""
         if not self.webhook_url:
@@ -170,8 +100,9 @@ class NotificationManager:
         """
         Discord alert for the OANDA forex bot path.
 
-        Decoupled from core.signal.Signal because the V5 forex strategy
-        emits a different Signal shape (strategies.base.Signal). Accepts
+        Decoupled from any Signal class because the V5 forex strategy
+        emits its own shape (strategies.base.Signal — now the only one).
+        Accepts
         primitives so each orchestrator passes whatever fields it has.
         """
         if not self.webhook_url:

@@ -528,7 +528,8 @@ def print_results(results: List[BracketResult]) -> None:
         "  2. src/evaluate_performance.py         SL_MULTIPLIER, TP_MULTIPLIER, MAX_HOLD_BARS"
     )
     print(
-        "  3. src/execution/live_orchestrator.py  SL_ATR_MULTIPLIER, TP_ATR_MULTIPLIER"
+        "  3. src/execution/risk_manager.py  RiskProfile.for_asset_class (source of truth"
+        "     since the 2026-09-16 Alpaca-lane deletion)"
     )
     print(
         "  4. src/analysis/failure_modes.py       SL_ATR_MULTIPLIER, TP_ATR_MULTIPLIER, MAX_HOLD_BARS"

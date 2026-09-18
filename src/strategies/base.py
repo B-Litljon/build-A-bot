@@ -1,11 +1,9 @@
 """
 Abstract base class for all trading strategies, and the Signal they emit.
 
-⚠️ TWO SIGNAL CLASSES EXIST. This one (``strategies.base.Signal``) is used by
-the OANDA / forex path and the Factory path, and carries explicit bracket
-distances. The other (``core.signal.Signal``) belongs to the Alpaca path and
-keeps its bracket levels inside a metadata dict. They are not interchangeable;
-see GLOSSARY.md.
+This is now the ONLY Signal class: the Alpaca path's `core.signal.Signal`
+(bracket levels in a metadata dict) was deleted 2026-09-16 along with that
+whole dormant lane. Direction here is a plain string, not an enum.
 
 Glossary:
     Signal -- what a strategy returns when it wants to trade. Returning None
