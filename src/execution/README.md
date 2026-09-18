@@ -4,26 +4,25 @@ Where decisions become orders. Everything here runs **live**: connect to a
 broker, hold state about open positions, submit and close orders, and enforce
 stops in software.
 
-The folder contains **three orchestrators for three different brokers/markets**,
-which is the main thing to get straight before reading any of it:
+The folder contains **one live orchestrator**:
 
 | File | Market | Status |
 |---|---|---|
 | `oanda_forex_orchestrator.py` | OANDA forex | ⚠️ **currently running live** (M15 practice soak) |
-| `live_orchestrator.py` | Alpaca equities + crypto | Working, tested, not the live bot |
-| `factory_orchestrator.py` | Alpaca (Factory path) | Smallest/clearest; good place to start reading |
 
-All three share the same shape: **bar seals → run the model on a worker thread
-→ if a signal comes back and we're flat, size it and send the order → a
+Until 2026-09-16 it also carried two dormant Alpaca orchestrators
+(`live_orchestrator.py` equities+crypto, `factory_orchestrator.py` Factory
+path), deleted in the downsizing pass — git history has them. Both shared the
+same shape the OANDA one inherited: **bar seals → run the model on a worker
+thread → if a signal comes back and we're flat, size it and send the order → a
 separate watchdog loop closes the position when price crosses a level.**
 
-Two rules hold across all of them:
+Two rules still hold:
 
-- **Software stops, not broker brackets** (except Alpaca equities, which do get
-  a real broker-side bracket). The consequence is that *the process being alive
-  is a safety requirement* — a dead bot means an unwatched position. That's why
-  the OANDA path flattens everything when its feed goes quiet, and why
-  `soak_watchdog.sh` exists.
+- **Software stops, not broker brackets.** The consequence is that *the process
+  being alive is a safety requirement* — a dead bot means an unwatched
+  position. That's why the OANDA path flattens everything when its feed goes
+  quiet, and why `soak_watchdog.sh` exists.
 - **Model inference never runs on the event loop.** It's CPU-bound and would
   stall the feed, so it's offloaded with `asyncio.to_thread`.
 
@@ -90,10 +89,8 @@ a broken sidecar must degrade, not block every entry.
 - **Imports from repo:** none (numpy only — deliberately dependency-light; the
   barrier payload arrives as an argument and its key is defined in
   `strategies.base`, not imported here).
-- **Imported by:** `src/core/retrainer.py`, `factory_orchestrator.py`,
-  `oanda_forex_orchestrator.py`, `__init__.py`, `run_factory.py`,
-  `run_oanda.py`, `chop_ab_test.py`, `scripts/generate_feature_stats.py`,
-  `scripts/run_paper_live.py`, `scripts/smoke_test.py`,
+- **Imported by:** `src/core/retrainer/` (_train,_gate), `oanda_forex_orchestrator.py`,
+  `__init__.py`, `run_oanda.py`, `scripts/generate_feature_stats.py`,
   `tests/test_risk_manager.py`, `tests/test_cost_feature.py`.
 - **Data artifacts:** none directly; reads per-instrument costs passed in from
   the model dir's `spread_alphas.json`.
@@ -212,57 +209,12 @@ HTTP timeout so a half-open socket cannot hang the entry path.
   `tests/test_oanda_entry.py`, `tests/test_oanda_forex.py`,
   `tests/test_execution_safety.py`.
 
-### `live_orchestrator.py` (2475 lines) — Alpaca dual-stream
-`LiveOrchestrator`. Trades equities and crypto in one event loop, with a Rich
-terminal dashboard. Not the live bot; `__init__.py` deliberately doesn't export
-it.
-
-**Threading contract** — the thing most likely to bite you here: the event loop
-is the *sole owner* of every mutable field on `SymbolContext`. Worker functions
-receive immutable snapshots and return frozen results (`InferenceOutcome`,
-`EntryOrderResult`) that the loop applies. Thread functions never hold a
-`SymbolContext` reference. Enforced by a regression test that instruments
-`SymbolContext.__setattr__` and asserts every write lands on the loop thread.
-
-Other specifics: a `SymbolState` machine (FLAT → PENDING → IN_TRADE →
-PENDING_EXIT → COOLING → FLAT) with a 5-minute cooling-off so one choppy
-stretch can't cause repeated re-entries; a volatility kill switch that skips
-bars above 0.5204 NATR regardless of what the models say; a Smart Clock Gate
-blocking equities outside market hours while crypto always passes; and a cached
-HTF feature snapshot with cold/warm paths, read once into a local before
-offloading so the warm path can't mix two periods.
-
-- **Imports from repo:** `core.notification_manager`, `core.signal`,
-  `ml.feature_pipeline`, `ml.features.v3_features`,
-  `strategies.concrete_strategies.ml_strategy`, `utils.bar_aggregator`.
-- **Imported by:** `run_live.py`, `src/analysis/optimize_brackets.py`,
-  `tests/execution/test_live_orchestrator.py`.
-- **Writes:** `active_trades.json` (so a restart can recover open trades).
-
-### `factory_orchestrator.py` (191 lines) — start here
-`FactoryOrchestrator`. The smallest complete trading loop in the repo and the
-clearest illustration of the shared shape.
-
-Two details worth carrying to the bigger files: it **re-checks
-`active_positions` after acquiring the lock**, because sizing awaits broker
-calls during which another coroutine could have entered; and its watchdog reads
-the **last sealed bar's close**, so exits can lag by up to a bar — the OANDA
-orchestrator improves on this by checking live quotes.
-
-- **Imports from repo:** `data.feed`, `execution.enums`,
-  `execution.risk_manager`, `strategies.concrete_strategies.ml_strategy`,
-  `utils.bar_aggregator`.
-- **Imported by:** `run_factory.py`, `__init__.py`, `scripts/smoke_test.py`,
-  `scripts/run_paper_live.py`, `tests/verify_warmup.py`.
-
 ### `enums.py`
 `OrderSide`, `OrderType`, `TimeInForce` — broker-agnostic order vocabulary.
-Adapters translate these into broker types; no broker SDK imports allowed here.
-The live paths use market orders only.
-- **Imported by:** `factory_orchestrator.py`.
+No broker SDK imports allowed here. Nothing imports it since the 2026-09-16
+lane deletion; kept because the vocabulary is cheap and adapter-shaped.
 
 ### `__init__.py`
-Exports only `FactoryOrchestrator` and `RiskManager`. Both `LiveOrchestrator`
-and `OandaForexOrchestrator` are **intentionally excluded** so importing this
-package doesn't pull in the heavy orchestrators; entry-point scripts import them
-by path.
+Exports only `RiskManager`. `OandaForexOrchestrator` is **intentionally
+excluded** so importing this package doesn't pull in the heavy orchestrator;
+entry-point scripts import it by path.

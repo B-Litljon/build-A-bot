@@ -3,8 +3,10 @@
 Two unrelated things share this folder, which is worth knowing before you go
 looking for something here:
 
-1. **Shared domain types and the notifier** — `signal.py` and
-   `notification_manager.py` are imported *by* the live trading paths.
+1. **Shared domain types and the notifier** — `notification_manager.py` is
+   imported *by* the live trading paths. (`signal.py`, the Alpaca-path Signal,
+   was deleted 2026-09-16 with that lane; `strategies.base.Signal` is now the
+   only Signal.)
 2. **The offline training and evaluation pipeline** — `retrainer.py`,
    `feedback_loop.py` and `resolver.py` are standalone scripts run from
    `run_pipeline.sh`. None of them run while the bot is trading.
@@ -21,7 +23,17 @@ drift).
 
 ## Files
 
-### `retrainer.py` (the big one)
+### `retrainer/` (the big one — a package since 2026-09-16)
+Formerly a 4,366-line `retrainer.py`; split into submodules by responsibility
+(`_common` imports/config, `_types` result dataclasses, `_data` fetch+holdout
+carve, `_labels` targets, `_features` engineering, `_train` fitting,
+`_thresholds` threshold search, `_gate` the walk-forward validation gate,
+`_persist` promotion and atomic artifact writes, `_pipeline` the `main()`
+wiring). `__init__.py` re-exports every historical name — importers
+(`tests/`, `scripts/`, `run_pipeline.sh`'s `python -m src.core.retrainer`) are
+unchanged. Patch discipline: tests monkeypatch at the *owning* submodule
+(`core.retrainer._common` etc.), not the facade.
+
 The training pipeline and the promotion gate. Fetches history, carves a
 chronologically last holdout slice **before** any feature engineering, engineers
 features on the remainder, purges the remainder's unresolvable tail (the last
@@ -129,30 +141,15 @@ practice the file `feedback_loop.py` consumes is written by
 ### `notification_manager.py`
 `NotificationManager` — every Discord alert the system sends. Silently no-ops
 when `DISCORD_WEBHOOK_URL` is unset, and swallows network errors, so callers
-can invoke it unconditionally without risking a trading outage. Has separate
-entry points for the Alpaca path (takes a `Signal`) and the OANDA path (takes
-primitives, because that path uses the *other* `Signal` class).
+can invoke it unconditionally without risking a trading outage. The live entry
+point is `send_oanda_trade_alert` (takes primitives). The Alpaca-path
+`send_trade_alert` was deleted 2026-09-16 with that lane.
 
-- **Imports from repo:** `core.signal` — lazily, inside the method, so the
-  offline pipeline can import this module without pulling in live-trading code.
-- **Imported by:** `src/execution/live_orchestrator.py`,
-  `src/execution/oanda_forex_orchestrator.py`,
+- **Imports from repo:** none.
+- **Imported by:** `src/execution/oanda_forex_orchestrator.py`,
   `src/strategies/concrete_strategies/ml_strategy.py`,
   `src/core/feedback_loop.py`.
 - **Data artifacts:** none (HTTP only).
-
-### `signal.py`
-`Signal` and `SignalType` for the **Alpaca** path. Bracket levels travel inside
-the `metadata` dict rather than as named fields.
-
-> ⚠️ There is a second, different `Signal` class at
-> [`src/strategies/base.py`](../strategies/) used by the OANDA/forex path,
-> which has explicit `raw_sl_distance` / `raw_tp_distance` fields. They are not
-> interchangeable. See GLOSSARY.md.
-
-- **Imports from repo:** none.
-- **Imported by:** `src/execution/live_orchestrator.py`,
-  `src/core/notification_manager.py`. **Data artifacts:** none.
 
 ### `thresholds.py`
 `ANGEL_THRESHOLD` — the fallback and fixed-mode value for the Angel proposal
@@ -167,12 +164,11 @@ time, and `MLStrategy` prefers that pinned value over this constant, so the
 env override is a train/analysis-time knob, not a live-tuning knob.
 
 - **Imports from repo:** none.
-- **Imported by:** `core/retrainer.py`, `execution/live_orchestrator.py`,
+- **Imported by:** `core/retrainer.py`,
   `strategies/concrete_strategies/ml_strategy.py`, `ml/train_model.py`,
-  `day_trading/train_model.py`, `analysis/optimize_brackets.py`,
-  `analysis/failure_modes.py`, `replay_test.py`. **Data artifacts:** none
-  directly (retrainer writes the value into `threshold.json` /
-  `metadata.json`).
+  `analysis/optimize_brackets.py`, `analysis/failure_modes.py`,
+  `replay_test.py`. **Data artifacts:** none directly (retrainer writes the
+  value into `threshold.json` / `metadata.json`).
 
 ### `events.py` — structured telemetry
 The machine-readable half of the bot's output: `emit()` appends one JSON object

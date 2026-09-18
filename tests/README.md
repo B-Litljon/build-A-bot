@@ -1,6 +1,6 @@
 # `tests/`
 
-**310 tests, all passing.** Run with:
+**538 tests + 6 subtests, all passing** (2026-09-16, after the retrainer package split). Run with:
 
 ```bash
 PYTHONPATH=src:. python -m pytest -q
@@ -11,15 +11,13 @@ from here — a deliberate guard, because root-level `test_*.py` probe scripts
 have historically had import-time side effects (one posted to the live Discord
 webhook on import).
 
-> ⚠️ **`verify_warmup.py` is never run.** It contains a real test case, but
-> collection also requires the default `test_*.py` filename pattern and this
-> file doesn't match. The suite reports 137 collected and this one isn't among
-> them. Renaming it to `test_warmup.py` would include it. Flagged, not changed.
+> `verify_warmup.py` (a filename-mismatched Alpaca-lane test, never
+> collected) and `execution/test_live_orchestrator.py` were deleted with the
+> dormant Alpaca scalper lane on 2026-09-16.
 
-**No network, no broker, no real models.** Every test stubs its dependencies —
-`SymbolContext` and `LiveOrchestrator` are even constructed via `__new__` to
-skip their heavy `__init__` chains. Running the suite against a live soak is
-harmless.
+**No network, no broker, no real models.** Every test stubs its dependencies,
+and orchestrators are even constructed via `__new__` to skip their heavy
+`__init__` chains. Running the suite against a live soak is harmless.
 
 ## What the suite is actually protecting
 
@@ -44,7 +42,6 @@ See the root [GLOSSARY.md](../GLOSSARY.md) for domain terms.
 | `test_events.py` | 11 | The telemetry sink: never raises, never blocks, never on the tick path |
 | `test_cost_feature.py` | 9 | The per-instrument cost feature and veto alphas |
 | `test_trading_mcp.py` | 9 | The MCP two-step confirm-token safety flow |
-| `execution/test_live_orchestrator.py` | 12 | State machine + **thread-ownership regression** + persistence ownership |
 | `test_oanda_entry.py` | 5 | Net-position arithmetic |
 | `test_oanda_tick_hook.py` | 5 | The raw tick callback contract |
 | `test_execution_safety.py` | 3 | Rebalance deadband, fill parsing, partial fills |
@@ -57,7 +54,6 @@ See the root [GLOSSARY.md](../GLOSSARY.md) for domain terms.
 | `test_base_rate_benchmark.py` | 6 | The gate's edge-over-random benchmark: the macro base rate is the mean on the population given, non-finite outcomes are dropped, an unlabelled frame returns nan (never 0.0), and the report carries it per fold and pooled |
 | `test_devil_label_switch.py` | 6 | `RETRAIN_DEVIL_LABEL`: default preserves the shipping label, `macro` selects the validated one, typos warn and fall back, read per call |
 | `test_barriers.py` | 39 | Excursion labels, the quantile estimator, the monotone audit, and the artifact contract (save/load, promotion verdict, stop calibration) |
-| `verify_warmup.py` | (1, **not collected**) | Warm-up injection |
 
 ### Tests worth understanding before changing anything
 
@@ -98,16 +94,6 @@ raises inside the bar callback.
 is the important one: an exception escaping the callback would kill the price
 feed, which with software stops means an unwatched position.
 
-**`execution/test_live_orchestrator.py`** — the thread-ownership suite added
-with the 2026-07-26 concurrency fix. It patches `SymbolContext.__setattr__` to
-record `(attribute, thread id)` for every write, drives a real bar→inference→
-order cycle, and asserts every write landed on the event-loop thread. That
-catches a whole *class* of bug rather than one instance. Two details worth
-copying elsewhere: a **vacuity guard** (assert all eight fields were actually
-written, so a test that exercised nothing can't pass), and the fact that the
-instrumentation was **negative-proofed** — a thread-side write was temporarily
-injected to confirm both tests fail, then removed. An assertion never observed
-failing isn't evidence.
 
 **`test_retrainer_output_dir.py`** — small but load-bearing. `RETRAIN_MODEL_DIR`
 is the isolation mechanism for experiments; if it leaked, a side experiment

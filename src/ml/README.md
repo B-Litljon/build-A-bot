@@ -44,7 +44,7 @@ one file here, read this one; its glossary defines each feature in plain terms.
   trading fail.
 
 - **Imports from repo:** `ml.core.interfaces`.
-- **Imported by:** `src/core/retrainer.py`, `src/execution/live_orchestrator.py`,
+- **Imported by:** `src/core/retrainer/`,
   `src/strategies/concrete_strategies/ml_strategy.py`, `src/ml/feature_pipeline.py`,
   `src/replay_test.py`, `src/analysis/failure_modes.py`,
   `src/analysis/optimize_brackets.py`, `scripts/probe_model.py`,
@@ -77,7 +77,7 @@ pooled and per-symbol, because instruments sit at genuinely different baseline
 levels.
 
 - **Imports from repo:** none.
-- **Imported by:** `src/core/retrainer.py` (writes the sidecar on promotion),
+- **Imported by:** `src/core/retrainer/` (writes the sidecar on promotion),
   `scripts/probe_model.py` (reads it), `scripts/generate_feature_stats.py`
   (backfills it), `tests/test_feature_stats.py`.
 - **Writes:** `feature_stats.json` inside the model directory.
@@ -94,7 +94,7 @@ factory, so it works with any configured `DATA_SOURCE`.
 
 ### `train_model.py` — ⚠️ legacy
 The original two-stage trainer: RandomForest, no validation gate, saving to
-`src/ml/models/`. Superseded by `src/core/retrainer.py` (LightGBM + promotion
+`src/ml/models/`. Superseded by `src/core/retrainer/` (LightGBM + promotion
 gate + `models/<asset_class>/`). Still the clearest plain statement of the
 Angel/Devil idea, which is why it's worth keeping — but don't use it to produce
 a model you intend to trade.
@@ -115,14 +115,14 @@ Note `predict_proba` returning probabilities (not hard labels) is what makes
 the tunable decision thresholds possible.
 - **Imported by:** `feature_pipeline.py`, `features/v3_features.py`,
   `targets/v3_targets.py`, `trainers/v3_rf_trainer.py`, `train_model.py`,
-  `src/day_trading/features.py`, `src/day_trading/targets.py`.
+  (The `src/day_trading/` consumer was deleted 2026-09-16.)
 
 ### `features/` — `v3_features.py`
 See above. (No `__init__.py`; implicit namespace package.)
 
 ### `targets/` — `v3_targets.py` ⚠️ legacy
 `V3DirectionalTarget` labels a bar 1 if price rises ≥0.3% within 15 bars. Only
-`feature_pipeline.main()` uses it. The production labels in `retrainer.py`
+`feature_pipeline.main()` uses it. The production labels in `core/retrainer/_labels.py`
 are harsher and more realistic: they replay stops and targets bar by bar, so a
 setup that would have been stopped out first counts as a loss — this one only
 asks whether price *ever* reached the level.
@@ -146,7 +146,7 @@ Enabled only with `RETRAIN_USE_HMM=1`. States are **not named or interpreted** �
 data get a uniform 1/3, a deliberately uninformative value rather than a gap.
 Leakage rule: fit on training rows only, then score both training and
 validation with that fitted model.
-- **Imported by:** `src/core/retrainer.py`,
+- **Imported by:** `src/core/retrainer/`,
   `src/strategies/concrete_strategies/ml_strategy.py`.
 - **Writes:** a joblib dict saved next to the Angel/Devil models.
 

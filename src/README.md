@@ -20,14 +20,15 @@ real, harmless, and worth knowing before you assume a module is missing.
 | [`core/`](core/) | Shared types, Discord notifier, **and the training pipeline**. | mixed |
 | [`utils/`](utils/) | Bar aggregation. | live |
 | [`analysis/`](analysis/) | Offline diagnostics, run by hand. | never live |
-| [`day_trading/`](day_trading/) | Dormant "V4.0" 5-minute experiment. | never live |
 
 The one that surprises people is `core/` — it holds both shared domain types
-*and* `retrainer.py`, the entire training and promotion pipeline. See
+*and* `retrainer/` (a package since 2026-09-16), the entire training and promotion
+pipeline. See
 [`core/README.md`](core/).
 
-`autopilot/` and `research/` appear in listings but contain **no source files**
-on this branch (only stale `__pycache__`).
+A `day_trading/` package (a dormant 5-minute experiment) lived here until
+2026-09-16; it and the whole Alpaca scalper lane were deleted in the
+downsizing pass — git history has them.
 
 ## Data flow
 

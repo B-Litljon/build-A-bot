@@ -17,10 +17,9 @@ NATR, warm-up, hot reload, threshold).
 `BaseStrategy` (the `generate_signals` contract plus a shared input check) and
 `Signal`.
 
-> ⚠️ **There are two `Signal` classes.** This one is used by the OANDA/forex
-> and Factory paths and carries explicit bracket *distances*. The other,
-> [`src/core/signal.py`](../core/), belongs to the Alpaca path and keeps
-> bracket levels inside a metadata dict.
+> This is the only `Signal` class as of 2026-09-16 — the Alpaca path's
+> `src/core/signal.py` (bracket levels in a metadata dict) was deleted with
+> that lane. This one carries explicit bracket *distances*.
 
 Two things about this `Signal` worth knowing:
 
@@ -66,7 +65,7 @@ match training exactly, or the model quietly scores garbage. So —
 
 - The feature pipeline is **imported** from `src/ml`, never reimplemented, and
   its generator order (`V3BaseFeatures → V3HTFFeatures → V3SessionFeatures →
-  V3CostFeatures`) is byte-identical to the retrainer's at `retrainer.py:878`.
+  V3CostFeatures`) is byte-identical to the retrainer's (now `core/retrainer/_features.py`; the split moved line numbers).
 - The feature list comes from the **model's own `feature_names_in_`**, not a
   hardcoded constant, so a retrain that changes the feature set propagates with
   no code edit.

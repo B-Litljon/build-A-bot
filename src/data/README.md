@@ -50,15 +50,15 @@ yields). Both are used by the **equities investor**, never by the forex bot.
 ### `enums.py`
 `AssetClass`, `AssetStatus`, `DataFeed`. Broker-agnostic by design — forex is
 notably absent, because the OANDA path bypasses these.
-- **Imported by:** `alpaca_provider.py`, `discovery.py`, `harvester.py`,
-  `src/day_trading/harvester_5m.py`, `src/execution/live_orchestrator.py`.
+- **Imported by:** `alpaca_provider.py`, `discovery.py`, `harvester.py`.
+  (The day_trading and Alpaca-orchestrator consumers were deleted 2026-09-16.)
 
 ### `timeframe.py`
 Frozen `TimeFrame(amount, unit)` plus `MIN_1` / `MIN_5` / `HOUR_1` / `DAY_1`
 constants. Replaces direct use of Alpaca's own timeframe type.
-- **Imported by:** `alpaca_provider.py`, `feed.py`, `fetch_training_data.py`,
-  `harvester.py`, `src/day_trading/harvester_5m.py`,
-  `src/execution/live_orchestrator.py`.
+- **Imported by:** `alpaca_provider.py`, `feed.py`, `harvester.py`.
+  (The `fetch_training_data.py` module and the day_trading/Alpaca consumers
+  were deleted 2026-09-16.)
 
 ## The switch
 
@@ -142,12 +142,11 @@ the provider abstraction and calls the Alpaca SDK directly.
 - **Writes:** `data/oos_bars.parquet` (overwritten each run).
 - **Imported by:** nothing — run as `python -m src.data.harvester`.
 
-### `fetch_training_data.py` — ⚠️ dead, and misleadingly named
-Nothing imports it and no script runs it. **There is also a *function* named
-`fetch_training_data` in `src/core/retrainer.py`, and that function is the one
-actually used** — `chop_ab_test.py` and `scripts/generate_feature_stats.py`
-import it from the retrainer, not from here. Different basket, different output
-layout (`data/raw/<SYMBOL>_1min.parquet`). Flagged, not removed.
+### `fetch_training_data.py` — ⚠️ DELETED 2026-09-16
+It was dead and misleadingly named: nothing imported it, while a live
+*function* of the same name in `src/core/retrainer/_data.py` is the one actually
+used (imported by `scripts/generate_feature_stats.py`, with a different basket
+and output layout). Deleted in the downsizing pass; git history has it.
 
 ### `discovery.py` — ⚠️ dormant
 `DiscoveryService.get_in_play_tickers()` scans the whole Alpaca universe for

@@ -76,9 +76,9 @@ Conventions for Layer 3:
 
 Verified during the 2026-07-27 glossary pass:
 
-- **Two different `Signal` classes.** `core.signal.Signal` (Alpaca path, brackets
-  in a metadata dict) and `strategies.base.Signal` (OANDA path, explicit
-  distance fields). Not interchangeable.
+- **One `Signal` class now.** The Alpaca path's `core.signal.Signal` was
+  deleted with that lane on 2026-09-16. `strategies.base.Signal` (explicit
+  distance fields) is the only one.
 - **`V3RandomForestTrainer` holds a LightGBM model.** `.load()` unpickles
   whatever is on disk; production models have been LightGBM since 2026-05-23.
   Candidates are not so uniform — the CatBoost A/B runs leave
@@ -98,8 +98,9 @@ Verified during the 2026-07-27 glossary pass:
   **"heartbeat"** (OANDA keepalive vs the strategy's periodic log).
 - **Don't use textbook PSI thresholds.** Market bars are autocorrelated; use the
   null calibration in `feature_stats.json`.
-- **`fetch_training_data`** is both a dead module (`src/data/`) and a live
-  function (`core/retrainer.py`). The function is the one in use.
+- **`fetch_training_data`** is a function living in `core/retrainer/_data.py`
+  (the retrainer became a package on 2026-09-16; `core/retrainer` re-exports
+  it). The same-named dead module in `src/data/` was deleted 2026-09-16.
 
 ## Testing
 

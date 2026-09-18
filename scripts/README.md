@@ -229,23 +229,11 @@ every promotion-bar metric; exit 2 = incumbent stands.
 
 ---
 
-## 3. Factory launchers
+## 3. Factory launchers — DELETED 2026-09-16
 
-### `run_paper_live.py`
-Paper-money launcher for `FactoryOrchestrator`. Near-duplicate of
-`run_factory.py` at the repo root; the paper-only guarantee is **procedural**
-(use paper keys in `.env`), not enforced in code.
-- **Imports from repo:** `execution.factory_orchestrator`,
-  `execution.risk_manager`, `data.feed`, `strategies.concrete_strategies`.
-
-### `smoke_test.py`
-Three hand-run sanity checks: construction against paper keys, the chop
-filter's refusal path, and the $50 minimum-notional floor.
-
-Its **"DO NOT COMMIT" header is stale** — the file is committed, and equivalent
-assertions now live in `tests/test_risk_manager.py`.
-- **Imports from repo:** `execution.factory_orchestrator`,
-  `execution.risk_manager`, `data.feed`.
+`run_paper_live.py` and `smoke_test.py` went away with the dormant
+Alpaca/Factory lane (`factory_orchestrator.py`, `run_factory.py`,
+`run_live.py`); git history has them.
 
 ### `diagnose_5yr_holdout.py`
 Diagnostic, not a gate: trains the would-be 5-year artifact on the
