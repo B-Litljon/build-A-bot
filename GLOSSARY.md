@@ -49,7 +49,7 @@ tests) or dormant experiments kept for reference.
 | `data/` | Bars, ledgers, and processed datasets (`raw/`, `processed/`, `cache/`). Mostly gitignored. | training + analysis |
 | `config/` | Configuration not in code — currently just a baked spread-cost table. | training + live |
 | `logs/` | Run logs, including the multi-day `soak_*.log` files that calibration is mined from. | live |
-| `docs/` | Three older design documents (architecture, day-trade model, an RSI/Bollinger strategy). | reference |
+| `docs/` | Older design documents (architecture, day-trade model, an RSI/Bollinger strategy) plus `GEMINI_NOTEBOOK_STUDY_NOTES.md`, a current sectioned architecture primer written 2026-09-18 for long-context study/notebook use. | reference |
 | [`llm_reports/`](llm_reports/README.md) | Written reports of work done, filed by category (`audits/`, `handoffs/`, `refactors/`, `recons/`, `stops/`); `m2m-prompts/` inside also holds the model-to-model briefs and live threads, including the pre-2026-09 ledger threads moved from the removed top-level `m2m_prompts/`. See its README for the convention. | reference |
 | [`dashboard/`](dashboard/README.md) | Read-only web view of the soak: Rust (axum) API + TypeScript front-end. Reads `logs/events-*.jsonl`, `logs/status.json`, and OANDA REST. Cannot affect trading. | manual |
 | `viz/` | Empty. | — |
