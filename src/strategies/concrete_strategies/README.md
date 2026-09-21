@@ -25,14 +25,57 @@ dropped the newest bar, return `None` rather than score an older bar against
 the current price), and a **heartbeat** log every 15 bars so an operator can
 see the model is alive during no-trade stretches.
 
+#### Learned barrier geometry (added 2026-09-14)
+
+An optional sidecar that replaces the profile's static `2.0×`/`4.0×` bracket
+with per-bar quantiles from [`ml.barriers`](../../ml/barriers/): the stop is
+`Q_MAE(0.95)` and the target `Q_MFE(0.50)`, both in NATR multiples. Three
+things about it matter operationally:
+
+- **OFF by default** — `BARRIER_GEOMETRY_ENABLED=1` (or
+  `use_barriers=True`). Off, this class behaves exactly as it did before the
+  sidecar existed, which is what makes it safe for a running soak to restart
+  onto a tree carrying this code.
+- **Fail-loud when enabled.** `_load_barriers()` raises at boot if the three
+  artifacts (`barriers_mae.pkl`, `barriers_mfe.pkl`, `barriers_meta.json`) are
+  absent or inconsistent, if the meta's label horizon disagrees with
+  `ml.barriers.labels.DEFAULT_HORIZON`, or if the barrier model reads a feature
+  the served schema does not produce. An operator who asked for learned stops
+  and silently got static ones has no way to tell — the same trap the
+  `cost_ratio`/HMM guards close.
+- **The reload trigger is the META's mtime alone.** `BarrierEstimator.save()`
+  writes both pickles first and the meta last, so a bar that sees a new meta
+  reads a complete matching pair; a pickle replaced on its own stays invisible.
+  A failed reload KEEPS the previously loaded geometry and alerts rather than
+  silently disabling it.
+- **A recorded FAILED promotion verdict is a refusal.** The artifact carries the
+  Phase 1 gate's result in `barriers_meta.json` (written by the retrainer from
+  `scripts/evaluate_barriers.py --verdict-out`, i.e. `BARRIER_VERDICT_OUT`), and
+  the loader raises on it — because the retrainer's barrier hook fires off the
+  **Angel/Devil** gate, not off the barrier gate, so artifacts already exist
+  whose barrier gate failed. An artifact with **no** recorded verdict is served
+  with a warning: absence is "unknown", which is the state of every artifact
+  written before the field existed.
+
+The payload travels in `Signal.metadata[BARRIER_GEOMETRY_KEY]` as NATR
+multiples, i.e. `RiskManager` multiplies them by the same raw ATR the static
+multipliers use — the learned quantiles substitute for the constants instead of
+compounding with them, so rounding, the gates and sizing stay on one path. The
+estimator's `rr`/`admissible` travel as telemetry only: its `rr_floor` compares
+`Q_MFE(0.50)` with `Q_MAE(0.95)`, a ratio structurally below 1, so enforcing it
+live would veto every bar (measured rr 0.28–0.30 across all three evaluation
+folds on 2026-09-14).
+
 - **Imports from repo:** `strategies.base`, `core.notification_manager`,
-  `ml.feature_pipeline`, `ml.features.v3_features`, `ml.regimes.hmm_regime`,
+  `ml.barriers.estimator`, `ml.barriers.labels`, `ml.feature_pipeline`,
+  `ml.features.v3_features`, `ml.regimes.hmm_regime`,
   `ml.trainers.v3_rf_trainer`.
 - **Imported by:** `__init__.py`, `ml_factory_strategy.py`,
   `src/execution/oanda_forex_orchestrator.py`, `run_oanda.py`, and tests.
 - **Reads:** `models/<asset_class>/` — `angel_latest.pkl`, `devil_latest.pkl`,
-  `threshold.json`, `metadata.json`, `spread_alphas.json`, and `hmm_latest.pkl`
-  when regime features are on. **Writes:** nothing.
+  `threshold.json`, `metadata.json`, `spread_alphas.json`, the
+  `barriers_*.{pkl,json}` set when the barrier sidecar is on, and
+  `hmm_latest.pkl` when regime features are on. **Writes:** nothing.
 
 ### `ml_factory_strategy.py`
 `MLFactoryStrategy` — a 33-line subclass of `MLStrategy` that presets

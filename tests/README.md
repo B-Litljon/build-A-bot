@@ -1,6 +1,6 @@
 # `tests/`
 
-**310 tests, all passing.** Run with:
+**538 tests + 6 subtests, all passing** (2026-09-16, after the retrainer package split). Run with:
 
 ```bash
 PYTHONPATH=src:. python -m pytest -q
@@ -11,15 +11,13 @@ from here — a deliberate guard, because root-level `test_*.py` probe scripts
 have historically had import-time side effects (one posted to the live Discord
 webhook on import).
 
-> ⚠️ **`verify_warmup.py` is never run.** It contains a real test case, but
-> collection also requires the default `test_*.py` filename pattern and this
-> file doesn't match. The suite reports 137 collected and this one isn't among
-> them. Renaming it to `test_warmup.py` would include it. Flagged, not changed.
+> `verify_warmup.py` (a filename-mismatched Alpaca-lane test, never
+> collected) and `execution/test_live_orchestrator.py` were deleted with the
+> dormant Alpaca scalper lane on 2026-09-16.
 
-**No network, no broker, no real models.** Every test stubs its dependencies —
-`SymbolContext` and `LiveOrchestrator` are even constructed via `__new__` to
-skip their heavy `__init__` chains. Running the suite against a live soak is
-harmless.
+**No network, no broker, no real models.** Every test stubs its dependencies,
+and orchestrators are even constructed via `__new__` to skip their heavy
+`__init__` chains. Running the suite against a live soak is harmless.
 
 ## What the suite is actually protecting
 
@@ -36,7 +34,7 @@ See the root [GLOSSARY.md](../GLOSSARY.md) for domain terms.
 | File | Tests | Covers |
 |---|---:|---|
 | `test_composite_fundamentals.py` | 18 | Provider chaining: first non-empty wins; a raising source is a miss, not an error |
-| `test_risk_manager.py` | 16 | The bracket floors and all three chop gates |
+| `test_risk_manager.py` | 35 | The bracket floors, all three chop gates, and the learned-barrier geometry substitution |
 | `test_oanda_forex.py` | 31 | The live bot's control flow — mostly failure paths |
 | `test_feature_stats.py` | 12 | The stats artifact and the PSI maths |
 | `test_stream_liveness.py` | 9 | What happens when the price feed goes silent |
@@ -44,7 +42,6 @@ See the root [GLOSSARY.md](../GLOSSARY.md) for domain terms.
 | `test_events.py` | 11 | The telemetry sink: never raises, never blocks, never on the tick path |
 | `test_cost_feature.py` | 9 | The per-instrument cost feature and veto alphas |
 | `test_trading_mcp.py` | 9 | The MCP two-step confirm-token safety flow |
-| `execution/test_live_orchestrator.py` | 12 | State machine + **thread-ownership regression** + persistence ownership |
 | `test_oanda_entry.py` | 5 | Net-position arithmetic |
 | `test_oanda_tick_hook.py` | 5 | The raw tick callback contract |
 | `test_execution_safety.py` | 3 | Rebalance deadband, fill parsing, partial fills |
@@ -52,8 +49,11 @@ See the root [GLOSSARY.md](../GLOSSARY.md) for domain terms.
 | `test_holdout_gate.py` | 26 | Holdout split, artifact scoring, metadata recording, the confidence-bound verdict, the boundary-tail purge, and the permanent leak guards |
 | `test_dynamic_thresholds.py` | 14 | The 2026-08-29 gate rebuild: OOF Angel-bar calibration, Devil min_child auto-scaling, CP fold-evidence bounds |
 | `test_retraining_notification.py` | 9 | The retrain Discord embed: a gate pass is not a deployment |
-| `test_ml_strategy_guards.py` | 5 | The stale-bar guard + threshold.json pinning |
-| `verify_warmup.py` | (1, **not collected**) | Warm-up injection |
+| `test_ml_strategy_guards.py` | 27 | The stale-bar guard, threshold.json pinning, sidecar reload seams, and the learned-barrier sidecar (boot refusal, units contract, promotion swap, promotion-verdict refusal) |
+| `test_alpaca_timeframe.py` | 7 | Bar-size → Alpaca timeframe mapping; regression test for the defect that made H4/D1 requests impossible (minute amounts cap at 59, Day/Week take amount 1 only) |
+| `test_base_rate_benchmark.py` | 6 | The gate's edge-over-random benchmark: the macro base rate is the mean on the population given, non-finite outcomes are dropped, an unlabelled frame returns nan (never 0.0), and the report carries it per fold and pooled |
+| `test_devil_label_switch.py` | 6 | `RETRAIN_DEVIL_LABEL`: default preserves the shipping label, `macro` selects the validated one, typos warn and fall back, read per call |
+| `test_barriers.py` | 39 | Excursion labels, the quantile estimator, the monotone audit, and the artifact contract (save/load, promotion verdict, stop calibration) |
 
 ### Tests worth understanding before changing anything
 
@@ -62,6 +62,15 @@ allowed *at all*. A regression here doesn't raise; it silently starts taking
 trades the system was built to refuse. Note `test_cold_start_bypasses_regime_gate`:
 with too little history the regime gate must stand down rather than veto
 everything, or a just-restarted bot freezes.
+
+`TestBarrierGeometry` in the same file (added 2026-09-14) covers the learned
+bracket substitution, and one property there is the one to keep: a payload
+**replaces** the profile multipliers, it does not compound with them
+(`test_payload_does_not_compound_with_the_profile`), and the gates must be asked
+about the substituted distance
+(`test_gate_a_asks_about_the_substituted_stop`). Both failure modes are silent —
+a doubled bracket is just "a wider stop", and a gate reading the static distance
+admits trades whose real stop is eaten by the spread.
 
 **`test_oanda_forex.py`** — the failure-path collection.
 `test_rapid_breach_ticks_close_once` (quotes arrive far faster than a close
@@ -85,16 +94,6 @@ raises inside the bar callback.
 is the important one: an exception escaping the callback would kill the price
 feed, which with software stops means an unwatched position.
 
-**`execution/test_live_orchestrator.py`** — the thread-ownership suite added
-with the 2026-07-26 concurrency fix. It patches `SymbolContext.__setattr__` to
-record `(attribute, thread id)` for every write, drives a real bar→inference→
-order cycle, and asserts every write landed on the event-loop thread. That
-catches a whole *class* of bug rather than one instance. Two details worth
-copying elsewhere: a **vacuity guard** (assert all eight fields were actually
-written, so a test that exercised nothing can't pass), and the fact that the
-instrumentation was **negative-proofed** — a thread-side write was temporarily
-injected to confirm both tests fail, then removed. An assertion never observed
-failing isn't evidence.
 
 **`test_retrainer_output_dir.py`** — small but load-bearing. `RETRAIN_MODEL_DIR`
 is the isolation mechanism for experiments; if it leaked, a side experiment

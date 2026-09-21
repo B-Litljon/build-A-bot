@@ -19,7 +19,11 @@ Glossary:
         for random forests.
     feature_names_in_ -- the column names the fitted model expects, or None.
         Used to check that live features line up with training features; a
-        mismatch here is a silent-wrong-answer bug, not a crash.
+        mismatch here is a silent-wrong-answer bug, not a crash. Reads BOTH
+        spellings: sklearn says ``feature_names_in_``, CatBoost says
+        ``feature_names_``, and without the fallback a CatBoost classifier
+        reports no schema at all — which is what refused to serve the H4
+        CatBoost candidate (2026-09-14).
 """
 
 from sklearn.ensemble import RandomForestClassifier
@@ -49,4 +53,24 @@ class V3RandomForestTrainer(BaseTrainer):
 
     @property
     def feature_names_in_(self):
-        return getattr(self.model, "feature_names_in_", None)
+        """
+        The column names the loaded estimator was fitted on, or None.
+
+        Both spellings are read because the library changed under this class:
+        sklearn and LightGBM expose ``feature_names_in_``, CatBoost exposes
+        ``feature_names_`` (no "in"). They mean the same thing — the training
+        column ORDER — so the fallback is exact rather than approximate, and
+        both are normalised to a list because sklearn returns an ndarray while
+        CatBoost returns a list.
+
+        Load-bearing, not cosmetic: MLStrategy sources its whole inference
+        schema from this property and REFUSES to boot when it is None, so a
+        CatBoost artifact used to be unserveable no matter how good it was
+        (verified 2026-09-14: models/forex_h4_catboost raised at boot). A model
+        fitted on a bare numpy array carries neither spelling and still returns
+        None — that case remains a genuine "no declared schema".
+        """
+        names = getattr(self.model, "feature_names_in_", None)
+        if names is None:
+            names = getattr(self.model, "feature_names_", None)
+        return list(names) if names is not None else None

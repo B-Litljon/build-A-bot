@@ -23,7 +23,16 @@ use ``monotone_constraints`` in quantile objective"), so the fitted model is
 checked on the natr_14/vol_rel decile ladder at fit time and the estimator
 raises rather than return a geometry where higher volatility yields a tighter
 excursion quantile. The no-lightgbm binned fallback is monotone by
-construction instead (bin ladder is isotonised at fit).
+construction instead (bin ladder is isotonised at fit). CatBoost DOES accept
+monotone_constraints under its quantile loss, so on that backend (the default)
+the constraint holds by construction too and the audit is a redundant check
+rather than the only guard.
+
+``save``/``load`` are the live sidecar contract: the artifact set is two
+pickles (one per quantile) plus a JSON meta, written pickles-first and
+os.replace'd into place, because the live strategy hot-reloads the model
+directory and triggers on the META's mtime — so a half-promoted pair is
+invisible rather than silently mixed.
 
 Glossary:
     DEFAULT_TAU_MAE / DEFAULT_TAU_MFE -- the stop-side and target-side
@@ -33,36 +42,78 @@ Glossary:
         Signal contract carries distances, not levels) plus the raw NATR-
         space quantiles and the implied reward:risk, for telemetry and the
         pre-trade veto.
-    BarrierEstimator -- the fit/predict contract; two LightGBM quantile
-        regressions under the hood, kept behind the interface so the family
-        is swappable.
+    BarrierEstimator -- the fit/predict contract; two quantile regressions
+        under the hood, kept behind the interface so the family is swappable
+        (CatBoost by default via BARRIER_FAMILY, LightGBM and a binned
+        fallback behind it).
     feature_names_in_ -- the fitted feature list; parity with the served
         feature frame is checked at fit time so a silent schema drift cannot
-        produce garbage barriers.
+        produce garbage barriers. Also the contract the live sidecar checks
+        against the strategy's own feature schema before it will predict.
+    horizon_ -- the forward-window length (BARS) the served weights were
+        LABELLED at, restored by load() from the meta. It must equal the
+        execution lifetime the geometry is served into; the live side
+        refuses an artifact that disagrees rather than sizing a bracket off a
+        horizon the trade never experiences. None until load() — fit() cannot
+        know it, because the labels frame does not carry it.
+    verdict / verdict_ -- the PROMOTION EVIDENCE recorded beside the weights
+        (per-fold pinball vs the static constant, MAE coverage, pass/fail, eval
+        date) and its restored form. Optional, because artifacts predate it;
+        the consumer decides what absence means (currently: serve with a
+        warning), while a recorded FAIL is a refusal. ``_validate_verdict``
+        refuses to WRITE a verdict without a boolean ``passed`` — an artifact
+        carrying an unreadable verdict-shaped blob looks evidenced, which is
+        worse than carrying none.
+    q_mae_scale -- conformal-style inflation of the STOP side only, recorded
+        in the meta and applied in predict() before rr/admissible are computed.
+        1.0 = the raw fitted quantile. It exists because the raw Q_MAE(0.95)
+        under-covers the most recent regime (measured coverage 0.951/0.937/0.912
+        across expanding folds, floor 0.93), with the shortfall concentrated in
+        the QUIET volatility deciles; a per-decile calibration cumulative-maxed
+        to stay non-decreasing reached 0.954/0.974/0.942. A positive scalar
+        preserves the monotone response, so the fit-time audit stays valid.
     rr_floor -- minimum implied reward:risk for a BarrierOutput to be
-        tradeable. Enforced at predict time (outputs below it are flagged,
-        not hidden) so the pre-trade veto in RiskManager sees honest numbers.
+        tradeable. Reported at predict time (outputs below it are flagged,
+        not hidden) so a pre-trade veto can see honest numbers.
     _AUDIT_TOL_ATR -- materiality floor of the fit-time monotonicity audit,
         in ATR units. A response curve may wiggle below its running peak by
         up to this much before the fit is refused; brackets quantize far
         coarser, so smaller dips are untradeable noise.
-    used_lightgbm_ -- set by fit(): True when the LightGBM path was fitted
-        and audited, False when the estimator degraded to the binned
-        fallback. Telemetry for which backend produced the served geometry.
+    used_lightgbm_ / used_catboost_ / backend_ -- set by fit() (and restored
+        by load()): which backend produced the served geometry. Telemetry,
+        and the thing that tells an operator whether a fitted model was
+        constrained by construction (catboost) or merely audited (lightgbm).
+    BARRIER_MAE_FILENAME / BARRIER_MFE_FILENAME / BARRIER_META_FILENAME --
+        the three files in a persisted artifact set, laid out beside
+        angel_latest.pkl so a model dir stays one self-describing directory.
 """
 
 from dataclasses import dataclass
+import json
+import logging
 import os
-from typing import List, Optional
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import List, Mapping, Optional
 
+import joblib
 import numpy as np
 import polars as pl
 
 from ml.barriers.labels import DEFAULT_HORIZON
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_TAU_MAE = 0.95
 DEFAULT_TAU_MFE = 0.50
 DEFAULT_RR_FLOOR = 2.0
+
+# The persisted artifact set, written beside the Angel/Devil pickles so a model
+# directory stays self-describing. Fixed names (not configurable) because the
+# live sidecar looks for exactly these.
+BARRIER_MAE_FILENAME = "barriers_mae.pkl"
+BARRIER_MFE_FILENAME = "barriers_mfe.pkl"
+BARRIER_META_FILENAME = "barriers_meta.json"
 
 # Materiality floor for the monotonicity audit: a fitted model is refused only
 # if its stop/target response to rising volatility dips by more than this many
@@ -87,6 +138,58 @@ class BarrierOutput:
     q_mfe: float
     rr: float
     admissible: bool
+
+
+def _validate_verdict(verdict: Mapping) -> dict:
+    """
+    Check a promotion verdict before it is written into the meta.
+
+    Fail-loud at WRITE time, because a malformed verdict is worse than none: an
+    artifact carrying a verdict-shaped blob that nothing can read looks
+    evidenced. Only ``passed`` is required (a bool, the yes/no the promotion
+    gate turns on); everything else — per-fold numbers, the eval date, the
+    feature vocabulary, the evaluation row count — passes through untouched so
+    the evidence a future agent needs is recorded even though its schema is not
+    this module's to fix.
+    """
+    if not isinstance(verdict, Mapping):
+        raise ValueError(
+            f"barrier verdict must be a mapping, got {type(verdict).__name__}"
+        )
+    if "passed" not in verdict or not isinstance(verdict["passed"], bool):
+        raise ValueError(
+            "barrier verdict must carry a boolean 'passed' — it is the one "
+            "field the promotion gate is read from, and a verdict without it "
+            "records evidence nobody can act on"
+        )
+    return {str(k): v for k, v in dict(verdict).items()}
+
+
+class _BinnedLadder:
+    """
+    The no-lightgbm backend: an isotonised empirical tau-quantile per natr_14
+    quartile bin (edges from the training frame only, so it stays causal).
+
+    A module-level class rather than the closure the first version used,
+    because a locally-defined function cannot be pickled — the fallback was
+    therefore unpersistable, which would have made the degraded backend
+    unusable by the live sidecar exactly when the libraries were missing.
+    """
+
+    def __init__(self, edges, ladder, natr_idx: int):
+        self.edges = np.asarray(edges, dtype=float)
+        self.ladder = np.asarray(ladder, dtype=float)
+        self.natr_idx = int(natr_idx)
+
+    def predict(self, X) -> np.ndarray:
+        b = np.digitize(np.asarray(X, dtype=float)[:, self.natr_idx], self.edges)
+        return self.ladder[b]
+
+    # The dict this is wrapped in has always held a plain CALLABLE under
+    # "predict" (the closure it replaced), and both _predict_quantile and the
+    # fallback tests address it that way. Keeping the handle callable means the
+    # backend swap is invisible to every caller.
+    __call__ = predict
 
 
 class BarrierEstimator:
@@ -121,6 +224,27 @@ class BarrierEstimator:
         self.used_lightgbm_: Optional[bool] = None
         self.used_catboost_: Optional[bool] = None
         self.backend_: Optional[str] = None
+        # The forward-window length (BARS) these weights were labelled at.
+        # fit() cannot know it — the labels frame does not carry it — so it is
+        # restored by load() from the artifact meta and checked against the
+        # execution lifetime by whoever serves the geometry.
+        self.horizon_: Optional[int] = None
+        # Conformal-style inflation applied to the STOP side only (never the
+        # target). 1.0 = the raw fitted quantile. It exists because the raw
+        # Q_MAE(0.95) under-covers the most recent regime: measured coverage
+        # 0.951/0.937/0.912 across expanding folds against a nominal 0.95 and a
+        # 0.93 floor (2026-09-14), with the shortfall concentrated in the QUIET
+        # volatility deciles. A per-decile calibration cumulative-maxed to stay
+        # non-decreasing reached 0.954/0.974/0.942 — i.e. it passes a gate the
+        # raw fit fails — and a positive scalar cannot break the
+        # monotonicity-by-construction guarantee. Recorded in the meta by
+        # save(), restored by load(); validated positive.
+        self.q_mae_scale: float = 1.0
+        # The promotion evidence recorded beside the weights, or None when the
+        # artifact carries none. Restored by load(); the SERVING POLICY (refuse
+        # a recorded FAIL, warn on unknown) belongs to the caller, not here —
+        # this module's job is to hand back what the artifact actually says.
+        self.verdict_: Optional[dict] = None
 
     def fit(
         self,
@@ -152,9 +276,18 @@ class BarrierEstimator:
         return self
 
     def predict(self, df: pl.DataFrame) -> List[BarrierOutput]:
-        """Barrier geometry for each row of df, in the same order."""
+        """
+        Barrier geometry for each row of df, in the same order.
+
+        The stop side is multiplied by ``q_mae_scale`` (1.0 unless the artifact
+        recorded a calibration) BEFORE ``rr`` and ``admissible`` are computed,
+        so the payload reports the ratio of the geometry actually served rather
+        than of the raw fit. A positive scalar preserves the monotone response,
+        which is why the fit-time audit stays valid under it.
+        """
         X = self._X(df)
-        q_mae = np.maximum(self._predict_quantile(self._model_mae, X, self.tau_mae), 1e-6)
+        raw_q_mae = np.maximum(self._predict_quantile(self._model_mae, X, self.tau_mae), 1e-6)
+        q_mae = raw_q_mae * self.q_mae_scale
         q_mfe = np.maximum(self._predict_quantile(self._model_mfe, X, self.tau_mfe), 0.0)
         natr = df["natr_14"].to_numpy().astype(float)
         close = df["close"].to_numpy().astype(float)
@@ -182,6 +315,186 @@ class BarrierEstimator:
                 )
             )
         return out
+
+    # ── persistence (the live sidecar contract) ────────────────────────────
+
+    def save(
+        self,
+        model_dir,
+        horizon: int = DEFAULT_HORIZON,
+        verdict: Optional[Mapping] = None,
+        q_mae_scale: Optional[float] = None,
+    ) -> dict:
+        """
+        Persist both quantile models + the meta contract into ``model_dir``.
+
+        Three files, mirroring Angel/Devil + their metadata sidecar: the two
+        pickles are opaque to the loader, the JSON is what a human (and
+        ``load``) reads to know what geometry these weights encode. Every file
+        is written under a temp name and replaced, because the live strategy
+        watches this directory.
+
+        Write ORDER is load-bearing: both pickles land BEFORE the meta, and
+        the live reload triggers on the meta's mtime alone. A bar that sees a
+        new meta therefore reads a complete matching pair, and a half-promoted
+        set (one pickle replaced, meta unchanged) is invisible rather than
+        silently mixed.
+
+        ``horizon`` is recorded, never inferred: it is the forward-window
+        length the labels were built at, and it must match the execution
+        lifetime the geometry is served into.
+
+        ``verdict`` is the PROMOTION EVIDENCE for this artifact — the output of
+        ``scripts/evaluate_barriers.py`` (per-fold pinball vs static, MAE
+        coverage, pass/fail) — recorded so the artifact carries its own reason
+        to be served. Without it an artifact says what it contains and nothing
+        about whether it earned promotion, and a retrain can stamp
+        "learned_barriers: true" on weights whose gate never ran. Optional for
+        backward compatibility; the consumer treats an absent verdict as
+        "unknown" and a recorded FAIL as a refusal. Returns the meta it wrote.
+        """
+        if self._model_mae is None or self._model_mfe is None:
+            raise RuntimeError(
+                "BarrierEstimator.save() called before fit() — refusing to "
+                "persist an unfitted estimator"
+            )
+        model_dir = Path(model_dir)
+        model_dir.mkdir(parents=True, exist_ok=True)
+
+        for name, model in (
+            (BARRIER_MAE_FILENAME, self._model_mae),
+            (BARRIER_MFE_FILENAME, self._model_mfe),
+        ):
+            target_path = model_dir / name
+            temp_path = target_path.with_suffix(target_path.suffix + ".tmp")
+            joblib.dump(model, temp_path)
+            temp_path.replace(target_path)
+
+        meta = {
+            "artifact": "barriers",
+            "backend": self.backend_,
+            "family": self.family,
+            "feature_cols": list(self.feature_cols),
+            "tau_mae": float(self.tau_mae),
+            "tau_mfe": float(self.tau_mfe),
+            "rr_floor": float(self.rr_floor),
+            "horizon": int(horizon),
+            "monotone_increasing": [
+                c for c in MONOTONE_INCREASING if c in self.feature_cols
+            ],
+            "trained_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if verdict is not None:
+            meta["verdict"] = _validate_verdict(verdict)
+        if q_mae_scale is not None:
+            scale = float(q_mae_scale)
+            if not np.isfinite(scale) or scale <= 0.0:
+                raise ValueError(
+                    f"q_mae_scale must be a positive finite number, got "
+                    f"{q_mae_scale!r} — a zero or negative scale would flatten "
+                    "or invert every stop this artifact produces"
+                )
+            self.q_mae_scale = scale
+        meta["q_mae_scale"] = float(self.q_mae_scale)
+        meta_path = model_dir / BARRIER_META_FILENAME
+        temp_meta = meta_path.with_suffix(meta_path.suffix + ".tmp")
+        temp_meta.write_text(json.dumps(meta, indent=2, sort_keys=True))
+        temp_meta.replace(meta_path)
+        logger.info(
+            "[ATOMIC] barrier artifact set saved: %s (%s, %d features, "
+            "tau_mae=%.2f tau_mfe=%.2f, horizon=%d bars)",
+            model_dir,
+            self.backend_,
+            len(self.feature_cols),
+            self.tau_mae,
+            self.tau_mfe,
+            meta["horizon"],
+        )
+        return meta
+
+    @classmethod
+    def load(cls, model_dir) -> "BarrierEstimator":
+        """
+        Restore an artifact set written by :meth:`save`.
+
+        Raises rather than returning a half-loaded estimator: a missing file,
+        an unparsable meta, or a meta without a horizon or a feature list is a
+        broken promotion, and predicting through it would size brackets off
+        weights nobody can identify. The live strategy decides what a failure
+        means (it keeps the previously loaded pair and alerts); the estimator's
+        job is to refuse. Feature parity against the served frame is still
+        enforced at predict time by ``_X``, the same check the fit path uses.
+        """
+        model_dir = Path(model_dir)
+        meta_path = model_dir / BARRIER_META_FILENAME
+        mae_path = model_dir / BARRIER_MAE_FILENAME
+        mfe_path = model_dir / BARRIER_MFE_FILENAME
+        missing = [p.name for p in (meta_path, mae_path, mfe_path) if not p.exists()]
+        if missing:
+            raise FileNotFoundError(
+                f"barrier artifact set incomplete in {model_dir}: missing "
+                f"{missing} — expected {BARRIER_MAE_FILENAME}, "
+                f"{BARRIER_MFE_FILENAME} and {BARRIER_META_FILENAME} together"
+            )
+
+        meta = json.loads(meta_path.read_text())
+        feature_cols = meta.get("feature_cols")
+        if not feature_cols or not all(isinstance(c, str) for c in feature_cols):
+            raise ValueError(
+                f"{meta_path} carries no usable 'feature_cols' — cannot "
+                "establish the inference schema, so the weights are "
+                "unidentifiable"
+            )
+        if "horizon" not in meta:
+            raise ValueError(
+                f"{meta_path} carries no 'horizon' — the label window the "
+                "geometry was fitted at is unknown, and serving it would size "
+                "brackets off a trade lifetime nobody declared"
+            )
+
+        est = cls(
+            feature_cols=feature_cols,
+            tau_mae=float(meta.get("tau_mae", DEFAULT_TAU_MAE)),
+            tau_mfe=float(meta.get("tau_mfe", DEFAULT_TAU_MFE)),
+            rr_floor=float(meta.get("rr_floor", DEFAULT_RR_FLOOR)),
+            family=str(meta.get("family") or "catboost"),
+        )
+        est._model_mae = joblib.load(mae_path)
+        est._model_mfe = joblib.load(mfe_path)
+        est.backend_ = meta.get("backend")
+        est.used_catboost_ = est.backend_ == "catboost"
+        est.used_lightgbm_ = est.backend_ == "lightgbm"
+        est.horizon_ = int(meta["horizon"])
+        stored_scale = meta.get("q_mae_scale", 1.0)
+        try:
+            stored_scale = float(stored_scale)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"{meta_path} carries an unreadable 'q_mae_scale' "
+                f"({stored_scale!r}) — refusing rather than silently serving "
+                "an unscaled stop"
+            )
+        if not np.isfinite(stored_scale) or stored_scale <= 0.0:
+            raise ValueError(
+                f"{meta_path} records q_mae_scale={stored_scale!r}; a "
+                "non-positive scale would flatten or invert every stop"
+            )
+        est.q_mae_scale = stored_scale
+        est.verdict_ = meta.get("verdict") if isinstance(meta.get("verdict"), dict) else None
+        logger.info(
+            "BarrierEstimator restored from %s: backend=%s tau_mae=%.2f "
+            "tau_mfe=%.2f horizon=%d features=%d q_mae_scale=%.4f verdict=%s",
+            model_dir,
+            est.backend_,
+            est.tau_mae,
+            est.tau_mfe,
+            est.horizon_,
+            len(est.feature_cols),
+            est.q_mae_scale,
+            "none recorded" if est.verdict_ is None
+            else ("PASS" if est.verdict_.get("passed") else "FAIL"),
+        )
+        return est
 
     # ── internals ──────────────────────────────────────────────────────────
 
@@ -213,6 +526,12 @@ class BarrierEstimator:
             "depth": 5,
             "random_seed": 42,
             "verbose": 0,
+            # CatBoost otherwise writes a catboost_info/ training-log directory
+            # into the CURRENT WORKING DIRECTORY, so simply running the Phase 1
+            # evaluation from the repo root dirties a tracked tree (it was
+            # committed once already, 2026-09-14). The estimator's fits are
+            # research/eval runs that must leave no trace on disk.
+            "allow_writing_files": False,
         }
         if any(mc):
             params["monotone_constraints"] = mc
@@ -349,11 +668,10 @@ class BarrierEstimator:
             ladder.append(rung)
         ladder = np.maximum.accumulate(np.asarray(ladder, dtype=float))
 
-        def predict(Xnew):
-            b = np.digitize(Xnew[:, natr_idx], edges)
-            return ladder[b]
-
-        return {"predict": predict}
+        # Wrapped in a callable handle (not a closure) so it pickles — see
+        # _BinnedLadder. The dict shape is kept: _predict_quantile and the
+        # tests address the model as model["predict"].
+        return {"predict": _BinnedLadder(edges, ladder, natr_idx)}
 
 
 def static_baseline_loss(

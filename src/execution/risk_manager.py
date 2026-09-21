@@ -59,6 +59,14 @@ Glossary:
     Gate B (regime, GATE_REGIME) -- rejects when current volatility sits in the
         bottom regime_pctile (20%) of its own recent window. A market too quiet
         to move cannot reach the target before the hold limit expires.
+    scheduled_market_pause -- names the SCHEDULED market pause in effect right
+        now (PAUSE_WEEKEND, PAUSE_DAILY_ROLLOVER, or None), anchored to
+        America/New_York so it tracks DST. Exists because silence during a pause
+        is not a fault: the liveness watchdog consumed it as one for a whole
+        weekend (12,674 CRITICALs, 14 alerts) and would have flattened live
+        positions held across the daily rollover.
+    WEEKLY_CLOSE_ET / WEEKLY_OPEN_ET -- Friday 17:00 / Sunday 17:00 New York:
+        the forex weekly close and reopen. Pause windows, not trading hours.
     Gate C (time, GATE_TIME) -- rejects everything inside a daily blackout
         window, default 16:55-17:30 New York (_DEFAULT_BLACKOUT_ET). This is
         the daily rollover, when spreads briefly blow out roughly tenfold.
@@ -113,13 +121,40 @@ Glossary:
         because Alpaca reports crypto funds in the cash field.
     $50 minimum notional -- anything smaller returns 0.0 and the trade is
         skipped, to avoid pointless dust positions.
+
+    ── Learned barrier geometry (optional) ──
+    barrier -- the LEARNED geometry payload passed to calculate_bracket (read
+        from Signal.metadata["barrier_geometry"]): per-bar NATR multiples from
+        ml.barriers.BarrierEstimator that REPLACE sl_atr_multiplier /
+        tp_atr_multiplier for that bar. Substituting at the multiplier step is
+        what keeps one code path — the gates, the rounding and the sizing all
+        still see a distance and cannot tell where it came from. An unusable
+        payload is IGNORED with a critical log rather than vetoing the trade:
+        the static bracket is a validated fallback, so a broken sidecar should
+        degrade, not block every entry.
+    last_geometry_source -- "static" or "barrier": which one produced the most
+        recent bracket. Telemetry for the orchestrator's entry log.
+    _barrier_multipliers -- payload validation; returns (sl_mult, tp_mult) or
+        None to mean "use the static profile".
+    BARRIER_WIDTH_WARN -- |log2(learned / static)| above which a substitution
+        logs at WARNING. A conditional quantile may legitimately differ
+        several-fold from the constant, but the OANDA path trades a FIXED 1000
+        units — it does not size by risk (see GLOSSARY) — so a wider learned
+        stop is a proportionally larger loss per stop-out, and that should be
+        visible in the log rather than reconstructed later.
+    rr_floor / admissible -- carried in the payload as telemetry only, NOT
+        enforced here. The estimator's floor compares Q_MFE(0.50) with
+        Q_MAE(0.95), which is structurally below 1, so enforcing a 2.0 floor
+        live would veto every bar (measured 2026-09-14: rr 0.28-0.30 on all
+        three evaluation folds). Making it a gate belongs behind a floor
+        recalibrated for that tau pair.
 """
 
 import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, time as dtime, timezone
-from typing import Optional, Sequence, Tuple
+from typing import Mapping, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -164,6 +199,19 @@ GATE_REGIME = "regime"  # Gate B — low-volatility regime floor
 GATE_STATIC = "static"  # legacy static floor (equities / no regime context)
 GATE_TIME = "time"      # Gate C — time-of-day blackout (e.g. NY 5pm rollover)
 
+# Geometry provenance: which multipliers produced a bracket. "static" is the
+# RiskProfile constants; "barrier" is the learned per-bar quantile pair from the
+# ml.barriers sidecar (see the module glossary). The payload arrives as an
+# argument — keyed by strategies.base.BARRIER_GEOMETRY_KEY in Signal.metadata —
+# so this module needs no import to find it and stays numpy-only.
+GEOMETRY_STATIC = "static"
+GEOMETRY_BARRIER = "barrier"
+
+# |log2(learned stop / static stop)| above which a substitution is logged at
+# WARNING instead of INFO: a 2x-or-wider change in stop distance is a 2x-or-
+# wider change in loss per stop-out on a path that does not size by risk.
+BARRIER_WIDTH_WARN = 1.0
+
 # Gate C blackout is anchored to America/New_York so it tracks the 5pm rollover
 # across DST (≈21:00 UTC in summer, ≈22:00 UTC in winter). A fixed UTC hour
 # would silently drift an hour every DST change.
@@ -172,6 +220,77 @@ try:
     _NY_TZ: "Optional[ZoneInfo]" = ZoneInfo("America/New_York")
 except Exception:  # pragma: no cover — tzdata missing
     _NY_TZ = None
+
+
+# ── Scheduled market pauses ────────────────────────────────────────────────
+# Forex does not tick every minute of every day: it pauses for ~35 minutes at
+# the daily 5pm-ET rollover and for the whole weekend, from Friday 17:00 ET to
+# Sunday 17:00 ET. Both are SCHEDULED, and both look exactly like a dead feed to
+# anything that measures price silence.
+#
+# This matters beyond log noise. On 2026-09-11..13 the soak's liveness watchdog
+# treated the weekend closure as an outage: 12,674 CRITICAL lines, 14 alert
+# incidents, 12 futile reconnect attempts, and a price clock that reached 51,072s
+# (14.2 hours) of "silence" — while the market was shut and every line correctly
+# reported "no positions held". The same rule flattens open positions, and
+# positions ARE legitimately held across the rollover (Gate C blocks only new
+# ENTRIES in that window), so the watchdog would have closed live trades during
+# the daily rollover at the moment spreads blow out tenfold.
+WEEKLY_CLOSE_ET = dtime(17, 0)   # Friday — forex weekly close
+WEEKLY_OPEN_ET = dtime(17, 0)    # Sunday — weekly reopen
+PAUSE_DAILY_ROLLOVER = "daily rollover"
+PAUSE_WEEKEND = "weekend closure"
+
+
+def scheduled_market_pause(
+    when: "Optional[datetime]" = None, spec: "Optional[str]" = None
+) -> "Optional[str]":
+    """
+    Name the SCHEDULED market pause in effect at ``when``, or None if prices are
+    expected.
+
+    Returns ``PAUSE_WEEKEND`` (Friday 17:00 ET → Sunday 17:00 ET) or
+    ``PAUSE_DAILY_ROLLOVER`` (inside the Gate C blackout window, default
+    16:55-17:30 ET), else None. ``when`` defaults to now; naive is assumed UTC.
+    The window is anchored to America/New_York so it tracks the 5pm rollover and
+    the Friday close across DST — a fixed UTC hour drifts by one hour twice a
+    year. ``spec`` overrides the rollover window (defaults to
+    ``RISK_BLACKOUT_ET``, then ``_DEFAULT_BLACKOUT_ET``), so an operator who
+    retunes the toxic-spread window retunes this with it.
+
+    Fail-safe direction: if the zoneinfo database is unavailable we cannot know
+    the local time, so this returns None — "prices expected" — which keeps the
+    liveness watchdog fully armed. Suppressing it by mistake costs an unwatched
+    position; not suppressing it costs spurious alerts and flattening, both of
+    which are visible and recoverable.
+
+    NOT covered: exchange holidays. Those are irregular per-year dates, and a
+    wrong calendar is worse than none — a holiday pause still alerts.
+    """
+    if _NY_TZ is None:
+        return None
+    ts = when if when is not None else datetime.now(timezone.utc)
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    ny = ts.astimezone(_NY_TZ)
+
+    weekday = ny.weekday()          # Mon=0 .. Sun=6
+    hm = ny.time()
+    if (
+        (weekday == 4 and hm >= WEEKLY_CLOSE_ET)   # Friday after the close
+        or weekday == 5                            # all Saturday
+        or (weekday == 6 and hm < WEEKLY_OPEN_ET)  # Sunday before the reopen
+    ):
+        return PAUSE_WEEKEND
+
+    window = _parse_blackout_et(
+        spec if spec is not None else os.getenv(ENV_BLACKOUT_ET, _DEFAULT_BLACKOUT_ET)
+    )
+    if window is None:
+        return None
+    start, end = window
+    inside = (start <= hm < end) if start <= end else (hm >= start or hm < end)
+    return PAUSE_DAILY_ROLLOVER if inside else None
 
 
 def _parse_blackout_et(spec: str) -> "Optional[Tuple[dtime, dtime]]":
@@ -310,6 +429,13 @@ class RiskManager:
         # Which gate vetoed the most recent calculate_bracket() call (read by
         # the orchestrator for split telemetry). GATE_NONE when it passed.
         self.last_veto_gate: str = GATE_NONE
+        # Which multipliers produced the most recent bracket: GEOMETRY_STATIC
+        # or GEOMETRY_BARRIER. Read by the orchestrator's entry log.
+        self.last_geometry_source: str = GEOMETRY_STATIC
+        # Distances from the most recent calculate_bracket() call:
+        # static (profile-based) and actual (substituted if learned geometry was applied).
+        self.last_static_sl_dist: Optional[float] = None
+        self.last_actual_sl_dist: Optional[float] = None
 
     def calculate_bracket(
         self,
@@ -320,6 +446,7 @@ class RiskManager:
         spread_fresh: bool = False,
         regime_series: Optional[Sequence[float]] = None,
         timestamp: Optional[datetime] = None,
+        barrier: Optional[Mapping] = None,
     ) -> Optional[Tuple[float, float]]:
         """
         Apply multipliers and the chop filter to raw ATR volatility.
@@ -336,10 +463,31 @@ class RiskManager:
         ``regime_series`` holds recent NATR scalars (percent) for ``symbol``,
         newest last. ``spread`` is the live absolute bid-ask spread; when not
         ``spread_fresh`` a volatility-scaled proxy is used instead.
+
+        ``barrier`` is the optional learned geometry payload from the strategy
+        (``Signal.metadata["barrier_geometry"]``). When present and usable its
+        ``sl_atr_mult`` / ``tp_atr_mult`` replace the profile's static
+        multipliers for this bar; every gate still runs, and still runs on the
+        *substituted* stop, so "does this stop pay for the spread / is this bar
+        too quiet" is asked of the distance actually being placed.
         """
         self.last_veto_gate = GATE_NONE
-        sl_dist = raw_atr * self.profile.sl_atr_multiplier
-        tp_dist = raw_atr * self.profile.tp_atr_multiplier
+        self.last_geometry_source = GEOMETRY_STATIC
+        self.last_static_sl_dist = None
+        self.last_actual_sl_dist = None
+
+        sl_mult = self.profile.sl_atr_multiplier
+        tp_mult = self.profile.tp_atr_multiplier
+        self.last_static_sl_dist = round(raw_atr * sl_mult, self.profile.round_precision)
+
+        learned = self._barrier_multipliers(barrier, symbol)
+        if learned is not None:
+            sl_mult, tp_mult = learned
+            self.last_geometry_source = GEOMETRY_BARRIER
+
+        sl_dist = raw_atr * sl_mult
+        tp_dist = raw_atr * tp_mult
+        self.last_actual_sl_dist = round(sl_dist, self.profile.round_precision)
 
         def _bracket() -> Tuple[float, float]:
             return (
@@ -372,6 +520,105 @@ class RiskManager:
             )
             return None
         return _bracket()
+
+    def _barrier_multipliers(
+        self, barrier: Optional[Mapping], symbol: Optional[str]
+    ) -> Optional[Tuple[float, float]]:
+        """
+        Validate a learned geometry payload; return (sl_mult, tp_mult) or None.
+
+        None means "use the static profile" and covers both "no payload" and
+        "unusable payload" — the caller cannot tell those apart, by design,
+        because both must place a bracket. The reason goes to the log here.
+
+        Telemetry keys the strategy also sends (rr, admissible, tau_mae,
+        tau_mfe, backend, source) are deliberately not required: only the two
+        numbers that size the bracket are load-bearing, so adding a field
+        upstream can never break live execution.
+
+        ``admissible`` is reported, never enforced — the estimator's rr_floor
+        was written for the static 4.0/2.0 payoff while it scores
+        Q_MFE(0.50)/Q_MAE(0.95), a ratio structurally below 1, so enforcing it
+        here would veto every trade (measured rr 0.28-0.30 on all three
+        evaluation folds, 2026-09-14).
+        """
+        if barrier is None:
+            return None
+        if not isinstance(barrier, Mapping):
+            logger.critical(
+                "[%s] barrier geometry payload is %s, not a mapping — ignoring "
+                "it and using the static bracket",
+                symbol or "unknown",
+                type(barrier).__name__,
+            )
+            return None
+        try:
+            sl_mult = float(barrier["sl_atr_mult"])
+            tp_mult = float(barrier["tp_atr_mult"])
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.critical(
+                "[%s] barrier geometry payload has no usable "
+                "sl_atr_mult/tp_atr_mult (%s) — ignoring it and using the "
+                "static bracket",
+                symbol or "unknown",
+                exc,
+            )
+            return None
+        if not (np.isfinite(sl_mult) and np.isfinite(tp_mult)):
+            logger.critical(
+                "[%s] barrier geometry payload is non-finite "
+                "(sl=%r tp=%r) — ignoring it and using the static bracket",
+                symbol or "unknown",
+                sl_mult,
+                tp_mult,
+            )
+            return None
+        if sl_mult <= 0.0 or tp_mult <= 0.0:
+            logger.critical(
+                "[%s] barrier geometry payload is non-positive "
+                "(sl=%.6f tp=%.6f) — a zero or inverted bracket is not "
+                "tradeable; using the static bracket",
+                symbol or "unknown",
+                sl_mult,
+                tp_mult,
+            )
+            return None
+
+        static_sl = self.profile.sl_atr_multiplier
+        rr = barrier.get("rr")
+        width = (
+            abs(float(np.log2(sl_mult / static_sl)))
+            if static_sl and static_sl > 0
+            else 0.0
+        )
+        if width >= BARRIER_WIDTH_WARN:
+            # Not a veto: a conditional quantile may legitimately differ from a
+            # constant. But on the OANDA path the position is a fixed 1000
+            # units, so a wider stop is a proportionally larger loss per
+            # stop-out and the operator should see the ratio, not infer it.
+            logger.warning(
+                "[%s] learned barrier stop %.3fx vs static %.3fx "
+                "(%.2fx wider) — fixed-unit path does not size by risk, so "
+                "this scales the loss per stop-out; rr=%s admissible=%s",
+                symbol or "unknown",
+                sl_mult,
+                static_sl,
+                (sl_mult / static_sl) if static_sl else float("nan"),
+                f"{float(rr):.3f}" if rr is not None else "n/a",
+                barrier.get("admissible"),
+            )
+        else:
+            logger.info(
+                "[%s] learned barrier geometry in use: sl=%.3fx tp=%.3fx "
+                "(static %.3fx/%.3fx) rr=%s",
+                symbol or "unknown",
+                sl_mult,
+                tp_mult,
+                static_sl,
+                self.profile.tp_atr_multiplier,
+                f"{float(rr):.3f}" if rr is not None else "n/a",
+            )
+        return sl_mult, tp_mult
 
     def _static_floor(self, entry_price: float, symbol: Optional[str]) -> float:
         """Legacy pip / percent floor (used when no regime context is given)."""
@@ -496,6 +743,35 @@ class RiskManager:
             return 0.01
         return 0.0001
 
+    def calculate_forex_units(
+        self,
+        base_units: int,
+        static_sl_distance: float,
+        actual_sl_distance: float,
+        min_units: int = 100,
+        max_units: Optional[int] = None,
+    ) -> int:
+        """
+        Scale forex position units inversely with stop-loss width.
+
+        Preserves constant dollar risk per stop-out:
+            units = round(base_units * (static_sl_distance / actual_sl_distance))
+
+        When learned barriers predict wider stops (e.g. 7.5x ATR vs static 2.0x ATR),
+        units are scaled down so the wider stop does NOT multiply total dollar loss.
+        Clamped to [min_units, max_units].
+        """
+        if actual_sl_distance <= 0 or static_sl_distance <= 0:
+            return base_units
+
+        width_ratio = static_sl_distance / actual_sl_distance
+        target = int(round(base_units * width_ratio))
+
+        if max_units is None:
+            max_units = int(base_units * 2)
+
+        return int(np.clip(target, min_units, max_units))
+
     def calculate_quantity(
         self,
         equity: float,
@@ -514,7 +790,7 @@ class RiskManager:
         """
         # 05192026: shouldn't apply to forex trades
         risk_dollars = equity * self.profile.risk_per_trade
-        risk_per_share = entry_price - sl_price
+        risk_per_share = abs(entry_price - sl_price)
 
         if risk_per_share <= 0:
             return 0.0

@@ -44,6 +44,10 @@ import polars as pl
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from core import retrainer as R  # noqa: E402
+from core.retrainer import _common as common  # noqa: E402  (env constants moved here)
+from core.retrainer import _data as data_mod  # noqa: E402  (fetch_training_data)
+from core.retrainer import _persist as persist  # noqa: E402  (promote_or_reject)
+from core.retrainer import _train as train  # noqa: E402  (refit_models)
 from core.retrainer import HoldoutMetrics, ValidationReport  # noqa: E402
 
 
@@ -275,7 +279,7 @@ class TestMetadataRecordsHoldout(unittest.TestCase):
                 "tickers": ["GBP_JPY"],
                 "timeframe_minutes": 1,
             }
-            with mock.patch.object(R, "HOLDOUT_FRAC", 0.0):
+            with mock.patch.object(common, "HOLDOUT_FRAC", 0.0):
                 R.save_models({"angel": 1}, {"devil": 2}, cfg)
 
             meta = json.loads((override / "metadata.json").read_text())
@@ -546,7 +550,7 @@ class TestPermanentLeakGuard(unittest.TestCase):
         )
 
         recorder = self._Recorder()
-        with mock.patch.object(R, "refit_models", recorder):
+        with mock.patch.object(train, "refit_models", recorder):
             report, angel, devil, angel_feats, devil_feats, threshold, hmm = (
                 R.validate_candidate(
                     rem_features,
@@ -609,19 +613,19 @@ class TestMainWiringLeakGuard(unittest.TestCase):
             return False
 
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
-            R, "fetch_training_data", return_value=raw
+            data_mod, "fetch_training_data", return_value=raw
         ), mock.patch.object(
-            R, "get_market_provider", return_value=object()
+            common, "get_market_provider", return_value=object()
         ), mock.patch.object(
-            R, "refit_models", recorder
+            train, "refit_models", recorder
         ), mock.patch.object(
-            R, "promote_or_reject", fake_promote
+            persist, "promote_or_reject", fake_promote
         ), mock.patch.object(
-            R, "DAYS_BACK", 30
+            common, "DAYS_BACK", 30
         ), mock.patch.object(
-            R, "HOLDOUT_FRAC", 0.2
+            common, "HOLDOUT_FRAC", 0.2
         ), mock.patch.object(
-            R, "USE_HMM_FEATURES", False
+            common, "USE_HMM_FEATURES", False
         ), mock.patch.dict(
             os.environ,
             {

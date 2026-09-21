@@ -147,6 +147,69 @@ are suppressing it".
 - **Reads:** a model dir (pickles + `feature_stats.json` + metadata) and live
   history via OANDA REST. **Writes:** nothing.
 
+### `angel_bar_frontier.py` — "could this model pass its own gate at ANY bar?"
+
+`validate_candidate` says *why* a run failed; it does not say whether any setting
+could have succeeded. Those are different questions, and the second one decides
+between "keep tuning" and "this model has no certifiable edge".
+
+The gate wants two things at once — enough pooled trades (a chop-scaled backstop,
+23 on the reference basket) **and** a pooled PF 95% lower bound ≥ 1.2 — and the
+retrainer's bar is chosen to MAXIMISE EV over a quantile grid of the OOF scores,
+which parks it at the thin top of the distribution. This script replaces that one
+choice with a fixed population quantile ("approve the top X%"), which dissolves the
+trade-count problem, and then measures what happens to the evidence.
+
+Reference run (cached M15 basket, 226,992 engineered rows): **0 of 6 points satisfy
+both criteria**; win rate never exceeds 0.273 against a 0.333 break-even, the PF
+lower bound never exceeds **0.7271** against 1.2, and the binding rejection becomes
+`EV < 0.0005` at every point. VERDICT: **unreachable** — and that is a statement
+about the model's evidence, not its configuration. The tool prints that sentence
+itself, because the tempting response to an unreachable gate is to loosen a
+threshold, which manufactures a pass without an edge.
+
+Exit 0 when some bar satisfies both criteria, 2 when none does (the retrainer's
+"trained but rejected" convention). Cache-only on purpose — deterministic, no
+network — so it needs `src/analysis/build_strategy_matrix.py` to have populated
+`analysis_cache/strategy_matrix/`.
+
+> ⚠️ It prints the HTF pairing it used, and you should read that line. `M<gran>`
+> alone does not determine it: `get_asset_config`'s default assumes **M1** (`"5m"`),
+> so an M15 caller that reuses `cfg` for feature engineering silently trains on the
+> wrong higher-timeframe features. The mapping here mirrors
+> `run_oanda.py`'s `_GRANULARITY_PROFILES`.
+
+- **Imports from repo:** `core.retrainer`, `execution.risk_manager`.
+- **Reads:** `analysis_cache/strategy_matrix/<SYM>_M<gran>.parquet`.
+- **Writes:** nothing (it monkeypatches one function in-process and restores it).
+
+### `reprice_band_geometry.py` — "the near-top band on a wide bracket?"
+
+Prices the one combination the 2026-09-14 decision view left standing: the
+model's score has a small edge in the top decile and none at the extreme top
+(where the live bar sits), and a wide bracket cuts the spread toll ~6x. This
+re-walks every row of `logs/graded_decisions.parquet` under four geometries
+(live 2.0/4.0/45, wide 10.25/2.74/45, wide with a longer hold, and the
+60-sweep's best cell) and reports win rate, gross R, spread toll and net R per
+score band.
+
+Reference run (18,625 fiat decisions, 2026-07-31 → 09-18): **no band,
+quintile, top-decile or certified population is positive at any geometry.**
+Widening improves the certified population ~5x (−0.52 → −0.11R per trade) and
+still loses, and the top decile is *worse* than the average row at the wide
+geometry — the near-top-band edge does not transfer. There is no reason left
+to serve wide static brackets or to expect a wide-label retrain to pass.
+Report: [`llm_reports/recons/2026-09-20_reprice-wide-geometry-band-analysis.md`](../llm_reports/recons/2026-09-20_reprice-wide-geometry-band-analysis.md).
+
+> ⚠️ It validates itself: the static arm must reproduce the ledger's own `won`
+> column (99.94% on the reference run) or the script exits 2 without printing
+> numbers. If you change the walk convention, fix the validation first.
+
+- **Imports from repo:** `data.oanda_provider`.
+- **Reads:** `logs/graded_decisions.parquet`, OANDA M15 bars (cached under
+  `analysis_cache/2026-09-20_reprice_band_geometry/`).
+- **Writes:** `reprice_trades.parquet` in the same cache dir; stdout tables.
+
 ### `bake_spread_alphas.py`
 Turns observation into configuration: parses `SPREAD_CALIB` lines out of a soak
 log and writes a per-instrument trading-cost table, replacing the single
@@ -193,23 +256,11 @@ every promotion-bar metric; exit 2 = incumbent stands.
 
 ---
 
-## 3. Factory launchers
+## 3. Factory launchers — DELETED 2026-09-16
 
-### `run_paper_live.py`
-Paper-money launcher for `FactoryOrchestrator`. Near-duplicate of
-`run_factory.py` at the repo root; the paper-only guarantee is **procedural**
-(use paper keys in `.env`), not enforced in code.
-- **Imports from repo:** `execution.factory_orchestrator`,
-  `execution.risk_manager`, `data.feed`, `strategies.concrete_strategies`.
-
-### `smoke_test.py`
-Three hand-run sanity checks: construction against paper keys, the chop
-filter's refusal path, and the $50 minimum-notional floor.
-
-Its **"DO NOT COMMIT" header is stale** — the file is committed, and equivalent
-assertions now live in `tests/test_risk_manager.py`.
-- **Imports from repo:** `execution.factory_orchestrator`,
-  `execution.risk_manager`, `data.feed`.
+`run_paper_live.py` and `smoke_test.py` went away with the dormant
+Alpaca/Factory lane (`factory_orchestrator.py`, `run_factory.py`,
+`run_live.py`); git history has them.
 
 ### `diagnose_5yr_holdout.py`
 Diagnostic, not a gate: trains the would-be 5-year artifact on the

@@ -35,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 # package: import siblings as tests.test_* instead.
 
 from core import retrainer as R  # noqa: E402
+from core.retrainer import _train as train  # noqa: E402  (refit_models lives here post-2026-09-16 split)
 from core.retrainer import (  # noqa: E402
     _devil_min_child,
     _find_optimal_angel_threshold,
@@ -186,7 +187,7 @@ class TestGateReportCarriesThresholdAndBounds(unittest.TestCase):
             htf_timeframe="5m",
         )
         recorder = TestPermanentLeakGuard._Recorder()
-        with mock.patch.object(R, "refit_models", recorder):
+        with mock.patch.object(train, "refit_models", recorder):
             report = R.validate_candidate(
                 rem_features, feature_cols, sl_mult=2.0, tp_mult=4.0, n_folds=3
             )[0]

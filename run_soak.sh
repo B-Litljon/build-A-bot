@@ -12,6 +12,14 @@
 set -euo pipefail
 cd /mnt/storage/mystuf/development/build-A-bot
 mkdir -p logs
+
+# Log hygiene on every launch (2026-09-17): gzip soak logs older than 30 days,
+# drop gzips older than 180 days. Runs before the new live log is created, so
+# the file this run is about to write is never eligible. A chatty single run
+# once produced a 427 MB log (soak_2026-08-16_1405.log.gz) — this bounds that.
+find logs -maxdepth 1 -name 'soak_*.log' -mtime +30 -exec gzip -9 {} + 2>/dev/null || true
+find logs -maxdepth 1 -name 'soak_*.log.gz' -mtime +180 -delete 2>/dev/null || true
+
 LOG="logs/soak_$(date +%Y-%m-%d_%H%M).log"
 echo "$LOG" > /tmp/soak_logpath
 echo "$$" > /tmp/soak.pid

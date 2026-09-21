@@ -51,6 +51,22 @@ from src.data.oanda_provider import OandaMarketProvider
 class TestStreamLiveness(unittest.TestCase):
     """C3 hardening: stale-stream detection and response."""
 
+    def setUp(self):
+        """Pin the clock OUTSIDE any scheduled pause for the whole class.
+
+        Added 2026-09-15 with the pause gate: these tests assert the incident
+        path (flatten + reconnect), which is correct behaviour only while prices
+        are expected. Without this pin the suite would pass or fail depending on
+        whether it happened to run inside the 5pm-ET rollover or over a weekend.
+        Pause suppression is tested explicitly in TestScheduledPauseNoAction.
+        """
+        self._pause = patch(
+            "src.execution.oanda_forex_orchestrator.scheduled_market_pause",
+            return_value=None,
+        )
+        self._pause.start()
+        self.addCleanup(self._pause.stop)
+
     def _make_orchestrator(self):
         provider = MagicMock()
         strategy = MagicMock()
@@ -319,3 +335,99 @@ class TestProviderLivenessState(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestScheduledPauseNoAction(unittest.TestCase):
+    """A quiet feed during a SCHEDULED pause takes no action at all.
+
+    Written for the 2026-09-11..13 weekend: the watchdog read the closed forex
+    market as a dead feed and produced 12,674 CRITICAL lines, 14 alert
+    incidents, and 12 futile reconnects, with a price clock reaching 14.2 hours
+    of "silence". With a position open the same path calls _flatten_all(), and
+    positions ARE held across the daily rollover — so this was a spurious-exit
+    bug wearing a safety feature's clothes.
+    """
+
+    def _make_orchestrator(self):
+        provider = MagicMock()
+        strategy = MagicMock()
+        strategy.warmup_period = 3
+        orch = OandaForexOrchestrator(
+            symbols=["EUR/USD"],
+            provider=provider,
+            strategy=strategy,
+            order_manager=MagicMock(),
+            warmup_period=3,
+            flatten_on_exit=False,
+            notifier=MagicMock(),
+        )
+        return orch, provider
+
+    def _quiet_with_position(self, provider, age=900.0):
+        provider.stream_down_seconds = None
+        provider.seconds_since_last_price = age
+        provider.seconds_since_last_message = age
+
+    def _run_during(self, pause_name):
+        orch, provider = self._make_orchestrator()
+        self._quiet_with_position(provider)
+        orch._positions["EUR_USD"] = {
+            "entry": 1.085, "sl": 1.084, "tp": 1.086,
+            "units": 1000, "state": "OPEN",
+        }
+        with patch(
+            "src.execution.oanda_forex_orchestrator.scheduled_market_pause",
+            return_value=pause_name,
+        ), patch.object(orch, "_flatten_all") as flatten:
+            asyncio.run(orch._check_stream_liveness())
+        return orch, provider, flatten
+
+    def test_weekend_quiet_does_not_flatten_or_reconnect(self):
+        orch, provider, flatten = self._run_during("weekend closure")
+        flatten.assert_not_called()
+        provider.force_disconnect.assert_not_called()
+        self.assertIn("EUR_USD", orch._positions)
+
+    def test_rollover_quiet_does_not_flatten_or_reconnect(self):
+        orch, provider, flatten = self._run_during("daily rollover")
+        flatten.assert_not_called()
+        provider.force_disconnect.assert_not_called()
+        self.assertIn("EUR_USD", orch._positions)
+
+    def test_no_discord_alert_during_a_pause(self):
+        orch, provider, _ = self._run_during("weekend closure")
+        orch._notifier.send_system_message.assert_not_called()
+
+    def test_pause_arms_the_watchdog_for_the_next_real_incident(self):
+        """The guard must be re-armed so the first genuine outage still alerts."""
+        orch, provider, _ = self._run_during("daily rollover")
+        self.assertFalse(orch._liveness_alert_fired)
+
+    def test_pause_logged_once_not_every_probe(self):
+        """One INFO line per pause, not one per 10-second probe."""
+        orch, provider = self._make_orchestrator()
+        self._quiet_with_position(provider)
+        with patch(
+            "src.execution.oanda_forex_orchestrator.scheduled_market_pause",
+            return_value="weekend closure",
+        ), patch("src.execution.oanda_forex_orchestrator.logger") as log:
+            for _ in range(5):
+                asyncio.run(orch._check_stream_liveness())
+        self.assertEqual(log.info.call_count, 1)
+        log.critical.assert_not_called()
+
+    def test_real_outage_after_the_pause_still_flattens(self):
+        """No pause → the original safety behaviour is untouched."""
+        orch, provider = self._make_orchestrator()
+        self._quiet_with_position(provider)
+        orch._positions["EUR_USD"] = {
+            "entry": 1.085, "sl": 1.084, "tp": 1.086,
+            "units": 1000, "state": "OPEN",
+        }
+        with patch(
+            "src.execution.oanda_forex_orchestrator.scheduled_market_pause",
+            return_value=None,
+        ):
+            asyncio.run(orch._check_stream_liveness())
+        provider.force_disconnect.assert_called_once()
+        self.assertEqual(orch._positions, {})

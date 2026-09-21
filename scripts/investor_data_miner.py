@@ -53,7 +53,7 @@ import pandas as pd
 import yfinance as yf
 from dotenv import load_dotenv
 
-# ── path setup (mirrors run_paper_live.py) ────────────────────────────
+# ── path setup (mirrors the deleted run_paper_live.py) ────────────────
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _SRC_DIR = _PROJECT_ROOT / "src"
 sys.path.insert(0, str(_SRC_DIR))

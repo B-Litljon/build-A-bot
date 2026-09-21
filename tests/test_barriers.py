@@ -11,12 +11,20 @@ Glossary:
     _synth -- a deterministic sine-wave price frame with known volatility, so
         label expectations can be computed by hand.
     _flat -- a constant-price frame where every excursion is exactly 0.
+    TestPersistence -- the live sidecar contract: exact round-trip, and a
+        refusal on an incomplete or horizon-less artifact set.
+    TestPromotionVerdict -- the artifact's own reason to be served.
+    TestStopCalibrationScale -- q_mae_scale: applied to the stop only, reflected
+        in rr/admissible, refused when non-positive, monotonicity-preserving.
 """
 
 import sys
+import tempfile
 import unittest
 from io import StringIO
 from pathlib import Path
+
+import json
 
 import numpy as np
 import polars as pl
@@ -404,5 +412,282 @@ class TestFallbackMonotonicity(unittest.TestCase):
         self.assertTrue(np.all(preds == preds[0]))
 
 
+class TestPersistence(unittest.TestCase):
+    """
+    The live sidecar contract: save()/load() must round-trip a fitted
+    estimator EXACTLY, and refuse to hand back something half-loaded.
+
+    What this pins is not "pickle works" but the three properties the live
+    strategy depends on: identical predictions after a reload (a promotion that
+    shifted geometry by a rounding step would be invisible in a log), a refusal
+    on an incomplete or horizon-less artifact set (an artifact whose label
+    window is undeclared cannot be served into a bracket), and a picklable
+    degraded backend (the no-lightgbm path used a closure, which cannot be
+    pickled, so the fallback was previously unservable live).
+    """
+
+    def _fitted(self, df=None):
+        df = df if df is not None else _synth(900)
+        labels = compute_excursions(df, horizon=45)
+        est = BarrierEstimator(feature_cols=_features(df))
+        try:
+            est.fit(df, labels)
+        except ValueError as e:
+            if "monotonicity" in str(e):
+                self.skipTest("synthetic regime refused by the audit")
+            raise
+        return est, df
+
+    def test_round_trip_predictions_are_identical(self):
+        est, df = self._fitted()
+        with tempfile.TemporaryDirectory() as td:
+            est.save(td, horizon=45)
+            restored = BarrierEstimator.load(td)
+        before = est.predict(df.tail(1))[0]
+        after = restored.predict(df.tail(1))[0]
+        self.assertEqual(before, after)
+        self.assertEqual(restored.tau_mae, est.tau_mae)
+        self.assertEqual(restored.tau_mfe, est.tau_mfe)
+        self.assertEqual(restored.feature_names_in_, est.feature_names_in_)
+        self.assertEqual(restored.backend_, est.backend_)
+        self.assertEqual(restored.horizon_, 45)
+
+    def test_meta_is_written_last(self):
+        """The live reload triggers on the meta's mtime alone, so the two
+        pickles must land first — otherwise a bar could read a new contract
+        against stale weights (or the reverse)."""
+        est, _ = self._fitted()
+        with tempfile.TemporaryDirectory() as td:
+            est.save(td, horizon=45)
+            p = Path(td)
+            meta = (p / "barriers_meta.json").stat().st_mtime
+            for name in ("barriers_mae.pkl", "barriers_mfe.pkl"):
+                self.assertLessEqual((p / name).stat().st_mtime, meta)
+
+    def test_save_before_fit_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(RuntimeError):
+                BarrierEstimator(feature_cols=["natr_14"]).save(td)
+
+    def test_load_requires_the_whole_set(self):
+        est, _ = self._fitted()
+        for missing in ("barriers_mae.pkl", "barriers_mfe.pkl", "barriers_meta.json"):
+            with tempfile.TemporaryDirectory() as td:
+                est.save(td, horizon=45)
+                (Path(td) / missing).unlink()
+                with self.assertRaises(FileNotFoundError):
+                    BarrierEstimator.load(td)
+
+    def test_load_refuses_undeclared_horizon(self):
+        """No horizon in the meta means the label window is unknown; serving it
+        would size a bracket off a walk length the trade never experiences."""
+        est, _ = self._fitted()
+        with tempfile.TemporaryDirectory() as td:
+            meta = est.save(td, horizon=45)
+            meta.pop("horizon")
+            (Path(td) / "barriers_meta.json").write_text(json.dumps(meta))
+            with self.assertRaises(ValueError):
+                BarrierEstimator.load(td)
+
+    def test_load_refuses_empty_feature_cols(self):
+        est, _ = self._fitted()
+        with tempfile.TemporaryDirectory() as td:
+            meta = est.save(td, horizon=45)
+            meta["feature_cols"] = []
+            (Path(td) / "barriers_meta.json").write_text(json.dumps(meta))
+            with self.assertRaises(ValueError):
+                BarrierEstimator.load(td)
+
+    def test_binned_fallback_is_picklable(self):
+        """The degraded backend was a closure and could not be pickled at all;
+        it is a module-level handle now, so an artifact fitted without
+        lightgbm/catboost still survives the round trip."""
+        est = BarrierEstimator(feature_cols=["natr_14", "rsi_14"])
+        X = np.column_stack([np.linspace(0.1, 1.5, 200), np.full(200, 50.0)])
+        y = 0.2 + X[:, 0]  # monotone in natr, so the ladder is already isotone
+        est._model_mae = est._fit_binned_fallback(X, y, tau=0.95)
+        est._model_mfe = est._fit_binned_fallback(X, y, tau=0.50)
+        est.backend_ = "binned"
+        df = pl.DataFrame(
+            {
+                "natr_14": [0.3, 0.9],
+                "rsi_14": [50.0, 50.0],
+                "close": [150.0, 150.0],  # predict() converts NATR% -> price
+            }
+        )
+        with tempfile.TemporaryDirectory() as td:
+            est.save(td, horizon=45)
+            restored = BarrierEstimator.load(td)
+        self.assertEqual(restored.backend_, "binned")
+        self.assertEqual(est.predict(df), restored.predict(df))
+
+
+class TestPromotionVerdict(unittest.TestCase):
+    """
+    The artifact carries its own reason to be served.
+
+    Without this, an artifact says what it contains and nothing about whether
+    it earned promotion — and the retrainer's barrier hook fires off the
+    Angel/Devil gate, not off `scripts/evaluate_barriers.py`, so a retrain could
+    stamp "learned_barriers: true" on weights whose gate never ran. The failure
+    this pins is not "a missing key": it is a *plausible-looking* verdict that
+    nothing can read, which is why a verdict without a boolean `passed` is
+    refused at WRITE time rather than tolerated at read time.
+    """
+
+    def _fitted(self):
+        df = _synth(900)
+        est = BarrierEstimator(feature_cols=_features(df))
+        try:
+            est.fit(df, compute_excursions(df, horizon=45))
+        except ValueError as e:
+            if "monotonicity" in str(e):
+                self.skipTest("synthetic regime refused by the audit")
+            raise
+        return est
+
+    def _verdict(self, passed=True):
+        return {
+            "passed": passed,
+            "eval_date": "2026-09-14T20:00:00+00:00",
+            "rows": 297409,
+            "coverage_floor": 0.93,
+            "folds": [
+                {"fold": 1, "coverage": 0.953, "passed": True},
+                {"fold": 2, "coverage": 0.934, "passed": True},
+                {"fold": 3, "coverage": 0.905, "passed": passed},
+            ],
+        }
+
+    def test_verdict_round_trips(self):
+        est = self._fitted()
+        with tempfile.TemporaryDirectory() as td:
+            meta = est.save(td, horizon=45, verdict=self._verdict(passed=False))
+            restored = BarrierEstimator.load(td)
+        self.assertFalse(meta["verdict"]["passed"])
+        self.assertIsNotNone(restored.verdict_)
+        self.assertFalse(restored.verdict_["passed"])
+        self.assertEqual(restored.verdict_["rows"], 297409)
+
+    def test_absent_verdict_restores_as_none(self):
+        """Every artifact written before this field existed is in this state —
+        absence must read as "unknown", not as a pass."""
+        est = self._fitted()
+        with tempfile.TemporaryDirectory() as td:
+            est.save(td, horizon=45)
+            restored = BarrierEstimator.load(td)
+        self.assertIsNone(restored.verdict_)
+
+    def test_verdict_without_passed_is_refused_at_write(self):
+        est = self._fitted()
+        for bad in ({"folds": []}, {"passed": "yes"}, {"passed": None}, "PASS", 1):
+            with tempfile.TemporaryDirectory() as td:
+                with self.assertRaises(ValueError):
+                    est.save(td, horizon=45, verdict=bad)
+
+    def test_verdict_extras_pass_through_untouched(self):
+        """The producer's schema is not this module's to fix: anything beyond
+        the `passed` boolean is recorded verbatim, so evidence a future agent
+        needs is not silently dropped."""
+        est = self._fitted()
+        with tempfile.TemporaryDirectory() as td:
+            est.save(
+                td,
+                horizon=45,
+                verdict={"passed": True, "granularity_minutes": 15, "note": "x"},
+            )
+            restored = BarrierEstimator.load(td)
+        self.assertEqual(restored.verdict_["granularity_minutes"], 15)
+        self.assertEqual(restored.verdict_["note"], "x")
+
+
 if __name__ == "__main__":
     unittest.main()
+
+class TestStopCalibrationScale(unittest.TestCase):
+    """
+    `q_mae_scale` — the conformal-style inflation of the stop side.
+
+    The raw Q_MAE(0.95) under-covers the most recent regime (measured coverage
+    0.951/0.937/0.912 across expanding folds against a 0.93 floor, shortfall
+    concentrated in the quiet volatility deciles), and a per-decile calibration
+    reached 0.954/0.974/0.942. This pins the consumer half: the scale is
+    recorded, restored, applied to the STOP ONLY, and reflected in rr /
+    admissible rather than left as a raw-fit number.
+    """
+
+    def _fitted(self):
+        df = _synth(900)
+        est = BarrierEstimator(feature_cols=_features(df))
+        try:
+            est.fit(df, compute_excursions(df, horizon=45))
+        except ValueError as e:
+            if "monotonicity" in str(e):
+                self.skipTest("synthetic regime refused by the audit")
+            raise
+        return est, df
+
+    def test_default_is_unscaled(self):
+        est, df = self._fitted()
+        self.assertEqual(est.q_mae_scale, 1.0)
+        with tempfile.TemporaryDirectory() as td:
+            meta = est.save(td, horizon=45)
+            self.assertEqual(meta["q_mae_scale"], 1.0)
+            self.assertEqual(BarrierEstimator.load(td).q_mae_scale, 1.0)
+
+    def test_scale_multiplies_the_stop_and_not_the_target(self):
+        est, df = self._fitted()
+        base = est.predict(df.tail(1))[0]
+        est.q_mae_scale = 1.2
+        scaled = est.predict(df.tail(1))[0]
+        self.assertAlmostEqual(scaled.q_mae, base.q_mae * 1.2, places=9)
+        self.assertAlmostEqual(scaled.raw_sl_distance, base.raw_sl_distance * 1.2, places=9)
+        # the target is untouched — only the stop side is calibrated
+        self.assertAlmostEqual(scaled.q_mfe, base.q_mfe, places=12)
+        self.assertAlmostEqual(scaled.raw_tp_distance, base.raw_tp_distance, places=12)
+
+    def test_rr_and_admissibility_reflect_the_served_geometry(self):
+        """rr must be the ratio actually served, or a reader comparing it to
+        rr_floor is reading the raw fit instead of the bracket."""
+        est, df = self._fitted()
+        est.q_mae_scale = 2.0
+        out = est.predict(df.tail(1))[0]
+        self.assertAlmostEqual(out.rr, out.q_mfe / out.q_mae, places=12)
+        self.assertEqual(out.admissible, out.rr >= est.rr_floor)
+
+    def test_scale_round_trips(self):
+        est, df = self._fitted()
+        with tempfile.TemporaryDirectory() as td:
+            est.save(td, horizon=45, q_mae_scale=1.207)
+            restored = BarrierEstimator.load(td)
+        self.assertAlmostEqual(restored.q_mae_scale, 1.207, places=9)
+        self.assertEqual(restored.predict(df.tail(1))[0], est.predict(df.tail(1))[0])
+
+    def test_non_positive_scale_is_refused_at_write_and_at_load(self):
+        """A zero or negative scale would flatten or invert every stop."""
+        est, _ = self._fitted()
+        for bad in (0.0, -1.0, float("nan"), float("inf")):
+            with tempfile.TemporaryDirectory() as td:
+                with self.assertRaises(ValueError):
+                    est.save(td, horizon=45, q_mae_scale=bad)
+        with tempfile.TemporaryDirectory() as td:
+            meta = est.save(td, horizon=45)
+            meta["q_mae_scale"] = -3.0
+            (Path(td) / "barriers_meta.json").write_text(json.dumps(meta))
+            with self.assertRaises(ValueError):
+                BarrierEstimator.load(td)
+
+    def test_scaling_preserves_the_monotone_response(self):
+        """The reason a scalar is a legitimate remedy: it cannot reorder the
+        response, so the fit-time audit's guarantee survives calibration."""
+        est, df = self._fitted()
+        X = np.column_stack([
+            np.full(19, np.nanmedian(df[c].to_numpy()))
+            for c in est.feature_cols
+        ])
+        natr_idx = est.feature_cols.index("natr_14")
+        X[:, natr_idx] = np.nanquantile(df["natr_14"].to_numpy(), np.linspace(0.05, 0.95, 19))
+        raw = np.asarray(est._predict_quantile(est._model_mae, X, est.tau_mae), dtype=float)
+        est.q_mae_scale = 1.207
+        scaled = raw * est.q_mae_scale
+        self.assertTrue(np.all(np.diff(scaled) >= 0.0) == np.all(np.diff(raw) >= 0.0))

@@ -10,6 +10,10 @@ Glossary:
     AlpacaProvider -- the adapter itself.
     api_key / secret_key -- Alpaca credentials, passed in by the factory.
     paper -- True routes trading calls to the paper-money account.
+    _timeframe_for -- maps a bar size in minutes onto the Alpaca TimeFrame unit that
+        can express it (1440 -> 1Day, 240 -> 4Hour, 15 -> 15Minute); raises for sizes
+        no single unit covers (e.g. 90). Minute amounts above 59 are rejected by
+        Alpaca's API, which is why H4/D1 must not be built as 240/1440 minutes.
     stock_client / crypto_client -- separate historical REST clients; Alpaca
         splits the two asset types across different endpoints.
     trading_client -- the account/asset endpoint, used for symbol discovery
@@ -42,6 +46,47 @@ from alpaca.trading.requests import GetAssetsRequest
 from data.market_provider import MarketDataProvider
 
 logger = logging.getLogger(__name__)
+
+
+MINUTES_PER_HOUR = 60
+MINUTES_PER_DAY = 1440
+
+
+def _timeframe_for(timeframe_minutes: int) -> TimeFrame:
+    """
+    Build an Alpaca ``TimeFrame`` for a bar size expressed in minutes.
+
+    Why this exists: ``TimeFrame(n, TimeFrameUnit.Minute)`` is rejected by Alpaca for
+    n > 59 ("Second or Minute units can only be used with amounts between 1-59"), so
+    the inline construction this replaces could not request **H4 (240) or D1 (1440) at
+    all** — the two sizes the crypto-expansion plan depends on (see
+    llm_reports/recons/2026-08-11_crypto-expansion-feasibility.md, which recommends
+    daily crypto precisely because the round-trip fee stops dominating there). Requests
+    built that way failed at the API, were swallowed by the caller's broad ``except``,
+    and surfaced as "no data" rather than as an error.
+
+    Two independent API restrictions shape the mapping, both confirmed against
+    alpaca-py's own ``TimeFrame.validate_timeframe``:
+      * minute amounts are limited to 1-59, so hours/days must change unit;
+      * **Day and Week units accept amount 1 only**, so a multi-day bar size (2880
+        minutes = 2 days) cannot be expressed at all.
+
+    Sizes no single unit covers (90 minutes, 2880 minutes, ...) raise ``ValueError``
+    here rather than failing remotely inside a broad ``except``.
+    """
+    n = int(timeframe_minutes)
+    if n <= 0:
+        raise ValueError(f"timeframe_minutes must be positive, got {timeframe_minutes}")
+    if n == MINUTES_PER_DAY:
+        return TimeFrame(1, TimeFrameUnit.Day)
+    if n % MINUTES_PER_HOUR == 0 and n // MINUTES_PER_HOUR <= 24:
+        return TimeFrame(n // MINUTES_PER_HOUR, TimeFrameUnit.Hour)
+    if n > 59:
+        raise ValueError(
+            f"{n} minutes is not expressible in Alpaca's timeframe units "
+            f"(minute amounts are 1-59; 60-1440 must divide by 60; day amounts must be 1)"
+        )
+    return TimeFrame(n, TimeFrameUnit.Minute)
 
 
 class AlpacaProvider(MarketDataProvider):
@@ -94,7 +139,7 @@ class AlpacaProvider(MarketDataProvider):
             if is_crypto:
                 req = CryptoBarsRequest(
                     symbol_or_symbols=symbol,
-                    timeframe=TimeFrame(timeframe_minutes, TimeFrameUnit.Minute),
+                    timeframe=_timeframe_for(timeframe_minutes),
                     start=start,
                     end=end,
                 )
@@ -102,7 +147,7 @@ class AlpacaProvider(MarketDataProvider):
             else:
                 req = StockBarsRequest(
                     symbol_or_symbols=symbol,
-                    timeframe=TimeFrame(timeframe_minutes, TimeFrameUnit.Minute),
+                    timeframe=_timeframe_for(timeframe_minutes),
                     start=start,
                     end=end,
                     feed=DataFeed.IEX,

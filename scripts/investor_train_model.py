@@ -140,7 +140,7 @@ TRAIN_DAYS   = 504   # minimum expanding train window (~2 calendar years)
 EMBARGO_DAYS = 60    # embargo = forward-return horizon prevents leakage
 TEST_DAYS    = 60    # fold width; also the roll-forward step size
 
-# ── Self-approval gate thresholds (mirror src/core/retrainer.py:214-219) ──
+# ── Self-approval gate thresholds (mirror src/core/retrainer/_common.py) ──
 # Ranker gate is LIFT-OVER-RANDOM, not absolute: a random picker scores
 # Precision@K ≈ the positive base rate (top-quintile target ≈ 0.20). The
 # gate requires the model to clear the base rate by a margin.

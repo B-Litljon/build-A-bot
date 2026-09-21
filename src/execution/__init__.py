@@ -1,24 +1,20 @@
 """
-src/execution — Factory trading orchestration layer.
+src/execution — trade lifecycle orchestration for the live lanes.
 
 Exports:
-    FactoryOrchestrator  — async trade lifecycle manager (factory path)
-    RiskManager          — bracket sizing, position sizing, A3 chop filter
+    RiskManager          — bracket sizing, position sizing, Gate C entry windows
 
-Note: LiveOrchestrator (legacy monolith) is intentionally excluded.
-      It lives in live_orchestrator.py and is quarantined until Tier 3
-      decoupling is complete.
-
-Note also that OandaForexOrchestrator -- the orchestrator actually running
-live -- is likewise not exported here; run_oanda.py imports it by path.
+Note: OandaForexOrchestrator -- the orchestrator actually running live -- is
+      intentionally not exported here; run_oanda.py imports it by path.
+      The Alpaca scalper lane (LiveOrchestrator, FactoryOrchestrator) was
+      DELETED 2026-09-16 with the rest of its dormant stack; git history
+      has it if it is ever resurrected.
 
 Glossary:
-    __all__ -- the deliberately short public surface. The exclusions above are
-        intentional, not oversights: importing this package must not pull in
-        the heavier orchestrators.
+    __all__ -- the deliberately short public surface: importing this package
+        must not pull in the heavy orchestrators.
 """
 
-from .factory_orchestrator import FactoryOrchestrator
 from .risk_manager import RiskManager
 
-__all__ = ["FactoryOrchestrator", "RiskManager"]
+__all__ = ["RiskManager"]

@@ -183,7 +183,7 @@ class TestCallSiteIsGuarded(unittest.TestCase):
     """
 
     def test_capture_is_guarded_by_an_explicit_none_check(self):
-        src = (Path(__file__).resolve().parents[1] / "src/core/retrainer.py").read_text()
+        src = (Path(__file__).resolve().parents[1] / "src/core/retrainer/_gate.py").read_text()  # validate_candidate lived here since the 2026-09-16 split
         idx = src.index("_capture_oos_ledger(\n                oos_ledger,")
         preceding = src[:idx]
         self.assertTrue(

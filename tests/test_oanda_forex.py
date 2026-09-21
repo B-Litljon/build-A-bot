@@ -993,3 +993,84 @@ class TestUntradeableSymbolFilter(unittest.TestCase):
         del provider.get_tradeable_instruments
         asyncio.run(orch._drop_untradeable_symbols())
         self.assertEqual(orch._symbols, ["GBP_JPY"])
+
+
+class TestRiskBasedSizing(unittest.TestCase):
+    """
+    Position sizing verification under learned barrier geometry.
+
+    Ensures risk sizing scales forex trade units inversely with stop distance
+    only when RISK_SIZING_ENABLED is active and geometry is learned.
+    """
+
+    def _make_orch(self, **kwargs):
+        holder = TestOandaForexOrchestrator()
+        return holder._make_orchestrator(**kwargs)
+
+    def test_default_risk_sizing_is_disabled(self):
+        orch, _, _, _, _ = self._make_orch()
+        self.assertFalse(orch._risk_sizing)
+
+    def test_explicit_risk_sizing_enabled(self):
+        orch, _, _, _, _ = self._make_orch(risk_sizing=True)
+        self.assertTrue(orch._risk_sizing)
+
+    def test_env_risk_sizing_enabled(self):
+        with patch.dict("os.environ", {"RISK_SIZING_ENABLED": "1"}):
+            orch, _, _, _, _ = self._make_orch()
+            self.assertTrue(orch._risk_sizing)
+
+    def test_risk_sizing_disabled_uses_fixed_units_with_barrier(self):
+        orch, _, strategy, order_manager, risk_manager = self._make_orch(risk_sizing=False)
+        strategy.generate_signals.return_value = FakeSignal(direction="long")
+        risk_manager.calculate_bracket.return_value = (0.00372, 0.00150)
+        risk_manager.last_geometry_source = "barrier"
+        risk_manager.last_static_sl_dist = 0.00100
+        order_manager.submit_target_position.return_value = {
+            "filled": 1000, "avg_price": 1.08500, "closed_units": 0,
+            "opened_units": 1000, "position_units": 1000, "position_avg_price": 1.08500,
+        }
+
+        for i in range(3):
+            asyncio.run(orch._on_bar(TestOandaForexOrchestrator._bar_dict(timestamp=i)))
+
+        order_manager.submit_target_position.assert_called_once_with("EUR_USD", 1000)
+
+    def test_risk_sizing_enabled_scales_units_with_barrier(self):
+        orch, _, strategy, order_manager, risk_manager = self._make_orch(risk_sizing=True)
+        strategy.generate_signals.return_value = FakeSignal(direction="long")
+        # 3.72x wider stop than static
+        risk_manager.calculate_bracket.return_value = (0.00372, 0.00150)
+        risk_manager.last_geometry_source = "barrier"
+        risk_manager.last_static_sl_dist = 0.00100
+        from src.execution.risk_manager import RiskManager
+        real_rm = RiskManager()
+        risk_manager.calculate_forex_units.side_effect = real_rm.calculate_forex_units
+
+        order_manager.submit_target_position.return_value = {
+            "filled": 269, "avg_price": 1.08500, "closed_units": 0,
+            "opened_units": 269, "position_units": 269, "position_avg_price": 1.08500,
+        }
+
+        for i in range(3):
+            asyncio.run(orch._on_bar(TestOandaForexOrchestrator._bar_dict(timestamp=i)))
+
+        # 1000 * 0.00100 / 0.00372 = 269 units
+        order_manager.submit_target_position.assert_called_once_with("EUR_USD", 269)
+
+    def test_risk_sizing_enabled_leaves_static_geometry_untouched(self):
+        orch, _, strategy, order_manager, risk_manager = self._make_orch(risk_sizing=True)
+        strategy.generate_signals.return_value = FakeSignal(direction="short")
+        risk_manager.calculate_bracket.return_value = (0.00100, 0.00200)
+        risk_manager.last_geometry_source = "static"
+        risk_manager.last_static_sl_dist = 0.00100
+
+        order_manager.submit_target_position.return_value = {
+            "filled": 1000, "avg_price": 1.08500, "closed_units": 0,
+            "opened_units": 1000, "position_units": -1000, "position_avg_price": 1.08500,
+        }
+
+        for i in range(3):
+            asyncio.run(orch._on_bar(TestOandaForexOrchestrator._bar_dict(timestamp=i)))
+
+        order_manager.submit_target_position.assert_called_once_with("EUR_USD", -1000)

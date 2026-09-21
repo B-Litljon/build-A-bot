@@ -20,6 +20,7 @@ src/ml/models/
 
 # Logs and result outputs
 *.log
+*.log.gz
 *_results.txt
 results_60.txt
 backtest_output.log
@@ -47,3 +48,4 @@ logs/status.json
 
 # Offline analysis artifacts (rescued/derived data; regenerable)
 analysis_cache/
+catboost_info/

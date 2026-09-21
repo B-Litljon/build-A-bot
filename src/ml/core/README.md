@@ -28,5 +28,5 @@ Three contracts:
 - **Imported by:** `src/ml/feature_pipeline.py`,
   `src/ml/features/v3_features.py`, `src/ml/targets/v3_targets.py`,
   `src/ml/trainers/v3_rf_trainer.py`, `src/ml/train_model.py`,
-  `src/day_trading/features.py`, `src/day_trading/targets.py`.
+  (The `src/day_trading/` consumer was deleted 2026-09-16.)
 - **Data artifacts:** none.

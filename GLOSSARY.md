@@ -44,14 +44,13 @@ tests) or dormant experiments kept for reference.
 |---|---|---|
 | [`src/`](src/README.md) | All library code. See its README for the package map. | training + live |
 | [`scripts/`](scripts/README.md) | Hand-run tools: the whole V4 investor, model diagnostics, calibration, paper launchers. | manual + monthly cron |
-| [`tests/`](tests/README.md) | 163 tests. No network, no broker, no real models. | CI / manual |
-| `models/` | Trained model artifacts. Subdirectories are separate models: `forex/`, `forex_m15/`, `forex_swing/`, plus legacy root-level `angel_latest.pkl` and `dt_*` (day-trade experiment) and `v4_investor_lgbm.txt`. | read live |
+| [`tests/`](tests/README.md) | 538 tests. No network, no broker, no real models. | CI / manual |
+| `models/` | Trained model artifacts. Live: `forex_m15_wide/` (served by the soak) with `forex_m15_wide_backup_20260829/` as rollback, `forex_h4_catboost/` (gated-out candidate, kept for the audit). Root-level `dt_*` is the day-trade experiment and `v4_investor_lgbm.txt` the monthly investor model. The ~24 one-off experiment dirs were pruned 2026-09-17. | read live |
 | `data/` | Bars, ledgers, and processed datasets (`raw/`, `processed/`, `cache/`). Mostly gitignored. | training + analysis |
 | `config/` | Configuration not in code — currently just a baked spread-cost table. | training + live |
 | `logs/` | Run logs, including the multi-day `soak_*.log` files that calibration is mined from. | live |
-| `docs/` | Three older design documents (architecture, day-trade model, an RSI/Bollinger strategy). | reference |
-| `llm_reports/` | Written reports of work done, filed by category (`audits/`, `handoffs/`, `refactors/`, `recons/`, `stops/`). See its README for the convention. | reference |
-| `m2m_prompts/` | The other half of that ledger: the briefs that *requested* the work. | reference |
+| `docs/` | Older design documents (architecture, day-trade model, an RSI/Bollinger strategy) plus `GEMINI_NOTEBOOK_STUDY_NOTES.md`, a current sectioned architecture primer written 2026-09-18 for long-context study/notebook use. | reference |
+| [`llm_reports/`](llm_reports/README.md) | Written reports of work done, filed by category (`audits/`, `handoffs/`, `refactors/`, `recons/`, `stops/`); `m2m-prompts/` inside also holds the model-to-model briefs and live threads, including the pre-2026-09 ledger threads moved from the removed top-level `m2m_prompts/`. See its README for the convention. | reference |
 | [`dashboard/`](dashboard/README.md) | Read-only web view of the soak: Rust (axum) API + TypeScript front-end. Reads `logs/events-*.jsonl`, `logs/status.json`, and OANDA REST. Cannot affect trading. | manual |
 | `viz/` | Empty. | — |
 | `src/autopilot/`, `src/research/` | **No source files on this branch** — only stale `__pycache__`. | — |
@@ -61,9 +60,6 @@ tests) or dormant experiments kept for reference.
 | File | What it does |
 |---|---|
 | `run_oanda.py` | ⚠️ Launcher for the **currently-running** forex bot. |
-| `run_live.py` | Launcher for the Alpaca equities/crypto scalper (not live). |
-| `run_factory.py` | Launcher for the Factory path (Alpaca crypto). |
-| `chop_ab_test.py` | Controlled A/B of the chop filter: same cached data, one variable changed. |
 | `trading_mcp.py` | Read-only MCP server exposing soak observability as tools, plus two guarded control tools. |
 | `backtest_60.py` | ⚠️ **Broken** — calls a constructor signature and a method that no longer exist. |
 
@@ -76,7 +72,6 @@ tests) or dormant experiments kept for reference.
 | `soak_watchdog.sh` | Cron, every 5 min: starts `soak.service` if the soak died, and logs a post-mortem of the previous run. **Kill switch: `touch soak.off` *before* stopping it**, or it comes back within 5 minutes. |
 | `run_pipeline.sh` | The offline loop: harvest → replay → grade → check drift → retrain if needed. Branches on exit codes. |
 | `run_investor_rebalance.sh` | Monthly investor cron wrapper. |
-| `run_chop_ab.sh` | Wrapper for the chop A/B harness. |
 
 ## `src/` packages
 
@@ -86,10 +81,9 @@ tests) or dormant experiments kept for reference.
 | [`ml/`](src/ml/README.md) | The feature factory: bars → the numbers models see. Training and live run the *same* generators in the same order. | training + live |
 | [`strategies/`](src/strategies/README.md) | The decision. Bars in, `Signal` or `None` out. No broker, no sizing. | live |
 | [`execution/`](src/execution/README.md) | Brokers, orders, position state, software stops. Three orchestrators for three markets. | **live** |
-| [`core/`](src/core/README.md) | Two unrelated things: shared types + the Discord notifier, **and** `retrainer.py`, the entire training and promotion pipeline. | mixed |
+| [`core/`](src/core/README.md) | Two unrelated things: shared types + the Discord notifier, **and** `retrainer/`, the entire training and promotion pipeline. | mixed |
 | [`utils/`](src/utils/README.md) | Bar aggregation. One live module. | live |
 | [`analysis/`](src/analysis/README.md) | Offline diagnostics, run by hand. Targets the legacy Alpaca stack. | never live |
-| [`day_trading/`](src/day_trading/README.md) | Dormant "V4.0" 5-minute experiment. Fully self-contained, `dt_`-prefixed artifacts. | never live |
 
 ---
 
@@ -101,12 +95,12 @@ tests) or dormant experiments kept for reference.
 possible, tolerating false alarms. It **proposes**. Fires above the Angel
 threshold — calibrated per retrain from out-of-fold scores since 2026-08-29
 (`ANGEL_THRESHOLD` env var pins the old fixed bar, default 0.40).
-*(`src/core/retrainer.py`)*
+*(`src/core/retrainer/`)*
 
 **Devil** — stage two. Tuned for *precision*, and trained only on the bars the
 Angel already liked: of these candidates, which are actually worth taking. It
 **vetoes**. Two stages exist because one model tuned for both jobs does neither
-well. *(`src/core/retrainer.py`)*
+well. *(`src/core/retrainer/`)*
 
 > For non-technical audiences these are called **Thing 1** and **Thing 2**.
 > Code and internal docs keep Angel/Devil.
@@ -194,8 +188,32 @@ near 1.09. `atr_abs = close × natr_14 / 100`.
 **bracket / SL / TP** — the stop-loss and take-profit levels placed either side
 of an entry. Sized as multiples of NATR, so they adapt to how much the
 instrument is actually moving. Equities default 0.5× / 3.0× (a 6:1 payoff);
-**the forex profile overrides this to 1.0× / 2.0×** (2:1) — always check the
-profile rather than the module constants.
+**the forex profile overrides this to 2.0× / 4.0×** (2:1) — it ran 1.0× / 2.0×
+until 2026-08-08. Always check the profile rather than the module constants.
+
+**MAE / MFE (maximum adverse / favourable excursion)** — how far a trade ran
+against you, and how far in your favour, over a fixed forward window, expressed
+as a multiple of the entry bar's ATR. The training targets of the barrier
+models. *(`src/ml/barriers/labels.py`)*
+
+**learned barrier geometry / quantile barrier** — a per-bar replacement for the
+bracket's static multiples, learned as conditional quantiles of the forward
+excursion: the stop is `Q_MAE(0.95)`, the 95th-percentile adverse walk a trade
+tolerates, and the target `Q_MFE(0.50)`, the median favourable walk. Both are
+NATR multiples, so they substitute for `sl_atr_multiplier` /
+`tp_atr_multiplier` and everything downstream — the gates, rounding, sizing —
+is unchanged. Travels on `Signal.metadata["barrier_geometry"]`
+(`BARRIER_GEOMETRY_KEY`) and is **OFF by default**, and an artifact that records
+a FAILED **promotion verdict** in its `barriers_meta.json` is refused outright at
+boot rather than merely switched off
+(`BARRIER_GEOMETRY_ENABLED=1` to serve it). Two gates stand in front of it: the
+switch, and the Phase 1 promotion verdict in `scripts/evaluate_barriers.py`,
+which as of 2026-09-14 **fails** (fold 3 coverage 0.905 against a 0.93 floor)
+even though the learned stop beats the static constant on pinball loss on every
+fold. *(`src/ml/barriers/`)* — see GLOSSARY-worthy caveat in
+`src/execution/README.md`: the OANDA path trades fixed 1000 units and does not
+size by risk, so a wider learned stop is a proportionally larger loss per
+stop-out.
 
 **alpha / `spread_atr_alpha`** — trading cost expressed as a fraction of a
 typical move. Dimensionless: 0.07 means the toll is 7% of a normal move (cheap);
@@ -216,7 +234,8 @@ live forex path** (verified 2026-09-09): `run_oanda.py` drives the OANDA
 orchestrator with a fixed `units_per_trade = 1000`
 (`oanda_forex_orchestrator.py:28-29`), and `RiskManager.calculate_quantity`
 (where the \$50 floor lives) is never called by it. The equity-derived sizing
-and the notional floor apply to the Alpaca/Factory paths only.
+and the notional floor applied to the deleted Alpaca/Factory paths (2026-09-16)
+only; git history has them.
 
 ## The gates (the "chop filter")
 
@@ -354,7 +373,7 @@ the previous weights stay in place.
 engineering, used to score the actual artifact that gets served. Passing the
 fold gate is necessary but not sufficient; the served model must also earn its
 bars on the holdout. Recorded in `metadata.json` so a deployed model can be
-checked against what it actually earned. *(`src/core/retrainer.py`)*
+checked against what it actually earned. *(`src/core/retrainer/`)*
 
 **artifact holdout gate** — the additional pass/fail applied to the final model
 on the holdout, using the same Brier/EV bars as the fold gate, the frozen
@@ -364,7 +383,7 @@ confidence bound** on the macro win rate rather than the point estimate
 fold gate fails, the holdout is still scored for diagnostics (Fold 3 models,
 `ValidationReport.holdout.diagnostic_only`); the fold verdict stands either
 way. Disabled by `RETRAIN_HOLDOUT_FRAC=0`; when disabled or empty the metadata
-records the bypass explicitly. *(`src/core/retrainer.py`)*
+records the bypass explicitly. *(`src/core/retrainer/`)*
 
 **Clopper-Pearson bound** — the one-sided lower confidence bound on a binary
 win rate (`Beta(1-confidence; wins, losses+1)` quantile), mapped through
@@ -373,14 +392,14 @@ approximation because Wilson under-covers below ~40 trades — precisely the
 sample sizes that used to flip the verdict. Exact for independent trades;
 the 45-bar macro walks overlap in price, so in practice the bound is
 conservative rather than a literal coverage guarantee — the safe direction
-for a promotion gate. *(`src/core/retrainer.py`)*
+for a promotion gate. *(`src/core/retrainer/`)*
 
 **unresolvable tail** — the last `max_hold` bars per symbol of a raw slice,
 whose bracket walk runs off the end of the frame and resolves "timeout →
 loss" no matter what the price actually did. Those labels are systematically
 wrong, so the engineered remainder and holdout each drop them after
 engineering (the **boundary purge**); the cutoffs are derived from the raw
-series because the walk needs the contiguous pre-veto path. *(`src/core/retrainer.py`)*
+series because the walk needs the contiguous pre-veto path. *(`src/core/retrainer/`)*
 
 **lift over random vs lift over benchmark** — two different questions, and for a
 long time the investor only asked the first. "Better than guessing" is measured
@@ -579,10 +598,6 @@ into place, so the hot reloader can never read a half-written file.
 **state machine** — the per-symbol lifecycle: FLAT → PENDING → IN_TRADE →
 PENDING_EXIT → COOLING → FLAT. **Cooling** is a 5-minute pause after any close,
 so one choppy stretch can't cause repeated re-entries.
-
-**SymbolContext** — all per-symbol runtime state in the Alpaca orchestrator.
-Owned exclusively by the event loop; worker threads get immutable snapshots and
-return frozen results. Enforced by a regression test.
 
 **soak** — a long unattended run on the practice account, used to gather
 evidence (spread measurements, gate telemetry) rather than to make money.

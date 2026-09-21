@@ -2,6 +2,24 @@
 
 Instructions for AI assistants working in this repo.
 
+## More than one agent may be in this checkout
+
+Several agents (and several humans) work in this tree, sometimes on the same
+feature at the same time. Two conventions exist for that, and using them is not
+optional when someone else is active:
+
+- **Leave a channel, not a private report.** A one-way brief or an audit nobody
+  else reads cannot coordinate two writers. Open or append to a **live thread**
+  in [`llm_reports/m2m-prompts/`](llm_reports/m2m-prompts/) — append-only, one
+  `## [timestamp] <from> → <to>` block per message, every claim marked VERIFIED
+  (with the command and its real output), ASK, OFFER, BLOCKER or DECIDED. Read
+  that folder's README for the index of open threads. **Re-read the thread
+  immediately before appending**, and say so if you edit a file the other agent
+  may be mid-edit in — a stale read in a shared tree silently clobbers work.
+- **Check the tree before you believe a note, including a note you wrote.** Read
+  `git log`/`git status` and the file itself; commits here are often made by
+  whoever finishes last, with a message that describes only their own half.
+
 ## Documentation maintenance (required)
 
 This repo carries a three-layer documentation system. **Keeping it accurate is
@@ -58,11 +76,16 @@ Conventions for Layer 3:
 
 Verified during the 2026-07-27 glossary pass:
 
-- **Two different `Signal` classes.** `core.signal.Signal` (Alpaca path, brackets
-  in a metadata dict) and `strategies.base.Signal` (OANDA path, explicit
-  distance fields). Not interchangeable.
+- **One `Signal` class now.** The Alpaca path's `core.signal.Signal` was
+  deleted with that lane on 2026-09-16. `strategies.base.Signal` (explicit
+  distance fields) is the only one.
 - **`V3RandomForestTrainer` holds a LightGBM model.** `.load()` unpickles
   whatever is on disk; production models have been LightGBM since 2026-05-23.
+  Candidates are not so uniform — the CatBoost A/B runs leave
+  `CatBoostClassifier` pickles — which is why `feature_names_in_` reads BOTH
+  spellings (`feature_names_in_`, CatBoost's `feature_names_`). A CatBoost
+  artifact used to fail the strategy's boot with "exposes no feature_names_in_"
+  (2026-09-14).
 - **`Signal.raw_tp_distance` is written but never read.** Target sizing belongs
   to `RiskManager`'s multipliers, deliberately.
 - **Bracket multipliers differ by asset class.** The module constants say
@@ -75,8 +98,9 @@ Verified during the 2026-07-27 glossary pass:
   **"heartbeat"** (OANDA keepalive vs the strategy's periodic log).
 - **Don't use textbook PSI thresholds.** Market bars are autocorrelated; use the
   null calibration in `feature_stats.json`.
-- **`fetch_training_data`** is both a dead module (`src/data/`) and a live
-  function (`core/retrainer.py`). The function is the one in use.
+- **`fetch_training_data`** is a function living in `core/retrainer/_data.py`
+  (the retrainer became a package on 2026-09-16; `core/retrainer` re-exports
+  it). The same-named dead module in `src/data/` was deleted 2026-09-16.
 
 ## Testing
 
@@ -85,7 +109,8 @@ Verified during the 2026-07-27 glossary pass:
 # (alpaca, mcp, …) and fails test COLLECTION with 23 import errors.
 PYTHONPATH=src:. \
   /home/tha_magick_man/.local/share/virtualenvs/build-A-bot-A3hTUWzK/bin/python \
-  -m pytest -q     # 416 collected / 411 passed / 5 skipped (2026-09-09)
+  -m pytest -q     # 505 passed / 6 subtests passed (2026-09-14; the suite has
+                   # grown a lot — treat the count as a sanity check, not a target)
 ```
 
 `PYTHONPATH=src:.` is required — entry points prepend `src/` to the path, which

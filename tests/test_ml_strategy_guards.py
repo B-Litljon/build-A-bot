@@ -36,7 +36,14 @@ project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root / "src"))
 sys.path.insert(0, str(project_root))
 
-from src.strategies.concrete_strategies.ml_strategy import MLStrategy
+from src.strategies.concrete_strategies.ml_strategy import (
+    MLStrategy,
+    _barriers_requested,
+)
+
+from core.retrainer import BASE_FEATURE_COLS
+from ml.barriers.estimator import BarrierEstimator
+from ml.barriers.labels import DEFAULT_HORIZON, compute_excursions
 
 
 def _bars(n: int, end: datetime) -> pl.DataFrame:
@@ -168,6 +175,14 @@ class TestHotReloadSeams(unittest.TestCase):
         s._cost_gen.alpha_table = None
         s.angel_trainer = MagicMock()
         s.devil_trainer = MagicMock()
+        # Barrier sidecar state, as __init__ would leave it. Without this the
+        # barrier hook inside _check_model_updates raises AttributeError and is
+        # swallowed by its own try/except, silently costing this class its
+        # coverage of everything after it.
+        s.use_barriers = False
+        s._barrier_estimator = None
+        s._barrier_meta_path = Path(tmp) / "barriers_meta.json"
+        s._barrier_mtime = 0.0
         return s
 
     def test_both_loaded_pair_is_consistent(self):
@@ -243,5 +258,336 @@ class TestHotReloadSeams(unittest.TestCase):
             s.angel_trainer.predict.assert_not_called()
 
 
+class TestBarrierSidecar(unittest.TestCase):
+    """
+    The learned-barrier sidecar (ml.barriers) on the strategy side.
+
+    Three things are load-bearing and pinned here:
+      * OFF by default — a soak restarting onto this branch must behave exactly
+        as it did before the barriers existed, so the switch is the only thing
+        that can turn learned geometry on.
+      * FAIL-LOUD on enable — an operator who asked for learned stops and
+        silently got static ones cannot tell, which is the trap the cost_ratio
+        and HMM guards already close.
+      * the units contract — the payload carries NATR MULTIPLES, so the
+        distance RiskManager builds from it equals BarrierOutput's own
+        price-unit distance. If those ever disagree, the learned geometry is
+        being served at a scale nobody fitted.
+    """
+
+    MODEL_DIR = Path("models/forex_m15_wide")
+
+    @staticmethod
+    def _bare(tmp: str) -> MLStrategy:
+        """A constructed-enough instance for the sidecar paths (no pickles)."""
+        s = MLStrategy.__new__(MLStrategy)
+        s.asset_class = "forex"
+        s.angel_path = Path(tmp) / "angel_latest.pkl"
+        s.devil_path = Path(tmp) / "devil_latest.pkl"
+        s._reload_lock = threading.Lock()
+        s.notification_manager = MagicMock()
+        s.use_barriers = True
+        s._barrier_estimator = None
+        s._barrier_meta_path = Path(tmp) / "barriers_meta.json"
+        s._barrier_mtime = 0.0
+        s.feature_names = list(BASE_FEATURE_COLS)
+        return s
+
+    @staticmethod
+    def _fit_and_save(model_dir, feature_cols=("natr_14", "vol_rel"), tau_mae=0.95):
+        """A real fitted artifact set on a synthetic frame, saved to disk."""
+        sys.path.insert(0, str(project_root))
+        from tests.test_barriers import _synth
+
+        df = _synth(900)
+        labels = compute_excursions(df, horizon=DEFAULT_HORIZON)
+        est = BarrierEstimator(feature_cols=list(feature_cols), tau_mae=tau_mae)
+        est.fit(df, labels)
+        est.save(model_dir, horizon=DEFAULT_HORIZON)
+        return est, df
+
+    def test_default_is_off(self):
+        """No env, no argument → static geometry, and no artifact is read."""
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("BARRIER_GEOMETRY_ENABLED", None)
+            self.assertFalse(_barriers_requested())
+        self.assertTrue(_barriers_requested(True))
+        self.assertFalse(_barriers_requested(False))
+
+    def test_env_switch_enables(self):
+        with patch.dict(os.environ, {"BARRIER_GEOMETRY_ENABLED": "1"}):
+            self.assertTrue(_barriers_requested())
+        with patch.dict(os.environ, {"BARRIER_GEOMETRY_ENABLED": "0"}):
+            self.assertFalse(_barriers_requested())
+
+    def test_enabling_without_artifacts_is_a_boot_error(self):
+        """The live model dir carries no barrier set, so asking for learned
+        geometry there must raise (naming every missing file) rather than
+        quietly serving static ones."""
+        with tempfile.TemporaryDirectory() as td:
+            s = self._bare(td)
+            with self.assertRaises(FileNotFoundError) as ctx:
+                s._load_barriers()
+            self.assertIn("barriers_mae.pkl", str(ctx.exception))
+
+    def test_real_model_dir_refuses_enable_without_artifacts(self):
+        """Same guard, through the real constructor on the served pair."""
+        with self.assertRaises(FileNotFoundError):
+            MLStrategy(
+                asset_class="forex",
+                angel_path=self.MODEL_DIR / "angel_latest.pkl",
+                devil_path=self.MODEL_DIR / "devil_latest.pkl",
+                warmup_period=10,
+                use_barriers=True,
+            )
+
+    def test_horizon_mismatch_refuses(self):
+        """A barrier labelled on a different walk length than the execution
+        lifetime must not be served."""
+        with tempfile.TemporaryDirectory() as td:
+            est = BarrierEstimator(feature_cols=["natr_14", "vol_rel"])
+            df = self._synth_for_horizon()
+            est.fit(df, compute_excursions(df, horizon=10))
+            est.save(td, horizon=10)
+            s = self._bare(td)
+            with self.assertRaises(RuntimeError) as ctx:
+                s._load_barriers()
+            self.assertIn("horizon", str(ctx.exception).lower())
+
+    def _synth_for_horizon(self):
+        from tests.test_barriers import _synth
+
+        return _synth(900)
+
+    def test_feature_vocabulary_outside_the_served_schema_refuses(self):
+        """A barrier model reading a column the live pipeline does not compute
+        cannot be served — that is the point of the parity check."""
+        with tempfile.TemporaryDirectory() as td:
+            est = BarrierEstimator(feature_cols=["natr_14"])
+            # 'not_a_live_feature' is fitted as a constant column so the fit is
+            # well-defined; the strategy must still refuse it.
+            df = self._synth_for_horizon().with_columns(
+                pl.lit(1.0).alias("not_a_live_feature")
+            )
+            est.feature_cols = ["natr_14", "not_a_live_feature"]
+            est.feature_names_in_ = list(est.feature_cols)
+            est.fit(df, compute_excursions(df, horizon=DEFAULT_HORIZON))
+            est.save(td, horizon=DEFAULT_HORIZON)
+            s = self._bare(td)
+            with self.assertRaises(RuntimeError) as ctx:
+                s._load_barriers()
+            self.assertIn("not_a_live_feature", str(ctx.exception))
+
+    def test_loaded_geometry_is_natr_multiples_matching_price_distances(self):
+        """The units contract: payload mult x raw ATR == BarrierOutput's own
+        price distance, so RiskManager rebuilds exactly what was fitted."""
+        with tempfile.TemporaryDirectory() as td:
+            est, df = self._fit_and_save(td)
+            s = self._bare(td)
+            s._barrier_estimator = s._load_barriers()
+
+            feature_frame = df.with_columns(
+                pl.col("vol_rel").fill_null(1.0)
+            ).tail(50)
+            payload = s._barrier_geometry(feature_frame)
+            self.assertIsNotNone(payload)
+            self.assertEqual(payload["source"], "barrier")
+
+            atr_abs = float(
+                (feature_frame["close"] * feature_frame["natr_14"] / 100.0)[-1]
+            )
+            self.assertAlmostEqual(
+                payload["sl_atr_mult"] * atr_abs,
+                est.predict(feature_frame.tail(1))[0].raw_sl_distance,
+                places=9,
+            )
+            self.assertAlmostEqual(
+                payload["tp_atr_mult"] * atr_abs,
+                est.predict(feature_frame.tail(1))[0].raw_tp_distance,
+                places=9,
+            )
+
+    def test_geometry_is_none_when_sidecar_off(self):
+        with tempfile.TemporaryDirectory() as td:
+            s = self._bare(td)
+            s._barrier_estimator = None
+            frame = pl.DataFrame(
+                {"close": [1.08], "natr_14": [0.5], "vol_rel": [1.0]}
+            )
+            self.assertIsNone(s._barrier_geometry(frame))
+
+    def test_prediction_failure_falls_back_instead_of_raising(self):
+        """A frame missing the barrier's columns must not blow up the bar —
+        the static bracket is a valid fallback, so degrade and log."""
+        with tempfile.TemporaryDirectory() as td:
+            s = self._bare(td)
+            est, _ = self._fit_and_save(td)
+            s._barrier_estimator = est
+            frame = pl.DataFrame({"close": [1.08], "natr_14": [0.5]})  # no vol_rel
+            self.assertIsNone(s._barrier_geometry(frame))
+
+    def test_meta_mtime_promotion_swaps_the_estimator(self):
+        """The promotion seam: a new artifact set lands, the meta mtime moves,
+        and the next bar serves the new geometry — no restart."""
+        with tempfile.TemporaryDirectory() as td:
+            old, _ = self._fit_and_save(td, tau_mae=0.95)
+            s = self._bare(td)
+            s._barrier_estimator = s._load_barriers()
+            s._barrier_mtime = s._barrier_meta_mtime()
+
+            new, _ = self._fit_and_save(td, tau_mae=0.90)
+            meta = Path(td) / "barriers_meta.json"
+            future = meta.stat().st_mtime + 60
+            os.utime(meta, (future, future))
+
+            s._reload_barriers_if_changed()
+            self.assertAlmostEqual(s._barrier_estimator.tau_mae, 0.90, places=6)
+            s.notification_manager.send_system_message.assert_called()
+
+    def test_broken_promotion_keeps_the_previous_geometry(self):
+        """A partially written set must not disable geometry or half-swap it:
+        the bar keeps serving the last set that loaded cleanly, and alerts."""
+        with tempfile.TemporaryDirectory() as td:
+            old = self._fit_and_save(td, tau_mae=0.95)[0]
+            s = self._bare(td)
+            s._barrier_estimator = old
+            s._barrier_mtime = s._barrier_meta_mtime()
+
+            self._fit_and_save(td, tau_mae=0.90)  # a new set lands...
+            (Path(td) / "barriers_mfe.pkl").unlink()  # ...incompletely
+            meta = Path(td) / "barriers_meta.json"
+            future = meta.stat().st_mtime + 60
+            os.utime(meta, (future, future))
+
+            s._reload_barriers_if_changed()
+            self.assertIs(s._barrier_estimator, old)
+            self.assertAlmostEqual(s._barrier_estimator.tau_mae, 0.95, places=6)
+            s.notification_manager.send_system_message.assert_called()
+
+    # ── promotion verdict: the artifact's own reason to be served ─────────
+
+    def test_recorded_fail_verdict_is_refused_at_boot(self):
+        """The Phase 1 gate is not advisory. A retrain hook fires off the
+        Angel/Devil gate rather than the barrier gate, so artifacts can exist
+        whose gate FAILED — and those must not reach a live bracket."""
+        with tempfile.TemporaryDirectory() as td:
+            est, _ = self._fit_and_save(td)
+            est.save(
+                td,
+                horizon=DEFAULT_HORIZON,
+                verdict={"passed": False, "folds": [{"fold": 3, "coverage": 0.905}]},
+            )
+            s = self._bare(td)
+            with self.assertRaises(RuntimeError) as ctx:
+                s._load_barriers()
+            self.assertIn("FAILED promotion verdict", str(ctx.exception))
+            # The recorded numbers travel with the refusal, so the log says
+            # what failed rather than only that something did.
+            self.assertIn("0.905", str(ctx.exception))
+
+    def test_recorded_pass_verdict_serves(self):
+        with tempfile.TemporaryDirectory() as td:
+            est, _ = self._fit_and_save(td)
+            est.save(td, horizon=DEFAULT_HORIZON, verdict={"passed": True})
+            s = self._bare(td)
+            loaded = s._load_barriers()
+            self.assertTrue(loaded.verdict_["passed"])
+            self.assertIsNotNone(loaded.horizon_)
+
+    def test_absent_verdict_serves_with_a_warning(self):
+        """Absence is "unknown", not "pass" and not a refusal: every artifact
+        written before the field existed is in this state, and refusing them
+        would break the sidecar for artifacts that were validated by hand."""
+        with tempfile.TemporaryDirectory() as td:
+            self._fit_and_save(td)
+            s = self._bare(td)
+            # MLStrategy.__module__, not a hardcoded name: this test file imports
+            # the module as `src.strategies....` while the live entry points
+            # import it as `strategies....`, so a literal name silently catches
+            # nothing.
+            with self.assertLogs(MLStrategy.__module__, level="WARNING") as logs:
+                loaded = s._load_barriers()
+            self.assertIsNone(loaded.verdict_)
+            self.assertTrue(
+                any("NO promotion verdict" in line for line in logs.output),
+                logs.output,
+            )
+
+    def test_verdict_summary_is_readable_from_folds(self):
+        from strategies.concrete_strategies.ml_strategy import _verdict_summary
+
+        line = _verdict_summary(
+            {
+                "passed": False,
+                "eval_date": "2026-09-14T20:00:00+00:00",
+                "coverage_floor": 0.93,
+                "folds": [
+                    {"fold": 1, "coverage": 0.953},
+                    {"fold": 2, "coverage": 0.934},
+                    {"fold": 3, "coverage": 0.905},
+                ],
+            }
+        )
+        self.assertIn("0.953/0.934/0.905", line)
+        self.assertIn("coverage_floor=0.93", line)
+        # And it must not raise on a verdict that carries nothing but the
+        # boolean — the refusal path must never become its own failure.
+        self.assertEqual(_verdict_summary({"passed": False}), "no detail recorded")
+
+    def test_bracket_check_stands_down_but_reports_the_skew(self):
+        """With learned geometry active the profile-vs-metadata bracket check
+        cannot apply — but the mismatch it would have caught is the Devil's
+        label geometry, so the numbers must appear rather than vanish.
+
+        The Devil is trained on `devil_target`, built from the STATIC multiples
+        (core/retrainer/_labels.py — was retrainer.py:1469 pre-split); a learned
+        bracket is a different walk than the one
+        its conviction was fitted on, and the direction of that error is not
+        known. A silent stand-down is how that gets forgotten.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            Path(td, "metadata.json").write_text(
+                json.dumps(
+                    {
+                        "asset_class": "forex",
+                        "sl_atr_multiplier": 1.0,
+                        "tp_atr_multiplier": 2.0,
+                    }
+                )
+            )
+            s = MLStrategy.__new__(MLStrategy)
+            s.asset_class = "forex"
+            s.angel_path = Path(td) / "angel_latest.pkl"
+            s.use_barriers = True
+            with self.assertLogs(MLStrategy.__module__, level="WARNING") as logs:
+                s._validate_metadata()  # must NOT raise: 1.0/2.0 vs profile 2.0/4.0
+            joined = "\n".join(logs.output)
+            self.assertIn("bracket check STOOD DOWN", joined)
+            self.assertIn("1.0", joined)  # the artifact's trained pair
+            self.assertIn("2.0", joined)  # ...and the profile it is served under
+
+    def test_bracket_check_still_refuses_when_barriers_are_off(self):
+        """The guard is only ever bypassed for a declared reason: with the
+        sidecar off, a mismatched artifact is still refused outright."""
+        with tempfile.TemporaryDirectory() as td:
+            Path(td, "metadata.json").write_text(
+                json.dumps(
+                    {
+                        "asset_class": "forex",
+                        "sl_atr_multiplier": 1.0,
+                        "tp_atr_multiplier": 2.0,
+                    }
+                )
+            )
+            s = MLStrategy.__new__(MLStrategy)
+            s.asset_class = "forex"
+            s.angel_path = Path(td) / "angel_latest.pkl"
+            s.use_barriers = False
+            with self.assertRaises(RuntimeError) as ctx:
+                s._validate_metadata()
+            self.assertIn("Bracket mismatch", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
+
