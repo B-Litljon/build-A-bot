@@ -3,8 +3,10 @@
 **Purpose:** a structured, sectioned reference intended to be pasted into Gemini
 Notebook (or any long-context study tool) so the architecture can be interrogated
 conversationally. Every section is self-contained and clearly labelled. Facts here
-were read from the working tree on **2026-09-18** (branch `feat/quantile-mae-barriers`,
-HEAD `b8fe4c9`), not from older docs.
+were read from the working tree on **2026-09-21** (branch `feat/quantile-mae-barriers`,
+HEAD `b6dabf3` + working tree updates through 2026-09-21), not from older docs. It
+incorporates the definitive findings from the 2026-09-20 wide-bracket re-price study
+and the 19k+ live decision ledger.
 
 > **Read this first — the repo's own docs are partly stale.** The root `readme.md`
 > describes "Universal Scalper V3.4" on Alpaca; that lane is gone. `table-o-content.md`
@@ -41,11 +43,16 @@ submitted to OANDA; and a tick-by-tick software watchdog — not the broker — 
 the stop and target. **A dead process means an unwatched open position**, and most of
 the engineering hardening follows from that single fact.
 
-**The central empirical finding (2026-09-14, still the standing conclusion):** the bot
-is *not* misconfigured. Its measured edge is roughly **+0.045R**, while any bracket
-geometry needs roughly **+0.09R** to overcome the spread toll. No configuration of this
-basket/timeframe/model is promotable, and the promotion gate refusing new models is
-correct. Widening stops *dilutes* the cost; it does not create edge. See §13.
+**The central empirical finding (2026-09-14, definitively reinforced 2026-09-20):** the
+bot is *not* misconfigured. Its measured edge is roughly **+0.045R** (selective edge in
+the top decile), while any bracket geometry needs roughly **+0.09R** to overcome the
+spread toll. The 2026-09-20 wide-bracket re-price study proved that while widening stops
+dilutes spread drag ~5× (−0.27R → −0.052R per trade), **the score does not transfer to
+wide geometry — it inverts**: the top decile (−0.102R) is worse than the population
+average (−0.081R), and the live certificate cohort is the worst in the file (−0.516R
+at live geometry). No configuration of this basket/timeframe/model is promotable, and
+the promotion gate refusing new models is correct. Widening stops *dilutes* the cost;
+it does not create edge. See §13.
 
 ---
 
@@ -69,12 +76,13 @@ build-A-bot/
 │   ├── core/                    # shared types + retrainer/ (training pipeline)
 │   ├── utils/                   # bar aggregation (legacy Alpaca path only)
 │   └── analysis/                # offline diagnostics, run by hand
-├── scripts/                     # hand-run tools + the whole V4 investor
+├── scripts/                     # hand-run tools, reprice studies + V4 investor
 ├── tests/                       # 538 tests, no network/broker/real models
 ├── models/                      # trained artifacts (gitignored)
 ├── data/                        # bars, ledgers, processed datasets (gitignored)
 ├── config/                      # spread alpha tables, example routing tables
-├── logs/                        # soak logs, events-*.jsonl, status.json
+├── logs/                        # soak logs, events-*.jsonl, status.json, graded decisions
+├── analysis_cache/              # cached bars & reprice study outputs
 ├── dashboard/                   # Rust (axum) read-only API + TS frontend
 └── llm_reports/                 # audits / refactors / recons / handoffs / stops
 ```
@@ -340,6 +348,19 @@ learned quantile can legitimately be ~10 ATR); widening beyond 2× the static wi
 a WARNING because the OANDA path trades *fixed* 1,000 units and a wider stop is a
 proportionally larger loss.
 
+### The static wide bracket & sizing trap (2026-09-20)
+Given that widening stops cuts the spread toll ~5×, why not simply change
+`RiskProfile.for_asset_class("forex")` to the wide numbers (e.g. `10.25×/2.74×`)?
+Two reasons, one empirical and one architectural:
+1. **Empirical:** as proven in the 2026-09-20 re-price study, net expectancy remains
+   negative (−0.081R/trade), and the top decile actually inverts.
+2. **Architectural trap:** `src/execution/oanda_forex_orchestrator.py:1495` guards
+   dynamic risk-adjusted sizing (`RISK_SIZING_ENABLED`) strictly on
+   `last_geometry_source == GEOMETRY_BARRIER`. Under `GEOMETRY_STATIC`, position sizing
+   trades a fixed `_units_per_trade = 1000`. Serving a ~10× stop statically would trade
+   1,000 units with 5× the stop distance, multiplying cash risk per trade by ~5× on a
+   negative-expectancy setup!
+
 ---
 
 ## 8. The live orchestrator (`src/execution/oanda_forex_orchestrator.py`, ~2,500 lines)
@@ -385,8 +406,16 @@ proportionally larger loss.
   sits below the 60s flatten threshold.
 - **Spread calibration (`SPREAD_CALIB`)** — samples real spread once per sealed bar, off
   the fast path; `scripts/bake_spread_alphas.py` consumes it.
-- **Fixed size** — `units_per_trade = 1000`. This path does **not** use equity-based
-  sizing; `RiskManager.calculate_quantity` is never called by it.
+- **Fixed size & dynamic sizing guard** — `units_per_trade = 1000` default. Sizing is
+  scaled inversely by `RiskManager.calculate_forex_units` **only** when
+  `_risk_sizing` is active AND `last_geometry_source == GEOMETRY_BARRIER` (see §7).
+  For static geometry, fixed units apply.
+- **The live soak trade rate context** — The bot having zero fills during soak has
+  actually protected capital: as measured in `logs/decision_report_2026-09-20.txt` and
+  `scripts/reprice_band_geometry.py`, the live certificate population (`verdict ∈
+  {agreement, devil_veto}`, n=38) has a win rate of only 15.8% and net R of
+  −0.516R/trade under live geometry. The strictness of the chop filter and the extreme
+  Angel bar (0.3833) have kept the bot out of its worst-performing cohort.
 
 ### `oanda_order_manager.py`
 Tracks the **net signed position** per instrument, never lots, because US (NFA) rules
@@ -570,9 +599,15 @@ is `behavior_matrix.py`, which is current.
   a cell is uninformative and `recommend()` skips it.
 - **`decision_grader.py`** — grades the **served** model's recorded decisions against what
   price did next. Uses the `ev="bar"` records (~500/day; only ~1/week becomes a fill).
-  First run on 9,183 graded decisions found the headline: the model's confidence is
-  **inverted at the top** — it wins 28–32% in low bands (random = 29.3%) but only 6.7% at
-  the 0.40 bar it trades on. The model is right about direction; the bracket loses anyway.
+  Updated through 2026-09-18 (report 2026-09-20) across **19,379 decisions recorded,
+  19,367 graded**:
+  - Base rate: 25.6% (break-even needs 33.3% at 2:1).
+  - Confidence inversion at the top: lower score bands win 25–28%, but the 0.40+ band
+    drops to **13.16% win rate** (n=38, gap −0.3337 vs mean Angel 0.4653).
+  - Threshold sweep net of 0.10R toll: all thresholds are negative; threshold 0.40 nets
+    −0.7053R (PF 0.262).
+  - Market behavior breakdown: `range_low` win rate is 32.6% (n=3,877), while
+    `trend_high` collapses to 20.07% (n=3,433).
 - **`strategy_backtester.py`** — strategy-agnostic scorer. Key conventions: `macro_win` is
   bracket resolution (target reached), not profitability; `gross_r`/`net_r` are the
   realized move over the stop distance. Realism: gap fills at the open, timeouts pay the
@@ -597,6 +632,15 @@ is `behavior_matrix.py`, which is current.
   for M1.
 - **`generate_feature_stats.py`** — backfills `feature_stats.json`; the end-date argument
   **must be the model's training date** or it manufactures drift.
+- **`reprice_band_geometry.py`** — "the near-top band on a wide bracket?" Prices the one
+  combination the 2026-09-14 decision view left standing: re-walks every row of
+  `logs/graded_decisions.parquet` across 4 geometries (live 2.0/4.0/45, wide
+  10.25/2.74/45, wide 10.25/2.74/192, best-sweep 8.0/1.0/90) and reports per-band win
+  rate, gross R, spread toll and net R.
+  ⚠️ **Self-validating:** the static arm must reproduce the ledger's own `won` column
+  (it does, on 99.94% of 18,625 fiat decisions) or the script exits 2 without printing.
+  Result: no band or cohort is positive at any geometry; widening cuts toll ~5× but the
+  score inverts at wide geometry.
 - **`evaluate_barriers.py`** — the Phase 1 barrier promotion gate (currently FAIL).
 - **`run_catboost_ab.py`**, **`run_h4_candidate.py`**, **`run_stability_batch.sh`** — A/B
   and stability runs; nothing writes under `models/` unless deliberately promoted.
@@ -605,8 +649,9 @@ is `behavior_matrix.py`, which is current.
 
 ## 13. The measured edge budget (the most important finding)
 
-Established 2026-09-14; the evidence lives in the repo's live thread and in
-`llm_reports/recons/2026-09-14_session-evidence-and-options.md`.
+Established 2026-09-14 and decisively completed on **2026-09-20**; the evidence lives
+in `llm_reports/recons/2026-09-14_session-evidence-and-options.md` and
+`llm_reports/recons/2026-09-20_reprice-wide-geometry-band-analysis.md`.
 
 **The conclusion:** the bot is not misconfigured. Its measured edge is roughly a third of
 what the market requires, and every lever tested acts on the cost side instead.
@@ -614,18 +659,50 @@ what the market requires, and every lever tested acts on the cost side instead.
 | quantity | value | currency |
 |---|---|---|
 | model's real selectivity | ≈ **+0.045R** | +1.5pp win rate over base rate at 2:1 |
-| static bracket's toll | ≈ **0.25R** | per-trade spread over a 2×ATR stop |
-| a wide bracket's toll | ≈ **0.04R** | same measure over a ~10×ATR stop |
+| static bracket's toll | ≈ **0.25R–0.27R** | per-trade spread over a 2×ATR stop |
+| a wide bracket's toll | ≈ **0.04R–0.052R** | same measure over a ~10×ATR stop |
 | **what any bracket geometry needs** | ≈ **0.09R** | best random-entry cell of a 60-geometry sweep |
 
-**So widening the stop does not create edge — it lowers the cost below the signal.** The
-wide arm measures ≈break-even (−0.049R) against the static arm's −0.207R. The gap is a
-factor of two to three on the *edge* side: find something worth ~3pp of win rate or stand
-down.
+**Widening the stop dilutes the cost; it does not create edge.** The wide arm measures
+closer to break-even (−0.081R) against the static arm's −0.288R. But as the 2026-09-20
+re-price proved, the score itself carries no edge at wide geometry.
 
-### The four research axes and their verdicts
-- **Bracket geometry / target definition — CLOSED.** 60-geometry sweep: **0 of 60 cells
-  positive at random entries**; gross expectancy tracks break-even within ±0.002R.
+### The Wide-Bracket Re-price Study (2026-09-20)
+The 2026-09-14 session left a specific hypothesis: the model's score has a small real
+edge in the top decile (+2.2pp over base, p=0.03) and none at the extreme top where the
+live bar (0.3833) sits; a wide bracket cuts the spread toll ~6×. Serve the near-top band
+on the wide bracket and the two effects might meet above zero.
+
+`scripts/reprice_band_geometry.py` re-walked 18,625 live decisions (2026-07-31 to
+2026-09-18) across four geometries, validating 99.94% against the live ledger:
+
+| arm (stop × target × hold) | pooled n | pooled win | pooled net R | top-decile net R | certified win | certified net R |
+|---|---:|---:|---:|---:|---:|---:|
+| static 2.0/4.0/45 *(live)* | 18,625 | 0.249 | **−0.288** | −0.268 | 0.158 | **−0.516** |
+| wide 10.25/2.74/45 | 18,625 | 0.498 | **−0.081** | −0.102 | 0.474 | −0.108 |
+| wide 10.25/2.74/192 | 18,625 | 0.719 | −0.078 | −0.098 | 0.684 | −0.076 |
+| best 8.0/1.0/90 *(60-sweep best)* | 18,625 | 0.848 | −0.085 | −0.100 | 0.816 | −0.045 |
+
+**Key findings:**
+1. **The toll budget reproduces:** static toll per trade is ~0.27R and wide is ~0.052R
+   (~5× dilution, matching the 2026-09-14 cost model).
+2. **Widening cuts the bleeding but cannot stop it:** certified population improves from
+   −0.516R to −0.108R, but remains negative.
+3. **The near-top band inverts at wide geometry:** at wide, the top decile (−0.102R)
+   and certified rows (−0.108R) are *worse* than the average row (−0.081R). The score
+   carries no positive relation to wide-geometry outcomes.
+4. **The live certificate is the worst population:** rows approved by the bar net
+   −0.516R/trade (win rate 15.8% vs 25% random base rate).
+5. **Wide-label retrain is closed as an edge play:** wide random-entry gross ≈ 0,
+   requiring ~+0.05R of genuine selectivity, and the model's static selectivity does not
+   transfer.
+
+### The research axes and their verdicts (updated 2026-09-20)
+- **Bracket geometry / target definition — DECISIVELY CLOSED.** 60-geometry sweep:
+  **0 of 60 cells positive at random entries**; gross expectancy tracks break-even within
+  ±0.002R. 2026-09-20 re-price: no band positive at wide.
+- **Wide-bracket serving & wide-label retrain — DECISIVELY CLOSED.** Options 3 and 5
+  of the 2026-09-14 decision view are jointly closed.
 - **Direction — CLOSED, against the hypothesis.** Shorts were the untested lever;
   measured long beats short in every period of both configs.
 - **A different market (crypto) — CLOSED.** 0 of 27 geometries positive at random entries
@@ -633,8 +710,8 @@ down.
 - **Non-fiat instruments — OPEN, and a HUMAN decision.** Metals had a 47.8–56.6% long base
   rate in 2025 (genuinely favourable) but `UNTRADEABLE_SYMBOLS` excludes XAU/XAG because
   this practice account can't trade them.
-- **A genuinely different feature/target design — UNTESTED.** The only axis left that
-  could *raise* the +0.045R rather than lower the toll.
+- **A genuinely different feature/target design — UNTESTED / OPEN.** The only axis left
+  that could *raise* the +0.045R rather than lower the toll.
 
 ### Related measured facts
 - The M15 model's edge over random is real but tiny (+0.011 to +0.019 over base rate), and
@@ -651,7 +728,7 @@ down.
 ### The soak
 - **`run_soak.sh`** — sources `.env`, sets `PYTHONPATH=src:.`, uses the pipenv venv python
   (system python 3.14 lacks deps), logs to `logs/soak_<ts>.log`, PID in `/tmp/soak.pid`.
-  Gzips logs >30 days, deletes gzips >180 days.
+  Automated log retention hygiene: gzips logs >30 days (`logs/*.log.gz`), deletes gzips >180 days.
 - **`soak.service`** — systemd **user** unit. `OANDA_MODEL_DIR=models/forex_m15_wide` is
   the **single source of truth for the served model**, and it must match the brackets in
   the checked-out tree (a model trained on one bracket and served under another is
@@ -735,6 +812,21 @@ and it didn't work." Key files:
 17. **`_GRANULARITY_PROFILES` matters**: `get_asset_config`'s default HTF pairing assumes
     M1 (`"5m"`); an M15 caller reusing `cfg` for feature engineering silently trains on the
     wrong HTF features.
+18. **"Widening the bracket to ~10×ATR creates edge"** — Widening dilutes the spread toll
+    (~0.27R → ~0.052R) and reduces loss rate (−0.29R → −0.08R), but net expectancy remains
+    negative across every score band, and the top decile actively inverts.
+19. **"Static wide numbers can be set in `RiskProfile`"** — In `oanda_forex_orchestrator.py`,
+    dynamic risk-based position sizing (`RISK_SIZING_ENABLED`) only triggers if
+    `last_geometry_source == "barrier"`. A static wide profile will trade fixed 1,000 units
+    with a 5× wider stop, multiplying dollar risk per trade by 5× on a losing strategy.
+20. **"The live certificate (Angel+Devil approval) is the highest-quality setup"** — In the
+    live decision ledger, rows where the Angel and Devil both approve have a 15.8% win rate
+    and lose −0.516R/trade (far worse than the 25% random base rate). Zero live fills has
+    protected the account.
+21. **"A wide-label retrain will fix the edge problem"** — Random-entry gross on wide
+    geometry is ≈0, so a wide model must supply ~+0.05R of genuine selectivity. The current
+    model's selectivity (+0.045R at 2:1) does not survive target changes; expecting a
+    retrain to pass without new features is unsubstantiated.
 
 ---
 
@@ -810,6 +902,16 @@ and it didn't work." Key files:
     for each choice?
 14. Two products share this repo. What do they actually share, and where is that sharing
     enforced (or deliberately avoided)?
+15. What was the hypothesis behind the 2026-09-20 wide-bracket re-price study, and how did
+    `scripts/reprice_band_geometry.py` validate its walk conventions? What did it discover
+    about score transferability across bracket geometries?
+16. Explain the risk sizing coupling trap in `src/execution/oanda_forex_orchestrator.py:1495`.
+    What happens to dollar risk per trade if someone updates `RiskProfile` to a 10×ATR stop
+    while `last_geometry_source` remains `"static"`?
+17. In `logs/decision_report_2026-09-20.txt`, the live certificate population has a 15.8%
+    win rate, while random entries win 25.6%. Explain how an ML model can produce an
+    inverted calibration curve at the extreme top of its score distribution, and why the
+    soak having zero fills was actually capital-protective.
 
 ---
 

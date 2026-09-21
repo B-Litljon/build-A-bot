@@ -183,6 +183,33 @@ network — so it needs `src/analysis/build_strategy_matrix.py` to have populate
 - **Reads:** `analysis_cache/strategy_matrix/<SYM>_M<gran>.parquet`.
 - **Writes:** nothing (it monkeypatches one function in-process and restores it).
 
+### `reprice_band_geometry.py` — "the near-top band on a wide bracket?"
+
+Prices the one combination the 2026-09-14 decision view left standing: the
+model's score has a small edge in the top decile and none at the extreme top
+(where the live bar sits), and a wide bracket cuts the spread toll ~6x. This
+re-walks every row of `logs/graded_decisions.parquet` under four geometries
+(live 2.0/4.0/45, wide 10.25/2.74/45, wide with a longer hold, and the
+60-sweep's best cell) and reports win rate, gross R, spread toll and net R per
+score band.
+
+Reference run (18,625 fiat decisions, 2026-07-31 → 09-18): **no band,
+quintile, top-decile or certified population is positive at any geometry.**
+Widening improves the certified population ~5x (−0.52 → −0.11R per trade) and
+still loses, and the top decile is *worse* than the average row at the wide
+geometry — the near-top-band edge does not transfer. There is no reason left
+to serve wide static brackets or to expect a wide-label retrain to pass.
+Report: [`llm_reports/recons/2026-09-20_reprice-wide-geometry-band-analysis.md`](../llm_reports/recons/2026-09-20_reprice-wide-geometry-band-analysis.md).
+
+> ⚠️ It validates itself: the static arm must reproduce the ledger's own `won`
+> column (99.94% on the reference run) or the script exits 2 without printing
+> numbers. If you change the walk convention, fix the validation first.
+
+- **Imports from repo:** `data.oanda_provider`.
+- **Reads:** `logs/graded_decisions.parquet`, OANDA M15 bars (cached under
+  `analysis_cache/2026-09-20_reprice_band_geometry/`).
+- **Writes:** `reprice_trades.parquet` in the same cache dir; stdout tables.
+
 ### `bake_spread_alphas.py`
 Turns observation into configuration: parses `SPREAD_CALIB` lines out of a soak
 log and writes a per-instrument trading-cost table, replacing the single
