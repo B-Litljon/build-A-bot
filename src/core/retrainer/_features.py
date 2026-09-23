@@ -1,5 +1,7 @@
-"""engineer_features_and_labels (bars -> full feature/label frame) and
-generate_time_decay_weights. Split out of core/retrainer.py on 2026-09-16.
+"""engineer_features_and_labels (bars -> full feature/label frame),
+apply_labels_and_veto (labels + vetoes on an already-featured frame; the shared
+half the feature lab reuses), and generate_time_decay_weights. Split out of
+core/retrainer.py on 2026-09-16; apply_labels_and_veto extracted 2026-09-21.
 """
 from __future__ import annotations
 
@@ -110,6 +112,83 @@ def engineer_features_and_labels(
         "hour_of_day, vol_rel"
     )
 
+    # The production feature space, by construction: the caller's generator list
+    # is the hardcoded V3 set above. ``cost_ratio`` exists iff an alpha_table was
+    # provided (V3CostFeatures is a no-op otherwise) — keyed off the function
+    # param, not the module global, so behavior follows what was computed.
+    base_cols = BASE_FEATURE_COLS + (["cost_ratio"] if alpha_table else [])
+    df, chop_veto_rate = apply_labels_and_veto(
+        df,
+        feature_cols=base_cols,
+        sl_mult=sl_mult,
+        tp_mult=tp_mult,
+        max_hold=max_hold,
+        survival_bars=survival_bars,
+        angel_mult=angel_mult,
+        risk_profile=risk_profile,
+        alpha_table=alpha_table,
+    )
+    if USE_HMM_FEATURES:
+        logger.info(
+            f"HMM regime features ENABLED — will be appended per-fold: {HMM_OUTPUT_COLS}"
+        )
+
+    return df, base_cols, chop_veto_rate
+
+
+def apply_labels_and_veto(
+    df: pl.DataFrame,
+    feature_cols: List[str],
+    *,
+    sl_mult: float = SL_ATR_MULTIPLIER,
+    tp_mult: float = TP_ATR_MULTIPLIER,
+    max_hold: int = MAX_HOLD_BARS,
+    survival_bars: int = SURVIVAL_BARS,
+    angel_mult: Optional[float] = None,
+    risk_profile: Optional[RiskProfile] = None,
+    alpha_table: Optional[dict] = None,
+) -> Tuple[pl.DataFrame, float]:
+    """
+    Build every label and apply every veto on an ALREADY-FEATURED frame.
+
+    This is (b)+(c) of ``engineer_features_and_labels`` split out (2026-09-21)
+    so a caller with its own feature generator list — the feature lab — can run
+    the exact same labelling and veto path. The production wrapper keeps its
+    hardcoded V3 generator list; this function is the shared half.
+
+    Order is load-bearing and inherited verbatim:
+      1. Angel target (3-bar ATR momentum) — needs ``natr_14``.
+      2. Devil macro target (max_hold-bar bracket walk) — needs the contiguous
+         price path, so it must run BEFORE any row-dropping veto.
+      3. Devil survival target (survival_bars SL survival).
+      4. Forward MAE/MFE excursions, computed per symbol.
+      5. Chop veto (Gate A cost / Gate B regime / Gate C blackout mirror),
+         then the optional behavior veto.
+      6. Cleanup: NaN/inf scrub, drop incomplete rows on ``feature_cols`` plus
+         the two training targets.
+
+    Args:
+        df: Feature frame (raw OHLCV + symbol/timestamp + feature columns).
+        feature_cols: the model-facing feature columns to clean on. Production
+            passes BASE_FEATURE_COLS (+ cost_ratio when the table is active);
+            the lab passes the resolved spec's columns. The returned frame's
+            completeness contract is scoped to exactly these + targets, which is
+            why a caller must not pass every column in the frame.
+        sl_mult / tp_mult / max_hold: bracket geometry for both label families.
+        survival_bars: horizon of the Devil's survival label.
+        angel_mult: ATR multiple for the Angel's 3-bar momentum bar. None falls
+            back to sl_mult (the legacy coupling).
+        risk_profile: enables the chop veto when given. None skips it (and then
+            ``chop_veto_rate`` is 0.0 unless the behavior veto fires — which
+            would be a `pre_veto` NameError, a known latent wart kept verbatim).
+        alpha_table: per-instrument cost table; also selects whether the frame
+            is expected to carry ``cost_ratio``.
+
+    Returns:
+        (labelled/filtered frame, chop_veto_rate) — the combined row-drop
+        fraction, which feeds the pooled dynamic trade-count floor in
+        validate_candidate().
+    """
     # ═══════════════════════════════════════════════════════════════════
     # ANGEL TARGET: ATR-relative 3-bar momentum
     # 1 if close 3 bars ahead > close + sl_mult × ATR_abs
@@ -268,15 +347,13 @@ def engineer_features_and_labels(
     # CLEANUP: Drop NaN/null rows (uses FeaturePipeline.clean_data)
     # ═══════════════════════════════════════════════════════════════════
     initial_count = len(df)
-    # cost_ratio exists iff an alpha_table was provided (V3CostFeatures is a
-    # no-op otherwise) — include it in cleaning and the returned schema so it
-    # reaches the models. Keyed off the function param, not the module global,
-    # so behavior follows what was actually computed.
-    base_cols = BASE_FEATURE_COLS + (["cost_ratio"] if alpha_table else [])
-    # Clean on BASE features only — HMM regime probs (when enabled) are
-    # appended later inside validate_candidate so each fold fits its own HMM.
+    cols = list(feature_cols)
+    # Clean on the model-facing features only — HMM regime probs (when
+    # enabled) are appended later inside validate_candidate so each fold fits
+    # its own HMM, and intermediate columns (bb_upper, sma_50, …) must not
+    # drop rows the model never reads.
     df = FeaturePipeline.clean_data(
-        df, feature_cols=base_cols + ["angel_target", "devil_target"]
+        df, feature_cols=cols + ["angel_target", "devil_target"]
     )
     dropped_count = initial_count - len(df)
 
@@ -284,11 +361,9 @@ def engineer_features_and_labels(
         f"Dropped {dropped_count:,} rows with nulls ({dropped_count / initial_count:.1%})"
     )
     logger.info(f"Final dataset: {len(df):,} rows")
-    logger.info(f"Base feature columns ({len(base_cols)}): {base_cols}")
-    if USE_HMM_FEATURES:
-        logger.info(f"HMM regime features ENABLED — will be appended per-fold: {HMM_OUTPUT_COLS}")
+    logger.info(f"Base feature columns ({len(cols)}): {cols}")
 
-    return df, base_cols, chop_veto_rate
+    return df, chop_veto_rate
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

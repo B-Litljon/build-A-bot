@@ -260,6 +260,11 @@ Glossary:
         own recent range (dead, choppy conditions).
     engineer_features_and_labels -- runs the feature pipeline, builds both
         labels, applies the veto, and returns the clean training frame.
+    apply_labels_and_veto -- (2026-09-21) the shared second half extracted from
+        that function: builds both labels, the excursion targets, and both
+        vetoes on an already-featured frame, then cleans. The feature lab
+        (src/lab) reuses it with candidate generator lists so its labels and
+        vetoes are byte-for-byte the production path.
     generate_time_decay_weights -- weights recent rows more heavily
         (decay_factor 0.95) so the model leans toward current market behaviour.
     refit_models -- trains the Angel then the Devil on one window.
@@ -399,6 +404,7 @@ from ._labels import (  # noqa: F401
 )
 
 from ._features import (  # noqa: F401
+    apply_labels_and_veto,
     engineer_features_and_labels,
     generate_time_decay_weights,
 )

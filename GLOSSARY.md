@@ -84,6 +84,7 @@ tests) or dormant experiments kept for reference.
 | [`core/`](src/core/README.md) | Two unrelated things: shared types + the Discord notifier, **and** `retrainer/`, the entire training and promotion pipeline. | mixed |
 | [`utils/`](src/utils/README.md) | Bar aggregation. One live module. | live |
 | [`analysis/`](src/analysis/README.md) | Offline diagnostics, run by hand. Targets the legacy Alpaca stack. | never live |
+| [`lab/`](src/lab/README.md) | The feature lab: candidate features scored by the retrainer's own promotion gate. Built 2026-09-21. | never live |
 
 ---
 
@@ -422,6 +423,47 @@ those share nearly all their rows and their excess series correlate 0.71, so
 they amount to about 2.2 independent samples. Re-slicing the same data guards
 against a lucky boundary; it does not manufacture statistical power. The same
 caution applies to the horizon study's "held at 5 of 5 alignments".
+
+## The feature lab
+
+**feature lab** — `src/lab/`, the offline harness for asking whether a candidate
+feature set would *promote*. It composes the `ml` generators, the retrainer's
+labels and gate, and the strategy backtester; nothing in `src/execution/` or
+`run_oanda.py` imports it. *(`src/lab/README.md`)*
+
+**FeatureSpec** — one frozen, hashable object describing a lab experiment: bars,
+feature families, bracket geometry, label knobs, cost-table switch, estimator
+family. Frozen so a change is a new spec, never a mutation.
+
+**content hash** — the spec's SHA-256 (16 hex chars), used as the frame-cache
+key. It covers the spread table's bytes and the frame-affecting environment, so
+a stale cache hit is impossible by construction.
+
+**feature family** — a registered name -> generators + model-facing columns. A
+new candidate feature is one `BaseFeatureGenerator` class plus a registration;
+nothing else in the repo changes.
+
+**edge over random** — the gate's telemetry: pooled fold win rate minus the
+macro bracket's **base rate** (what a random long entry won on the same
+tradeable bars). In *win-rate units*, not R. A positive PF is worth nothing
+unless this is positive — and at the EV-maximising Angel bar the approved
+population is thin enough that a large positive edge is usually small-sample
+noise. Read it beside `pooled_oos_trades`. *(`src/core/retrainer/_gate.py`)*
+
+**base rate** — the fraction of random long entries that would win under the
+same bracket. 0.254 on the M15 fiat basket over the cached 730-day window.
+
+**served-artifact replay** — `lab.artifact`, the lab's second baseline question:
+*what would the model the bot currently runs have done on this frame?* It loads
+the `OANDA_MODEL_DIR` pair, pins its own `threshold.json` bars, and replays it
+through the same live-gated backtester as a candidate — no gate, no retrain, no
+PASS/FAIL. The report splits the frame at the artifact's recorded holdout window
+(the only rows it never saw); everything else is in-sample. *(`src/lab/artifact.py`)*
+
+**frame** — in the lab, the engineered + labelled + vetoed table the gate and
+backtest both consume (`FrameResult.df`). Building it and scoring it must use
+the same rows; the parity test pins that `feature_sets=("v3_base",)` reproduces
+`engineer_features_and_labels` row for row, plus the production tail purge.
 
 ## Scoring
 

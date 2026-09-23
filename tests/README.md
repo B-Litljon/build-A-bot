@@ -1,6 +1,7 @@
 # `tests/`
 
-**538 tests + 6 subtests, all passing** (2026-09-16, after the retrainer package split). Run with:
+**588 tests + 17 subtests, all passing** (2026-09-21, after the served-artifact
+replay landed). Run with:
 
 ```bash
 PYTHONPATH=src:. python -m pytest -q
@@ -54,6 +55,13 @@ See the root [GLOSSARY.md](../GLOSSARY.md) for domain terms.
 | `test_base_rate_benchmark.py` | 6 | The gate's edge-over-random benchmark: the macro base rate is the mean on the population given, non-finite outcomes are dropped, an unlabelled frame returns nan (never 0.0), and the report carries it per fold and pooled |
 | `test_devil_label_switch.py` | 6 | `RETRAIN_DEVIL_LABEL`: default preserves the shipping label, `macro` selects the validated one, typos warn and fall back, read per call |
 | `test_barriers.py` | 39 | Excursion labels, the quantile estimator, the monotone audit, and the artifact contract (save/load, promotion verdict, stop calibration) |
+| `test_lab_spec.py` | 8 | `FeatureSpec`: frozen, validated, and content-hashed — every field that changes a frame must move the hash |
+| `test_lab_registry.py` | 9 | Feature-family registry: unknown names raise, declared columns are what the model sees, the seed family is per-symbol and causal |
+| `test_lab_frames.py` | 5 | The parity contract — `v3_base` frame == `engineer_features_and_labels` + production tail purge, with and without the spread table |
+| `test_lab_gate.py` | 5 | Gate wrapper wiring: exact args, `RETRAIN_DEVIL_LABEL` scoped and restored, MODEL_FAMILY mismatch fails loudly |
+| `test_lab_backtest.py` | 6 | Model-aware strategy: raw-ATR units, row alignment, thresholds, live-gate funnel, per-symbol toll |
+| `test_lab_artifact.py` | 12 | Served-artifact replay: `threshold.json` precedence, CatBoost's `feature_names_`, schema-order refusal, gate-path parity, window split |
+| `test_lab_report.py` | 5 | The recon emitter's caveats (failed gate, thin population, cost table off) and its atomic write |
 
 ### Tests worth understanding before changing anything
 
