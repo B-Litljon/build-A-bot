@@ -159,10 +159,19 @@ PYTHONPATH=src:. python -m pytest tests/test_lab_stats.py tests/test_lab_momentu
 # 34 passed in 1.08s
 ```
 
-Full suite: **646 passed, 17 subtests** (baseline before this lane: 612
-passed / 17 subtests — the delta is exactly the 34 new tests).
-`python -m compileall -q src/` clean. All reported numbers recompute from the
-cached parquet via `python -m lab.momentum_crypto --json` (cache hit; the
+Full suite: **650 passed, 17 subtests** (baseline `b09fde2` in the main
+checkout: 616 passed + the same two model-pickle fixture errors; the delta is
+the 34 new tests — 17 stats + 17 momentum — and `src/lab/__init__.py` gained
+only lazy PEP-562 entries for the stats functions, so no existing test was
+altered by this lane).
+
+> Note: the model-pickle fixture issue is a gitignored-artifact problem, not
+> a code problem — `models/forex_m15_wide/*.pkl` does not exist in this
+> worktree until copied from the main checkout. Any agent re-running the
+> suite here must copy those four files first.
+
+`python -m compileall -q src/` clean. All reported numbers recompute from
+the cached parquet via `python -m lab.momentum_crypto --json` (cache hit; the
 rerun in this session reproduced every figure above to the last digit).
 
 Deterministic cases from the brief §6.4 are all in
