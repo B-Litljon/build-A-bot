@@ -23,8 +23,12 @@ MODEL_FAMILY before the CLI can apply the spec's estimator choice.
 Glossary:
     _load_spec_file -- import a user spec by path (no sys.path games, no
         network) and pull SPEC/build_spec().
-    _apply_model_family -- sets MODEL_FAMILY from the spec/flag BEFORE the
-        retrainer is imported, which is the only moment it can take effect.
+    _apply_model_family -- sets MODEL_FAMILY from the flag, the environment,
+        or the spec — in that precedence — BEFORE the retrainer is imported,
+        which is the only moment it can take effect. The env beats the spec
+        so the W4 estimator A/B can run a lightgbm-pinned seed spec under
+        catboost (the frame hash excludes gate.model_family, so both arms
+        share one cached frame).
     _resolve_spec -- --name/--spec validation and seed lookup, shared by run
         and replay.
     _cmd_replay -- the served-artifact path: no MODEL_FAMILY, no gate; loads
@@ -73,13 +77,27 @@ def _load_spec_file(path: str) -> FeatureSpec:
 
 
 def _apply_model_family(spec: FeatureSpec, explicit: str | None) -> None:
-    family = (explicit or spec.gate.model_family).strip().lower()
+    """Pin MODEL_FAMILY before the retrainer imports (it is read at import).
+
+    Precedence (W4, 2026-09-22): an explicit --model-family wins, then an
+    env-selected family (MODEL_FAMILY=catboost python -m lab.cli run ... —
+    the estimator A/B seam), then the spec's declared family. The env beats
+    the spec because a seed spec is pinned to lightgbm and the A/B needs to
+    run THAT spec under catboost; the content hash deliberately excludes
+    gate.model_family, so both arms reuse the same cached frame.
+    """
     current = os.environ.get("MODEL_FAMILY", "").strip().lower()
-    if explicit and family != spec.gate.model_family:
-        raise SystemExit(
-            f"--model-family {family!r} disagrees with the spec's "
-            f"{spec.gate.model_family!r}; the spec is the contract"
-        )
+    if explicit:
+        family = explicit.strip().lower()
+        if family != spec.gate.model_family:
+            raise SystemExit(
+                f"--model-family {family!r} disagrees with the spec's "
+                f"{spec.gate.model_family!r}; the spec is the contract"
+            )
+    elif current:
+        family = current  # env-selected A/B arm wins over the spec default
+    else:
+        family = spec.gate.model_family.strip().lower()
     if family != current:
         os.environ["MODEL_FAMILY"] = family
 
@@ -187,6 +205,42 @@ def _cmd_replay(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_ablate(args: argparse.Namespace) -> int:
+    """Feature-interaction ablation: edge(full) - edge(full - X), with CIs."""
+    spec = _resolve_spec(args)
+    command = (
+        f"PYTHONPATH=src:. python -m lab.cli ablate --spec {args.spec}"
+        if args.spec
+        else f"PYTHONPATH=src:. python -m lab.cli ablate --name {args.name}"
+    )
+
+    # MODEL_FAMILY must be set before anything imports the retrainer.
+    _apply_model_family(spec, args.model_family)
+
+    from lab.ablate import ablate
+    from lab.experiments import DEFAULT_FRAME_CACHE, ExperimentRunner
+    from lab.report import DEFAULT_REPORT_DIR, write_ablation_report
+
+    runner = ExperimentRunner(
+        bar_cache_dir=Path(args.bar_cache_dir or "analysis_cache/strategy_matrix"),
+        frame_cache_dir=Path(args.frame_cache_dir or DEFAULT_FRAME_CACHE),
+        refresh_bars=args.refresh_bars,
+        use_frame_cache=not args.no_frame_cache,
+    )
+    result = ablate(spec, runner=runner)
+    print(json.dumps(result.summary(), indent=2, default=str))
+
+    if not args.no_report:
+        path = write_ablation_report(
+            result,
+            out_dir=Path(args.report_dir or DEFAULT_REPORT_DIR),
+            command=command,
+        )
+        print(f"\nReport: {path}", file=sys.stderr)
+
+    return 0
+
+
 def _add_spec_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--name", help="seed spec name (see `list`)")
     parser.add_argument("--spec", help="path to a Python file defining SPEC/build_spec()")
@@ -197,6 +251,7 @@ def _add_spec_args(parser: argparse.ArgumentParser) -> None:
         "--refresh-bars", action="store_true", help="re-fetch bars from the provider"
     )
     parser.add_argument("--frame-cache-dir", default=None)
+    parser.add_argument("--bar-cache-dir", default=None)
     parser.add_argument("--report-dir", default=None)
     parser.add_argument("--no-report", action="store_true")
 
@@ -233,11 +288,24 @@ def main(argv=None) -> int:
         help="override the report filename slug (default: served-artifact-<spec>)",
     )
 
+    ablate = sub.add_parser(
+        "ablate",
+        help="edge(full cocktail) - edge(cocktail - X) per family, with CIs",
+    )
+    _add_spec_args(ablate)
+    ablate.add_argument(
+        "--model-family",
+        default=None,
+        help="must match the spec; set before the retrainer imports (default: spec's)",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "list":
         return _cmd_list()
     if args.command == "replay":
         return _cmd_replay(args)
+    if args.command == "ablate":
+        return _cmd_ablate(args)
     return _cmd_run(args)
 
 

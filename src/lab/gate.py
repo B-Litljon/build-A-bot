@@ -21,7 +21,9 @@ Glossary:
     require_model_family -- MODEL_FAMILY is read when the retrainer is
         imported, so the lab refuses a spec that disagrees with the loaded
         value instead of silently scoring the wrong estimator. Launch with
-        MODEL_FAMILY=<family> to select it.
+        MODEL_FAMILY=<family> to select it. The CLI run/ablate path passes
+        allow_env_override=True: an env-selected family IS the run's arm
+        (the W4 estimator A/B launches a lightgbm seed spec under catboost).
 """
 
 from __future__ import annotations
@@ -56,16 +58,35 @@ class GateResult:
         return self.report.edge_over_random
 
 
-def require_model_family(declared: str) -> str:
-    """Fail loudly when the spec's estimator is not the loaded one."""
+def require_model_family(declared: str, *, allow_env_override: bool = False) -> str:
+    """Fail loudly when the spec's estimator is not the loaded one.
+
+    With ``allow_env_override`` (the CLI run/ablate path), an env-selected
+    MODEL_FAMILY is the run's own arm — the estimator A/B (W4) launches a
+    lightgbm-pinned seed spec under ``MODEL_FAMILY=catboost`` and the guard
+    must accept that instead of refusing it. The override is still LOUD: the
+    returned family (what the report records) is the loaded one, and the
+    frame hash excludes the estimator entirely, so the two arms share one
+    cached frame by construction. Without the flag the original contract
+    stands: a spec file naming an estimator must match the loaded retrainer.
+    """
     from core.retrainer._common import MODEL_FAMILY as loaded
 
     wanted = declared.strip().lower()
     if wanted != loaded:
-        raise RuntimeError(
-            f"spec requests model_family={wanted!r} but the retrainer was imported "
-            f"with MODEL_FAMILY={loaded!r}. MODEL_FAMILY is read at import time — "
-            f"relaunch with MODEL_FAMILY={wanted}."
+        if not allow_env_override:
+            raise RuntimeError(
+                f"spec requests model_family={wanted!r} but the retrainer was imported "
+                f"with MODEL_FAMILY={loaded!r}. MODEL_FAMILY is read at import time — "
+                f"relaunch with MODEL_FAMILY={wanted}."
+            )
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "spec %r declares model_family=%r but the process was launched with "
+            "MODEL_FAMILY=%r — running the %s arm (env-selected estimator A/B); "
+            "the frame is shared either way (the frame hash excludes the estimator)",
+            "<spec>", wanted, loaded, loaded,
         )
     return loaded
 
@@ -102,7 +123,7 @@ def run_gate(frame, spec, *, n_folds: Optional[int] = None) -> GateResult:
     from core.retrainer._common import get_hyperparameters
     from core.retrainer._gate import validate_candidate
 
-    family = require_model_family(spec.gate.model_family)
+    family = require_model_family(spec.gate.model_family, allow_env_override=True)
     angel_params, devil_params = get_hyperparameters(spec.asset_class)
     fold_count = int(n_folds if n_folds is not None else spec.gate.n_folds)
 

@@ -84,7 +84,7 @@ tests) or dormant experiments kept for reference.
 | [`core/`](src/core/README.md) | Two unrelated things: shared types + the Discord notifier, **and** `retrainer/`, the entire training and promotion pipeline. | mixed |
 | [`utils/`](src/utils/README.md) | Bar aggregation. One live module. | live |
 | [`analysis/`](src/analysis/README.md) | Offline diagnostics, run by hand. Targets the legacy Alpaca stack. | never live |
-| [`lab/`](src/lab/README.md) | The feature lab: candidate features scored by the retrainer's own promotion gate. Built 2026-09-21. | never live |
+| [`lab/`](src/lab/README.md) | The feature lab: candidate features scored by the retrainer's own promotion gate. Built 2026-09-21; v2 (state-hashed cache, gate-list threading, `ablate`, estimator A/B) 2026-09-23. | never live |
 
 ---
 
@@ -436,8 +436,40 @@ feature families, bracket geometry, label knobs, cost-table switch, estimator
 family. Frozen so a change is a new spec, never a mutation.
 
 **content hash** — the spec's SHA-256 (16 hex chars), used as the frame-cache
-key. It covers the spread table's bytes and the frame-affecting environment, so
-a stale cache hit is impossible by construction.
+key. It covers the spread table's bytes, the frame-affecting environment, every
+registered family's (name, version) pair, and the RESOLVED state of any extra
+generator — a stale cache hit is impossible by construction. It deliberately
+EXCLUDES `gate.model_family`/`n_folds` (run provenance: they change the
+estimator, not the frame), which is what lets the W4 estimator A/B reuse one
+cached frame. *(`src/lab/spec.py`)*
+
+**family version** — the required `version: int` (>= 1) every
+`register_family`/`register_feature` call must pass. Folded into the content
+hash: bump it whenever anything inside the family's generators changes frame
+contents (a lookback constant, a formula), or cached frames from the old
+behaviour are silently reused. *(`src/lab/registry.py`)*
+
+**generator state** — an extra (unregistered) generator's resolved
+`__dict__`, hashed alongside its class id into the content hash. Two instances
+of one class with different constructor args hash differently; a generator
+whose state is not JSON-serializable raises from `content_hash()` rather than
+degrading to a class-name-only hash. *(`src/lab/spec.py`)*
+
+**ablation (lab ablate)** — `lab.ablate`, the feature-INTERACTION question:
+edge(full cocktail) − edge(cocktail − X) per registered family, with only
+`feature_sets` varying across the N+1 arms (labels, veto, geometry, data and
+cost table identical). Each delta carries a Clopper-Pearson interval on the
+underlying win-rate difference; a delta consistent with zero on thin pooled
+trades is never a drop decision. *(`src/lab/ablate.py`)*
+
+**estimator A/B (MODEL_FAMILY arm)** — running one identical spec under two
+estimator families via the retrainer's `MODEL_FAMILY` seam
+(`core/retrainer/_common.py:410`): `MODEL_FAMILY=catboost python -m lab.cli
+run --name <seed>`. The env-selected family is the run's arm (the CLI's
+precedence: `--model-family` flag > env > the spec's declared family), the
+frame is shared by construction (the frame hash excludes the estimator), and
+the frame's feature-list contract is the gate's `GateResult` lists. Measured
+and closed 2026-09-23: CatBoost scored worse than random on the same frame.
 
 **feature family** — a registered name -> generators + model-facing columns. A
 new candidate feature is one `BaseFeatureGenerator` class plus a registration;
@@ -464,7 +496,6 @@ PASS/FAIL. The report splits the frame at the artifact's recorded holdout window
 backtest both consume (`FrameResult.df`). Building it and scoring it must use
 the same rows; the parity test pins that `feature_sets=("v3_base",)` reproduces
 `engineer_features_and_labels` row for row, plus the production tail purge.
-
 ## Scoring
 
 **Brier score** — mean squared error between predicted probabilities and what

@@ -9,17 +9,24 @@ Built-ins are registered lazily (their modules import talib/lightgbm), which
 keeps this module import-light: the registry contract is dependency-free.
 
 Glossary:
-    FeatureFamily -- name -> (build, columns, description). ``build(spec,
+    FeatureFamily -- name -> (build, columns, description, version). ``build(spec,
         alpha_table)`` returns generator INSTANCES; ``columns(spec,
         alpha_table)`` returns the column names the model may see, which is a
         subset of what the generators append (bb_upper, sma_50, htf_rsi_14 and
         friends are intermediates or dead features, deliberately not model
         inputs).
+    version -- a family's required content version (int >= 1), folded into
+        FeatureSpec.content_hash: bump it whenever anything inside the family's
+        generators changes frame contents (a lookback constant, a formula), or
+        a cached frame from the old behaviour is silently reused. A missing
+        version fails registration loudly.
     register_family -- functional registration for families whose generators
         take configuration.
     register_feature -- decorator for a no-argument generator class; columns
         come from the class's ``feature_cols`` attribute or the ``columns``
         argument.
+    family_version -- the registered version for one family name, raising
+        KeyError on an unknown name (the same loud contract as get_generators).
     get_generators -- expand a spec's feature_sets (plus extra_generators) into
         the ordered generator list, raising on an unknown family rather than
         silently skipping it (a silent drop would score a different experiment
@@ -50,9 +57,21 @@ class FeatureFamily:
     build: BuildFn
     columns: ColumnsFn
     description: str = ""
+    version: int = 1
 
 
 _REGISTRY: Dict[str, FeatureFamily] = {}
+
+
+def _require_version(version: int) -> int:
+    """Validate one family version: an int >= 1, no defaults, no floats."""
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError(
+            f"feature family version must be an int, got {type(version).__name__}"
+        )
+    if version < 1:
+        raise ValueError(f"feature family version must be >= 1, got {version}")
+    return version
 
 
 def register_family(
@@ -61,19 +80,42 @@ def register_family(
     build: BuildFn,
     columns: ColumnsFn,
     description: str = "",
+    version: int = 0,
     replace: bool = False,
 ) -> FeatureFamily:
-    """Register a feature family; duplicate names raise unless ``replace``."""
+    """Register a feature family; duplicate names raise unless ``replace``.
+
+    ``version`` is REQUIRED (pass an int >= 1): it is folded into
+    FeatureSpec.content_hash, so bumping it invalidates every cached frame
+    built by the previous behaviour of this family's generators.
+    """
     if not name.strip():
         raise ValueError("feature family name must be non-empty")
+    _require_version(version)
     if name in _REGISTRY and not replace:
         raise ValueError(
             f"feature family {name!r} is already registered "
             f"({_REGISTRY[name].description or 'no description'})"
         )
-    family = FeatureFamily(name=name, build=build, columns=columns, description=description)
+    family = FeatureFamily(
+        name=name,
+        build=build,
+        columns=columns,
+        description=description,
+        version=version,
+    )
     _REGISTRY[name] = family
     return family
+
+
+def family_version(name: str) -> int:
+    """The registered content version for one family; KeyError when unknown."""
+    family = _REGISTRY.get(name)
+    if family is None:
+        raise KeyError(
+            f"unknown feature family {name!r}; registered: {sorted(_REGISTRY)}"
+        )
+    return family.version
 
 
 def register_feature(
@@ -81,6 +123,7 @@ def register_feature(
     *,
     columns: Optional[Tuple[str, ...]] = None,
     description: str = "",
+    version: int = 0,
     replace: bool = False,
 ):
     """
@@ -88,6 +131,7 @@ def register_feature(
 
     ``columns`` may also live on the class as a ``feature_cols`` attribute.
     Generators that need constructor configuration should use register_family.
+    ``version`` is required (int >= 1) and feeds FeatureSpec.content_hash.
     """
 
     def decorator(cls: type) -> type:
@@ -105,6 +149,7 @@ def register_feature(
             build=lambda spec, table: [cls()],
             columns=lambda spec, table: tuple(declared),
             description=description or (doc_lines[0] if doc_lines else f"family {name}"),
+            version=version,
             replace=replace,
         )
         return cls
@@ -193,6 +238,7 @@ register_family(
     "v3_base",
     build=_build_v3_base,
     columns=_cols_v3_base,
+    version=1,
     description=(
         "The production V3 stack (Base + HTF + Session + Cost). Its columns are "
         "the retrainer's BASE_FEATURE_COLS (+ cost_ratio with the spread table)."

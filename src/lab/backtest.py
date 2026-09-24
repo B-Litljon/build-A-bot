@@ -29,6 +29,10 @@ Glossary:
     _replay_models -- the shared per-symbol loop + pooling, so the gate and
         artifact paths cannot drift apart.
     run_model_backtest -- per-symbol backtests + a pooled summary, gate models.
+        Threads the gate's OWN feature lists (GateResult.angel_features /
+        devil_features) into the replay — never a re-derivation from the
+        frame's columns, which silently diverge once HMM features append
+        HMM_OUTPUT_COLS to the trained schema (core/retrainer/_gate.py:606).
     run_artifact_backtest -- the same replay for a served artifact (duck-typed
         to avoid an import cycle with lab.artifact).
     LabBacktestReport -- pooled net/gross EV in R, win rate, net PF, drawdown
@@ -242,6 +246,12 @@ def run_model_backtest(frame, gate, spec) -> LabBacktestReport:
     Backtest the gate's models over the frame, symbol by symbol, live-gated.
 
     ``frame`` is the FrameResult the gate scored; ``gate`` is its GateResult.
+    The gate's OWN feature lists (``angel_features`` / ``devil_features``) are
+    threaded through — never re-derived from ``frame.feature_cols``. When HMM
+    regime features are enabled, the retrainer appends HMM_OUTPUT_COLS to its
+    feature space (core/retrainer/_gate.py:606), so the frame-derived list
+    would silently disagree with the trained schema; the gate's list is the
+    fit-time truth.
     """
     return _replay_models(
         frame,
@@ -250,6 +260,8 @@ def run_model_backtest(frame, gate, spec) -> LabBacktestReport:
         devil_model=gate.devil_model,
         angel_threshold=gate.report.production_angel_threshold,
         devil_threshold=gate.production_threshold,
+        angel_feature_cols=tuple(gate.angel_features),
+        devil_feature_cols=tuple(gate.devil_features),
     )
 
 

@@ -63,6 +63,15 @@ class TestFeatureSpec(unittest.TestCase):
         self.assertEqual(len(a.content_hash()), 16)
 
     def test_every_frame_affecting_change_moves_the_hash(self):
+        import lab.registry as registry
+
+        # The unregistered-family variant needs the family to exist for the
+        # version lookup; register it under a throwaway name for this test.
+        registry.register_feature(
+            "other_family", columns=("of_one",), version=1
+        )(_ExtraGen)
+        self.addCleanup(registry._REGISTRY.pop, "other_family", None)
+
         base = FeatureSpec(name="base")
         variants = {
             "geometry": FeatureSpec(name="base", geometry=GeometrySpec(1.0, 2.0, 30)),
@@ -83,6 +92,15 @@ class TestFeatureSpec(unittest.TestCase):
                 self.assertNotEqual(
                     baseline, spec.content_hash(), f"{label} did not change the hash"
                 )
+
+    def test_estimator_config_is_excluded_from_the_frame_hash(self):
+        """model_family/n_folds change the estimator, not the frame — W4's A/B
+        must reuse the same cached frame by construction."""
+        a = FeatureSpec(name="x")
+        b = FeatureSpec(name="x", gate=GateConfig(model_family="catboost"))
+        c = FeatureSpec(name="x", gate=GateConfig(n_folds=5))
+        self.assertEqual(a.content_hash(), b.content_hash())
+        self.assertEqual(a.content_hash(), c.content_hash())
 
     def test_schema_version_participates_in_the_hash(self):
         """A serialization change must invalidate every cached frame."""
@@ -127,7 +145,153 @@ class TestFeatureSpec(unittest.TestCase):
     def test_gate_config_is_part_of_the_spec(self):
         a = FeatureSpec(name="x")
         b = FeatureSpec(name="x", gate=GateConfig(model_family="catboost"))
+        self.assertNotEqual(a, b)
+
+
+class _ConfigurableGen(BaseFeatureGenerator):
+    """Carries constructor state into generate() — the W1 hash contract."""
+
+    feature_cols = ("cfg_one",)
+
+    def __init__(self, scale: float, lookback: int = 5):
+        self.scale = scale
+        self.lookback = lookback
+
+    def generate(self, df):
+        return df.with_columns(
+            (pl.col("close") * self.scale).alias("cfg_one")
+        )
+
+
+class _UnhashableGen(BaseFeatureGenerator):
+    feature_cols = ("unh_one",)
+
+    def __init__(self):
+        self.handle = object()  # not JSON-serializable
+
+    def generate(self, df):
+        return df
+
+
+class TestGeneratorStateHashing(unittest.TestCase):
+    """W1: the frame-cache key must cover generator state, not just class ids."""
+
+    def test_registered_family_version_participates_in_the_hash(self):
+        import lab.registry as registry
+
+        spec = FeatureSpec(name="ver", feature_sets=("ver_test",))
+        with self.assertRaises(KeyError):
+            spec.content_hash()  # unregistered family must be loud
+
+        registry.register_feature("ver_test", columns=("v_one",), version=1)(
+            _ExtraGen
+        )
+        with_version_1 = spec.content_hash()
+        self.assertEqual(registry.family_version("ver_test"), 1)
+
+        # Bump the version — the exact act of editing a lookback inside the
+        # generator — and the same spec must hash to a NEW cache key.
+        registry.register_feature(
+            "ver_test", columns=("v_one",), version=2, replace=True
+        )(_ExtraGen)
+        self.assertNotEqual(with_version_1, spec.content_hash())
+
+        # Restore for other tests in this process.
+        registry.register_feature(
+            "ver_test", columns=("v_one",), version=1, replace=True
+        )(_ExtraGen)
+        self.assertEqual(with_version_1, spec.content_hash())
+
+    def test_registration_without_a_version_raises(self):
+        import lab.registry as registry
+
+        try:
+            registry.register_feature("no_version", columns=("nv_one",))(_ExtraGen)
+        except (TypeError, ValueError):
+            pass
+        else:
+            self.fail("registration without a version must raise")
+        finally:
+            registry._REGISTRY.pop("no_version", None)
+
+    def test_configured_generator_args_move_the_hash(self):
+        a = FeatureSpec(
+            name="cfg", extra_generators=(_ConfigurableGen(scale=1.0),)
+        )
+        b = FeatureSpec(
+            name="cfg", extra_generators=(_ConfigurableGen(scale=2.0),)
+        )
+        c = FeatureSpec(
+            name="cfg", extra_generators=(_ConfigurableGen(scale=1.0),)
+        )
         self.assertNotEqual(a.content_hash(), b.content_hash())
+        self.assertEqual(a.content_hash(), c.content_hash())
+
+    def test_same_class_different_args_do_not_collide(self):
+        """The core W1 bug: two instances of one class hashed identically."""
+        fast = _ConfigurableGen(scale=1.0, lookback=10)
+        slow = _ConfigurableGen(scale=1.0, lookback=50)
+        a = FeatureSpec(name="pair", extra_generators=(fast,))
+        b = FeatureSpec(name="pair", extra_generators=(slow,))
+        self.assertNotEqual(a.content_hash(), b.content_hash())
+
+    def test_non_serializable_generator_state_raises(self):
+        spec = FeatureSpec(
+            name="unh", extra_generators=(_UnhashableGen(),)
+        )
+        with self.assertRaises(TypeError):
+            spec.content_hash()
+
+    def test_dataclass_generator_state_moves_the_hash(self):
+        @dataclasses.dataclass
+        class DataclassGen(BaseFeatureGenerator):
+            feature_cols = ("dc_one",)
+            window: int = 20
+
+            def generate(self, df):
+                return df
+
+        a = FeatureSpec(name="dc", extra_generators=(DataclassGen(window=20),))
+        b = FeatureSpec(name="dc", extra_generators=(DataclassGen(window=50),))
+        self.assertNotEqual(a.content_hash(), b.content_hash())
+
+    def test_distinct_dataclass_generator_classes_with_same_fields_do_not_collide(self):
+        @dataclasses.dataclass
+        class GenOne(BaseFeatureGenerator):
+            feature_cols = ("dc_one",)
+            window: int = 20
+
+            def generate(self, df):
+                return df
+
+        @dataclasses.dataclass
+        class GenTwo(BaseFeatureGenerator):
+            feature_cols = ("dc_one",)
+            window: int = 20
+
+            def generate(self, df):
+                return df
+
+        a = FeatureSpec(name="dc", extra_generators=(GenOne(window=20),))
+        b = FeatureSpec(name="dc", extra_generators=(GenTwo(window=20),))
+        self.assertNotEqual(
+            a.content_hash(),
+            b.content_hash(),
+            "Two distinct dataclass generator classes must not collide even if field values match",
+        )
+
+    def test_unhashable_dataclass_generator_state_raises(self):
+        @dataclasses.dataclass
+        class UnhashableDataclass(BaseFeatureGenerator):
+            feature_cols = ("unh_dc",)
+            unhashable: object = dataclasses.field(default_factory=object)
+
+            def generate(self, df):
+                return df
+
+        spec = FeatureSpec(name="dc_unh", extra_generators=(UnhashableDataclass(),))
+        with self.assertRaises(TypeError):
+            spec.content_hash()
 
 
 class _ExtraGenWithoutCols(BaseFeatureGenerator):

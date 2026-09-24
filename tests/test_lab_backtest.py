@@ -25,6 +25,7 @@ from unittest import mock
 
 import numpy as np
 import polars as pl
+from polars.exceptions import ColumnNotFoundError
 
 project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root / "src"))
@@ -158,12 +159,14 @@ class TestRunModelBacktest(unittest.TestCase):
             alpha_table=alpha_table,
         )
 
-    def _gate(self):
+    def _gate(self, angel_features=("f",), devil_features=("f", "angel_prob")):
         return SimpleNamespace(
             angel_model=ConstantModel(1.0),
             devil_model=ConstantModel(1.0),
             production_threshold=0.5,
             report=SimpleNamespace(production_angel_threshold=0.5),
+            angel_features=list(angel_features),
+            devil_features=list(devil_features),
         )
 
     def test_trades_are_taken_with_gates_off(self):
@@ -209,6 +212,57 @@ class TestRunModelBacktest(unittest.TestCase):
         # The measured alpha (0.9) is far above the flat default toll, so the
         # cost-priced run must book a strictly worse net EV.
         self.assertLess(with_table.net_ev_r, flat.net_ev_r)
+
+    def test_uses_the_gate_own_feature_lists_not_frame_columns(self):
+        """W2: a GateResult feature list is the fit-time truth. A synthetic
+        HMM stand-in (present in the frame's df but ABSENT from
+        frame.feature_cols — exactly how the retrainer's fold-local HMM cols
+        behave) must be consumed as the gate declares, with no silent
+        fallback to the frame-derived list."""
+        spec = FeatureSpec(name="bt", symbols=("GBP_JPY",), feature_sets=("stub",))
+        n = 120
+        df = backtest_frame(n).with_columns(
+            # Alternating 1.0/0.0 stand-in regime column: an echo model on it
+            # proposes only on even bars. frame.feature_cols omits it — so any
+            # frame-derived feature list would miss it and score differently.
+            pl.Series("hmm_regime_prob_1", [1.0, 0.0] * (n // 2))
+        )
+        frame = self._frame_result(df)
+        gate = self._gate(
+            angel_features=["hmm_regime_prob_1", "f"],
+            devil_features=["hmm_regime_prob_1", "f", "angel_prob"],
+        )
+        gate.angel_model = FeatureEchoModel("hmm_regime_prob_1")
+
+        with mock.patch.dict(os.environ, {"RISK_CHOP_FILTER_ENABLED": "0"}):
+            report = run_model_backtest(frame, gate, spec)
+        # The echo model scored the gate-declared FIRST column
+        # 'hmm_regime_prob_1' (alternating 1.0/0.0) — proposals on half the
+        # bars. The frame-derived comparison arm re-derives ("f",) (all 1.0)
+        # and trades on every eligible bar: one MORE trade. The gate's list,
+        # not the frame's, is what the replay consumed.
+        self.assertGreater(report.total_trades, 0)
+        fallback_gate = self._gate(
+            angel_features=["f"], devil_features=["f", "angel_prob"]
+        )
+        # The frame-derived arm: the re-derivation this test guards against
+        # would produce exactly this list ("f", all 1.0) and score every
+        # eligible bar — one more trade than the gate-declared alternating arm.
+        fallback_gate.angel_model = FeatureEchoModel("f")
+        with mock.patch.dict(os.environ, {"RISK_CHOP_FILTER_ENABLED": "0"}):
+            fallback = run_model_backtest(frame, fallback_gate, spec)
+        self.assertLess(report.total_trades, fallback.total_trades)
+
+        # And the loud path: the gate names a column the frame truly lacks —
+        # that must raise, never silently shrink to the frame's columns.
+        frame_short = self._frame_result(backtest_frame())
+        gate_missing = self._gate(
+            angel_features=["f", "hmm_missing_col"],
+            devil_features=["f", "hmm_missing_col", "angel_prob"],
+        )
+        with self.assertRaises(ColumnNotFoundError):
+            with mock.patch.dict(os.environ, {"RISK_CHOP_FILTER_ENABLED": "0"}):
+                run_model_backtest(frame_short, gate_missing, spec)
 
 
 if __name__ == "__main__":

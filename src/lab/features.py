@@ -94,6 +94,7 @@ class LabMicrostructureFeatures(BaseFeatureGenerator):
 
 register_feature(
     "microstructure",
+    version=1,
     description=(
         "Seed candidate family: short-horizon range position, return stretch, "
         "up/down asymmetry, and lag-1 autocorrelation (needs v3_base first)."
