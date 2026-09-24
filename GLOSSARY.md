@@ -519,6 +519,53 @@ in the top quintile. Since the target *is* a quintile, random guessing scores
 
 **NDCG** — a whole-ordering score that rewards good names placed near the top.
 
+## Falsification statistics and earnings anomalies (Lane 2, 2026-09-24)
+
+**embargo** — in walk-forward validation, a gap left between the train and
+test/validation windows so the training tail cannot overlap the future the
+forward-looking label measures. The monthly investor lane uses a 60-TRADING-day
+embargo (its label looks 60 days ahead); the Lane-2 weekly lane uses a
+10-CALENDAR-day *atomic* embargo (its label looks 5 trading days ahead), asserted
+per fold as `train.max(date) + 10d < val.min(date)` with NO rows allowed to fall
+in the gap. See `scripts/investor_train_model_weekly.py`.
+
+**point-in-time (PIT) filter** — the rule that a feature row dated `t` may only
+use a fundamental whose `publish_date ≤ t`. Quarterly filings describe a fiscal
+quarter but only become knowable when *published* (the 10-Q lag is 1–63 days,
+median 33, in the SimFin caches). Using the fiscal-quarter date instead of the
+publish date is the classic look-ahead leak. Enforced by the Lane-2 pipeline; a
+future-dated match raises. See `scripts/investor_feature_pipeline_weekly.py`.
+
+**SUE (Standardized Unexpected Earnings)** — the earnings surprise, normalized:
+`(EPS_q − E[EPS_q]) / std(EPS_q − E[EPS_q])`, with the expectation here a
+seasonal random walk (the same fiscal quarter one year prior) over an 8-quarter
+trailing window, min 4. EPS is `Net Income (Common) / Shares (Diluted)` from the
+SimFin quarterly income cache. Point-in-time safe only when every input filing
+has `publish_date ≤ t` (see above).
+
+**PEAD (Post-Earnings Announcement Drift)** — the documented tendency for prices
+to keep drifting in the direction of an earnings surprise for days after the
+announcement; the anomaly SUE is built to harvest. The Lane-2 finding is that
+PEAD/SUE adds little to the ranker here — PEAD-only excess measured +18.6
+bps/month (t=0.49, indistinguishable from zero) against the base factors'
++184 bps/month; see `llm_reports/recons/2026-09-24_lab-equity-factor-pead.md`.
+
+**DSR (Deflated Sharpe Ratio)** — Bailey–López de Prado (2014). The probability
+(0–1) that an observed Sharpe is genuinely positive after subtracting the
+expected max Sharpe of `n_trials` zero-skill variants. Lane gates use `DSR >
+0.95`. Implemented once in `src/lab/stats.py` (shared by Lanes 1–5).
+
+**HLZ haircut Sharpe** — Harvey, Liu, Zhu (2016). The observed Sharpe minus a
+multiple-testing buffer sized by trial count and the Sharpe's sampling variance.
+`hlz_haircut_sharpe` returns the adjusted Sharpe; `hlz_t_stat` puts it on the
+t-scale the Lane-2 gate thresholds (`t > 3.0`). In `src/lab/stats.py`.
+
+**PBO (Probability of Backtest Overfitting)** — Bailey, Borwein, López de Prado,
+Zhu (2014), via Combinatorially Symmetric Cross-Validation (CSCV). The fraction
+of train/test splits whose best-in-sample strategy ranks in the worse half out
+of sample. `PBO < 0.50` is the Lane gate; a no-signal (zeros) matrix returns
+exactly 0.5 (a coin flip). In `src/lab/stats.py`.
+
 ## Diagnosing a quiet model
 
 **drift** — the model's inputs or its calibration have moved away from what it

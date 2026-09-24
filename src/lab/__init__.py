@@ -51,6 +51,11 @@ _LAZY = {
     "render_artifact_report": "lab.report",
     "write_artifact_report": "lab.report",
     "seed_specs": "lab.specs",
+    "deflated_sharpe_ratio": "lab.stats",
+    "expected_max_sharpe": "lab.stats",
+    "cscv_pbo": "lab.stats",
+    "hlz_haircut_sharpe": "lab.stats",
+    "hlz_t_stat": "lab.stats",
     "main": "lab.cli",
 }
 

@@ -37,4 +37,5 @@ message, claims marked VERIFIED / ASK / OFFER / BLOCKER / DECIDED.
 | Thread | Topic | State |
 |---|---|---|
 | `2026-09-14_barrier-live-seam.md` | Quantile barrier producer ↔ consumer seam (retrainer artifacts, `MLStrategy` payload, `RiskManager` substitution) | CLOSED as a feature — 16 blocks; the decision view is [`recons/2026-09-14_session-evidence-and-options.md`](../recons/2026-09-14_session-evidence-and-options.md) |
+| `2026-09-24_quant-lanes.md` | The five parallel 2026-09-24 quant lanes (crypto / equity PEAD / forex RV / option var / falsification) and the shared `src/lab/stats.py` contract | OPEN |
 

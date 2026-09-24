@@ -125,6 +125,60 @@ basket.
 
 ---
 
+## Lane-2 weekly rebase + PEAD (research-only, 2026-09-24)
+
+Three **parallel** scripts on branch `lane/equity-factor-pead`. They re-target
+the same 96-name universe to a **5-trading-day** hold with ISO-week ranking
+groups and add a point-in-time-safe PEAD/SUE signal, evaluated under stricter
+falsification gates (DSR / HLZ / CSCV-PBO) than the monthly lane. **None of
+these is scheduled, wired into cron, or imported by the live lane.**
+
+### `investor_feature_pipeline_weekly.py`
+Same 13 present cross-sectional factors as the monthly pipeline (the raw
+parquet has no `EBITDA` column, so `ebitda_margin` is absent — matching
+production, which likewise trained without it) **plus** `sue`,
+`days_since_earnings`, and a `days_until_earnings` **prefilter-only** field.
+Materializes `data/processed/earnings_calendar.parquet`
+(`[symbol, earnings_date, eps_reported, publish_date, source]`, atomic) from
+the SimFin quarterly caches' own fully-populated `Publish Date` column — no
+announcement-date reconstruction is needed. Target is `fwd_log_ret_5d` grouped
+into quintile labels per ISO week. Hard invariant: every fundamental consumed
+at date `t` has `publish_date ≤ t` (enforced; a violation raises).
+
+- **Reads:** `data/raw/v4_investor_data.parquet`,
+  `data/raw/simfin_cache/us-{income,balance}-quarterly.csv`.
+- **Writes:** `data/processed/earnings_calendar.parquet`,
+  `data/processed/v4_weekly_{training,inference}_features.parquet` (`--inference`).
+
+### `investor_train_model_weekly.py`
+LightGBM `lambdarank` (`ndcg_at=[5,10]`, depth 6, leaves 31, lr 0.05,
+feature_fraction 0.9, `deterministic`, `random_state=42`) under a **purged
+group time-series CV** with a **10-CALENDAR-day atomic embargo** — it asserts
+`train.max(date) + 10d < val.min(date)` per fold. Drops pre-announcement rows
+(`0 ≤ days_until_earnings ≤ 2`) before grouping. Gates: excess ≥ +80 bps/month
+vs equal-weight, DSR > 0.95, HLZ t > 3.0, PBO < 0.50 — the stats from
+`src/lab/stats.py`. Always writes the metrics sidecar (falsification is the
+deliverable); only writes the model artifact on a gate PASS. Exit 0 pass / 2
+reject / 1 error.
+
+- **Reads:** `data/processed/v4_weekly_training_features.parquet`,
+  `data/raw/v4_investor_data.parquet` (closing prices for the excess gate).
+- **Writes:** `models/v4_investor_weekly_lgbm.metrics.json` (always, atomic);
+  `models/v4_investor_weekly_lgbm.txt` (gate PASS only).
+
+### `portfolio_orchestrator_weekly.py`
+Research-only weekly ranker/rebalancer. Reuses the production lane's Alpaca
+execution helpers by import. **Default is a dry run** (the ranking is the
+deliverable; no credentials needed); `--live` opts into paper orders. Refuses
+to run if the trainer didn't produce a model (i.e. the gate rejected). **Not
+scheduled; do not add to cron.**
+
+- **Reads:** `data/processed/v4_weekly_inference_features.parquet`,
+  `models/v4_investor_weekly_lgbm.txt`.
+- **Writes:** logs (`--dry-run`); broker orders (`--live`).
+
+---
+
 ## 2. Diagnostics & calibration
 
 ### `probe_model.py` — "the bot hasn't traded in days, is it broken?"
