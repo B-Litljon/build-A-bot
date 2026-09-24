@@ -119,6 +119,8 @@ def fake_gate():
         devil_model=ConstantModel(1.0),
         production_threshold=0.5,
         report=SimpleNamespace(production_angel_threshold=0.5),
+        angel_features=["f"],
+        devil_features=["f", "angel_prob"],
     )
 
 

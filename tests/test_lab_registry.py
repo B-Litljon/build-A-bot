@@ -34,13 +34,50 @@ class _OneCol(BaseFeatureGenerator):
 
 
 class TestRegistryMechanics(unittest.TestCase):
+    def tearDown(self):
+        for name in (
+            "dup_test",
+            "unlisted_test",
+            "dedupe_test",
+            "version_test",
+            "no_version_test",
+        ):
+            registry._REGISTRY.pop(name, None)
+
     def test_duplicate_registration_raises(self):
-        registry.register_feature("dup_test", columns=("x",))(type("Dup", (_OneCol,), {}))
+        registry.register_feature("dup_test", columns=("x",), version=1)(type("Dup", (_OneCol,), {}))
         with self.assertRaises(ValueError):
-            registry.register_feature("dup_test", columns=("x",))(type("Dup2", (_OneCol,), {}))
-        registry.register_feature("dup_test", columns=("x",), replace=True)(
+            registry.register_feature("dup_test", columns=("x",), version=1)(type("Dup2", (_OneCol,), {}))
+        registry.register_feature("dup_test", columns=("x",), version=1, replace=True)(
             type("Dup3", (_OneCol,), {})
         )
+
+    def test_registration_requires_a_version(self):
+        with self.assertRaises(ValueError):
+            registry.register_feature("no_version_test", columns=("x",))(_OneCol)
+        with self.assertRaises(TypeError):
+            registry.register_feature("no_version_test", columns=("x",), version="2")(
+                _OneCol
+            )
+        with self.assertRaises(ValueError):
+            registry.register_feature("no_version_test", columns=("x",), version=0)(
+                _OneCol
+            )
+        with self.assertRaises(ValueError):
+            registry.register_feature("no_version_test", columns=("x",), version=-1)(
+                _OneCol
+            )
+        # bool is an int subclass — reject it explicitly.
+        with self.assertRaises(TypeError):
+            registry.register_feature("no_version_test", columns=("x",), version=True)(
+                _OneCol
+            )
+
+    def test_family_version_resolves_and_raises_on_unknown(self):
+        registry.register_feature("version_test", columns=("x",), version=7)(_OneCol)
+        self.assertEqual(registry.family_version("version_test"), 7)
+        with self.assertRaises(KeyError):
+            registry.family_version("never_registered")
 
     def test_missing_family_raises_not_skips(self):
         spec = FeatureSpec(name="missing", feature_sets=("does_not_exist",))
@@ -51,11 +88,11 @@ class TestRegistryMechanics(unittest.TestCase):
 
     def test_columns_come_from_the_declaration_not_the_instance(self):
         spec = FeatureSpec(name="unlisted", feature_sets=("unlisted_test",))
-        registry.register_feature("unlisted_test", columns=("never_produced",))(_OneCol)
+        registry.register_feature("unlisted_test", columns=("never_produced",), version=1)(_OneCol)
         self.assertEqual(registry.feature_columns(spec, None), ["never_produced"])
 
     def test_extra_generator_order_and_dedupe(self):
-        registry.register_feature("dedupe_test", columns=("one_col", "shared"))(_OneCol)
+        registry.register_feature("dedupe_test", columns=("one_col", "shared"), version=1)(_OneCol)
         spec = FeatureSpec(
             name="dedupe",
             feature_sets=("dedupe_test",),

@@ -20,7 +20,7 @@ real, harmless, and worth knowing before you assume a module is missing.
 | [`core/`](core/) | Shared types, Discord notifier, **and the training pipeline**. | mixed |
 | [`utils/`](utils/) | Bar aggregation. | live |
 | [`analysis/`](analysis/) | Offline diagnostics, run by hand. | never live |
-| [`lab/`](lab/) | The feature lab: candidate features scored by the retrainer's own gate (built 2026-09-21). | never live |
+| [`lab/`](lab/) | The feature lab: candidate features scored by the retrainer's own gate (built 2026-09-21; v2 frame-hash/ablate/A-B 2026-09-23). | never live |
 
 The one that surprises people is `core/` — it holds both shared domain types
 *and* `retrainer/` (a package since 2026-09-16), the entire training and promotion

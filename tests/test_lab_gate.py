@@ -147,9 +147,37 @@ class TestRunGateWiring(unittest.TestCase):
                 gate=GateConfig(model_family="lightgbm"),
             )
             with self.assertRaises(RuntimeError) as ctx:
-                run_gate(make_frame(), spec)
+                require_model_family("lightgbm")
             self.assertIn("MODEL_FAMILY", str(ctx.exception))
             self.assertEqual(require_model_family("catboost"), "catboost")
+        finally:
+            common.MODEL_FAMILY = original
+
+    def test_env_override_is_accepted_and_loud_but_not_spec_contract(self):
+        """W4: the estimator A/B launches a lightgbm-pinned seed spec under
+        MODEL_FAMILY=catboost. run_gate must run the LOADED family (the
+        env-selected arm) and record it, not refuse."""
+        import core.retrainer._common as common
+
+        original = common.MODEL_FAMILY
+        try:
+            common.MODEL_FAMILY = "catboost"
+            spec = FeatureSpec(
+                name="wiring",
+                feature_sets=("stub",),
+                gate=GateConfig(model_family="lightgbm"),
+            )
+            captured = {}
+            with mock.patch(
+                "core.retrainer._gate.validate_candidate", self._stub(captured)
+            ):
+                result = run_gate(make_frame(), spec)
+            self.assertEqual(result.model_family, "catboost")
+            # run_gate's contract (override allowed) accepts the env arm...
+            self.assertEqual(require_model_family("lightgbm", allow_env_override=True), "catboost")
+            # ...while the bare spec-contract form still refuses.
+            with self.assertRaises(RuntimeError):
+                require_model_family("lightgbm")
         finally:
             common.MODEL_FAMILY = original
 

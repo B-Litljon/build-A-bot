@@ -19,6 +19,14 @@ Glossary:
     render_artifact_report -- ArtifactReplayResult + command -> markdown text.
     write_artifact_report -- the replay's writer; ``slug`` defaults to
         ``served-artifact-<spec>`` so it can never overwrite a gate report.
+    render_ablation_report -- AblationResult + command -> markdown: the
+        ablation table (one row per variant: pooled trades, wins,
+        edge_over_random, both PF bounds, and the delta WITH its
+        Clopper-Pearson interval) plus a Caveats section that fires on thin
+        pooled trades — a delta consistent with zero is never a drop decision
+        by itself.
+    write_ablation_report -- the ablation's writer; slug ``ablate-<spec>`` so
+        it can never overwrite a gate or replay report.
     _git_head -- short commit hash for the frontmatter, or "unknown" outside a
         git checkout (never raises: a report is not worth losing to a git call).
     _fmt -- float formatting helper with an explicit nan fallback, because the
@@ -377,5 +385,151 @@ def write_artifact_report(
     path = out_dir / f"{stamp}_lab-{slug}.md"
     tmp = path.with_suffix(".md.tmp")
     tmp.write_text(render_artifact_report(result, command=command))
+    os.replace(tmp, path)
+    return path
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Ablation reports (lab.ablate, W3 2026-09-22)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _ablation_caveats(result) -> list:
+    """The honesty box for an ablation: thin trades dominate deltas."""
+    from lab.ablate import THIN_TRADES
+
+    out = []
+    full = result.full.report
+    if not full.gate_passed:
+        out.append(
+            "Full-cocktail gate FAILED — every arm replays Fold-3 placeholder "
+            "models; the deltas compare two failed runs, not two promoted ones."
+        )
+    thin = [
+        v.family
+        for v in result.variants
+        if v.report.pooled_oos_trades < THIN_TRADES
+        or full.pooled_oos_trades < THIN_TRADES
+    ]
+    if full.pooled_oos_trades < THIN_TRADES or any(
+        v.report.pooled_oos_trades < THIN_TRADES for v in result.variants
+    ):
+        out.append(
+            f"Pooled OOS trades are thin (full {full.pooled_oos_trades}; "
+            + ", ".join(f"{v.family} {v.report.pooled_oos_trades}" for v in result.variants)
+            + f"; the caveat threshold is {THIN_TRADES}). At these counts a "
+            "delta whose interval spans zero is NOT a drop decision and NOT "
+            "evidence of no effect — it is sampling noise wearing a point "
+            "estimate. Single runs of anything stochastic are noise."
+        )
+    out.append(
+        "edge_over_random is in WIN-RATE units, not R (see the 2026-09-14 "
+        "edge-budget work). Deltas inherit that currency."
+    )
+    out.append(
+        "Each variant is a full walk-forward gate run: the delta compares two "
+        "trained model PAIRS, not one model with a column removed. Family "
+        "interactions are inside the models' fits, which is the question — "
+        "but it also means a delta folds in every calibration shift the "
+        "smaller feature set induces, not just the family's columns."
+    )
+    return out
+
+
+def render_ablation_report(result, *, command: str = "") -> str:
+    """Markdown for one ablation run (lab.ablate.AblationResult)."""
+    s = result.summary()
+    spec = result.spec
+    now = datetime.now().astimezone()
+    full = s["full"]
+    lines = [
+        "---",
+        "type: recon",
+        f"date: {now.date().isoformat()}",
+        f"time: {now.strftime('%H:%M %Z')}",
+        "agent: opencode",
+        "model: deepseek-flash",
+        'trigger: "Feature-interaction ablation {name} (full hash {hash})"'.format(
+            name=spec.name, hash=full["content_hash"]
+        ),
+        f"head: {_git_head()}",
+        "scope: lab run only — no production model, config, or live path touched",
+        "related:",
+        "  - handoffs/2026-09-22_feature-lab-v2.md",
+        "  - handoffs/2026-09-22_feature-lab-v2-build-tasks.md",
+        "---",
+        "",
+        f"# Feature lab — ablation (`{spec.name}`)",
+        "",
+        "## Question",
+        "",
+        "For each registered family X: **edge(full cocktail) − edge(cocktail − X)**,",
+        "measured with only `feature_sets` varying — same bars, labels, veto,",
+        "geometry, cost table and folds. The delta is a family's in-situ effect,",
+        "not a lone-feature diagnostic.",
+        "",
+        f"- estimator: {s['model_family']} | wall time {s['run_seconds']:.1f}s",
+        f"- full cocktail: {', '.join(spec.feature_sets)}",
+        "",
+        "## Ablation table",
+        "",
+        "| cocktail | trades | wins | edge over random | pooled PF lb | fold-3 PF lb | "
+        "Δ edge (full − minus-X) | 90% CI on delta |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
+        f"| **full** | {full['pooled_oos_trades']} | {full['pooled_oos_wins']} | "
+        f"{_fmt(full['edge_over_random'])} | {_fmt(full['pooled_pf_lower_bound'])} | "
+        f"{_fmt(full['fold3_pf_lower_bound'])} | — | — |",
+    ]
+    for row in s["variants"]:
+        delta = row["delta"] or {}
+        lines.append(
+            f"| − {row['family']} | {row['pooled_oos_trades']} | "
+            f"{row['pooled_oos_wins']} | {_fmt(row['edge_over_random'])} | "
+            f"{_fmt(row['pooled_pf_lower_bound'])} | {_fmt(row['fold3_pf_lower_bound'])} | "
+            f"**{_fmt(delta.get('delta'))}** | "
+            f"[{_fmt(delta.get('ci_low'))}, {_fmt(delta.get('ci_high'))}] |"
+        )
+
+    lines += ["", "## Frame hashes", "", f"- full cocktail: `{full['content_hash']}`"]
+    for row in s["variants"]:
+        cache_note = "cached" if row["frame_from_cache"] else "built this run"
+        lines.append(f"- − {row['family']}: `{row['content_hash']}` ({cache_note})")
+
+    caveats = _ablation_caveats(result)
+    lines += ["", "## Caveats", ""]
+    lines += [f"- {caveat}" for caveat in caveats]
+    lines += [
+        "",
+        "## Reading rule",
+        "",
+        "A family is a CANDIDATE FOR REMOVAL only when its delta's interval",
+        "excludes zero on a trade count the gate itself calls evidential. A",
+        "delta consistent with zero on thin trades is the expected regime for",
+        "this basket — it is not a drop decision and not evidence of no effect.",
+        "",
+        "## Interpretation",
+        "",
+        "_To be written after reading the numbers above._",
+        "",
+    ]
+    if command:
+        lines += ["## Command", "", "```bash", command, "```", ""]
+    return "\n".join(lines)
+
+
+def write_ablation_report(
+    result,
+    *,
+    out_dir: Path = DEFAULT_REPORT_DIR,
+    command: str = "",
+) -> Path:
+    """Render and write an ablation report atomically; returns the path."""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().astimezone().date().isoformat()
+    spec_slug = result.spec.name.strip().lower().replace(" ", "-").replace("_", "-")
+    path = out_dir / f"{stamp}_lab-ablate-{spec_slug}.md"
+    tmp = path.with_suffix(".md.tmp")
+    tmp.write_text(render_ablation_report(result, command=command))
     os.replace(tmp, path)
     return path

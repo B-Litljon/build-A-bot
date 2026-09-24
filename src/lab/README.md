@@ -13,7 +13,11 @@ metric is `validate_candidate`, the exact function a production retrain calls,
 with `edge_over_random` as the primary number and a live-gated backtest as the
 cost-side check. Lab numbers are directly comparable to the served model's.
 
-Built 2026-09-21 against `llm_reports/handoffs/2026-09-21_feature-lab-plan.md`.
+Built 2026-09-21 against `llm_reports/handoffs/2026-09-21_feature-lab-plan.md`;
+v2 (frame-hash covers generator state, gate-list threading, `ablate`, the
+estimator A/B) built 2026-09-22/23 against
+`llm_reports/handoffs/2026-09-22_feature-lab-v2-build-tasks.md` on branch
+`lab/w1-w4`.
 
 ## The loop
 
@@ -23,6 +27,7 @@ PYTHONPATH=src:. python -m lab.cli list
 PYTHONPATH=src:. python -m lab.cli run --name v3_base_control
 PYTHONPATH=src:. python -m lab.cli run --spec specs/my_feature.py
 PYTHONPATH=src:. python -m lab.cli replay --name v3_base_control
+PYTHONPATH=src:. python -m lab.cli ablate --name v3_base_control
 ```
 
 `run` loads bars (cached parquet basket), builds or loads the frame, runs the
@@ -37,7 +42,25 @@ the same content-hashed frame, and writes a report with the raw pre-gate
 population, a split at the artifact's recorded holdout window, and the live-gated
 replay. No gate, no retrain, no PASS/FAIL; exit 0 on a completed replay.
 
-Adding a candidate feature is one class plus a registration:
+`ablate` asks the interaction question — *what does each registered family add
+in situ?* It expands the spec into N+1 arms (the full cocktail plus one per
+family with that family removed), runs the real gate on each with identical
+labels/veto/geometry/data/cost-table (only `feature_sets` varies), and reports
+per family the delta `edge(full) − edge(full − X)` WITH a Clopper-Pearson
+interval — never a bare point. Needs ≥ 2 registered families (a single-family
+spec has no cocktail to subtract against; use `run`). Writes
+`llm_reports/recons/<date>_lab-ablate-<spec>.md`.
+
+Estimator A/B (the architecture seam): `MODEL_FAMILY=catboost python -m lab.cli
+run --name <seed>` runs the seed spec under CatBoost. The env-selected family is
+the run's arm (precedence: explicit `--model-family` flag > env > the spec's
+declared family — measured and closed 2026-09-23, see
+`llm_reports/recons/2026-09-23_lab-model-family-ab.md`). The frame hash excludes
+the estimator, so both arms share one cached frame by construction.
+
+Adding a candidate feature is one class plus a registration — **which now
+REQUIRES a version** (folded into the frame-cache key; bump it whenever you edit
+anything inside the generator that changes the frame):
 
 ```python
 # src/lab/features.py or a spec file
@@ -50,7 +73,7 @@ class MyFeatures(BaseFeatureGenerator):
     def generate(self, df):                       # per symbol, causal
         return df.with_columns(...)               # .over("symbol")
 
-register_feature("my_family", description="...")(MyFeatures)
+register_feature("my_family", version=1, description="...")(MyFeatures)
 ```
 
 then `FeatureSpec(feature_sets=("v3_base", "my_family"))`. No pipeline,
@@ -62,18 +85,27 @@ retrainer, or live-code edit is needed.
 `FeatureSpec` — one frozen, hashable object describing the whole experiment:
 data window, feature families, bracket geometry, label knobs, cost-table switch,
 estimator family. `content_hash()` is the frame-cache key; it includes the
-spread-table bytes and the frame-affecting environment (veto switches, risk
-profile values, behavior veto).
+spread-table bytes, the frame-affecting environment (veto switches, risk
+profile values, behavior veto), every registered family's `(name, version)`
+pair, and the resolved state of any extra generator (constructor args
+included; non-serializable state raises rather than degrading to a
+class-name-only hash). It deliberately EXCLUDES `gate.model_family`/`n_folds` —
+run provenance, not frame content — which is what lets the estimator A/B reuse
+one cached frame.
 
-- **Imports from repo:** `ml.core.interfaces`.
+- **Imports from repo:** `ml.core.interfaces`; the registry (lazily, for
+  family versions).
 - **Imported by:** `registry`, `frames`, `data`, `experiments`, `specs`, tests.
 - **Reads/writes:** reads the spread table's bytes when hashing; writes nothing.
 
 ### `registry.py`
 The feature-family registry. `register_family` / `register_feature` bind a name
-to generators + the model-facing columns; `get_generators` and
-`feature_columns` expand a spec. Built-in `v3_base` is the production V3 stack
-(Base + HTF + Session + Cost) and its columns are exactly the retrainer's
+to generators + the model-facing columns + a REQUIRED `version: int` (>= 1)
+that feeds the frame-cache key — bump it when the family's generators change
+frame contents. `family_version(name)` resolves one family's version (raising
+on unknown names, the same loud contract as the expanders); `get_generators`
+and `feature_columns` expand a spec. Built-in `v3_base` is the production V3
+stack (Base + HTF + Session + Cost) and its columns are exactly the retrainer's
 `BASE_FEATURE_COLS` (+ `cost_ratio` when the table is active). Unknown family
 names raise — never a silent skip.
 
@@ -117,21 +149,27 @@ plus the production tail purge, row for row.
 ### `gate.py`
 `run_gate` calls `validate_candidate` with the spec's geometry and the frame's
 veto rate, scoping `RETRAIN_DEVIL_LABEL` to the spec's label kind for the
-duration. `require_model_family` refuses a spec whose estimator differs from the
-loaded `MODEL_FAMILY` (it is read at retrainer import time — launch with the env
-var set). `GateResult` carries the report, models, feature lists, and frozen
-thresholds.
+duration. `require_model_family` refuses a spec whose estimator differs from
+the loaded `MODEL_FAMILY` (read at retrainer import time) — except on the CLI
+run/ablate path, where an env-selected family IS the run's arm
+(`allow_env_override=True`, the W4 estimator A/B; still loud, and the bare
+spec-contract form still refuses). `GateResult` carries the report, models,
+feature lists, and frozen thresholds.
 
 - **Imports from repo:** `core.retrainer._gate` / `_common` / `_types`.
-- **Imported by:** `experiments`, `__init__`, tests.
+- **Imported by:** `experiments`, `ablate`, `__init__`, tests.
 - **Reads/writes:** nothing.
 
 ### `backtest.py`
 `LabModelStrategy` replays the gate-trained models as a `BaseStrategy` and
 `run_model_backtest` walks it symbol by symbol through `run_backtest` with a
 live `RiskManager`, so Gates A/B/C veto entries and the per-instrument toll
-applies. `run_artifact_backtest` is the same replay for a served artifact at its
-own pinned bars, and both share one `_replay_models` body so they cannot drift.
+applies. It threads the gate's OWN feature lists (`GateResult.angel_features`
+/ `devil_features`) into the replay — never a re-derivation from the frame's
+columns, which silently diverge once HMM features append their columns to the
+trained schema (`core/retrainer/_gate.py:606`).
+`run_artifact_backtest` is the same replay for a served artifact at its own
+pinned bars, and both share one `_replay_models` body so they cannot drift.
 `raw_sl_distance` is raw ATR (`close * natr_14 / 100`) — the RiskManager owns
 the multipliers.
 
@@ -173,11 +211,31 @@ trade counts, and a disabled cost table. `render_artifact_report` /
 `write_artifact_report` are the replay variants (slug defaults to
 `served-artifact-<spec>` so a replay can never overwrite a gate report), with an
 honesty box that states the replay is not a promotion gate and is largely
-in-sample for the served artifact.
+in-sample for the served artifact. `render_ablation_report` /
+`write_ablation_report` (slug `ablate-<spec>`) render the ablation table — one
+row per variant with the delta AND its Clopper-Pearson interval — plus the
+thin-trades caveat and the reading rule: a delta consistent with zero on thin
+trades is not a drop decision.
 
 - **Imports from repo:** none.
 - **Imported by:** `cli`, `__init__`.
 - **Reads/writes:** writes the report file.
+
+### `ablate.py`
+`ablate` expands a spec into N+1 arms (the full cocktail plus one per family
+with that family removed — labels, veto, geometry, data and cost table carried
+over UNCHANGED, so the delta reads as a family effect) and runs the real gate
+on each, sharing one bar load and the frame cache. `delta_with_ci` computes
+edge(full) − edge(full − X) with a Clopper-Pearson interval on the underlying
+win-rate difference (clipped to the feasible win-rate range); `THIN_TRADES`
+arms the caveat that fires whenever an arm's pooled trades fall below it —
+a delta consistent with zero on thin trades is never a drop decision.
+`AblationResult` and its `summary()` are what the CLI prints.
+
+- **Imports from repo:** `lab.gate` (lazily), `core.retrainer._common` via
+  scipy lazily for the beta quantile.
+- **Imported by:** `cli`, `report`, tests.
+- **Reads/writes:** writes nothing (the report writer does).
 
 ### `specs.py`
 The three seed experiments: `v3_base_control` (calibration), 
@@ -186,21 +244,36 @@ The three seed experiments: `v3_base_control` (calibration),
 only changed variable).
 
 ### `cli.py`
-`list`, `run` and `replay`; loads user spec files and sets `MODEL_FAMILY` from
-the spec before the retrainer is imported (the replay path never touches the
-retrainer).
+`list`, `run`, `replay` and `ablate`; loads user spec files and sets
+`MODEL_FAMILY` from the flag, the environment, or the spec — in that precedence
+— before the retrainer is imported (the replay path never touches the
+retrainer). The env beating the spec is the W4 estimator-A/B seam; an explicit
+`--model-family` flag must still agree with the spec.
 
 - **Imports from repo:** none at module scope.
 - **Reads/writes:** writes reports by default.
 
-## What v1 does NOT do (deliberately)
+## What v1 did NOT do (v2 status, built 2026-09-22/23 on `lab/w1-w4`)
 
-- **No candidate artifact holdout.** `_score_artifact_holdout` engineers its
-  slice with the production feature list, so it cannot score a *candidate*
-  feature set without generalizing that function. The fold gate's
-  `edge_over_random` is the verdict for candidates; fold 3's validation window is
-  the recent-regime check. (The SERVED artifact *is* replayed — `lab.artifact` —
-  because its schema is known; that is a baseline, not a promotion test.)
+- **Frame-cache hash now covers generator state (W2 fix in the review's
+  numbering, shipped as W1).** Editing a lookback inside a registered
+  generator requires bumping its registration version; extra generators hash
+  their resolved `__dict__`. The prior hole — a class-name-only hash — is
+  pinned shut by tests (`tests/test_lab_spec.py`).
+- **The backtest consumes the gate's OWN feature lists (W2).** No
+  re-derivation from `frame.feature_cols`, which would silently diverge under
+  HMM features (`core/retrainer/_gate.py:606`).
+- **`lab ablate` (W3) is built** — the interaction question, with CIs.
+- **The estimator A/B (W4) ran and closed**: CatBoost scored worse than random
+  on the same frame (`llm_reports/recons/2026-09-23_lab-model-family-ab.md`);
+  the architecture axis stays closed at the estimator-swap level.
+- **Still not done (deliberately):** no candidate artifact holdout —
+  `_score_artifact_holdout` engineers its slice with the production feature
+  list, so it cannot score a *candidate* feature set without generalizing that
+  function. The fold gate's `edge_over_random` is the verdict for candidates;
+  fold 3's validation window is the recent-regime check. (The SERVED artifact
+  *is* replayed — `lab.artifact` — because its schema is known; that is a
+  baseline, not a promotion test.)
 - **No angel-bar frontier** (`gate.run_frontier` in the plan). The standalone
   `scripts/angel_bar_frontier.py` already answers that question on the cached
   basket; porting it needs per-fold OOF probabilities, which

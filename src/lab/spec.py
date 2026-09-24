@@ -25,8 +25,18 @@ Glossary:
     FeatureSpec -- the whole experiment: data window, feature families,
         geometry, labels, cost-table switch, estimator family.
     content_hash -- sha256 of the resolved spec plus the environment that
-        affects frame contents (spread-table bytes, risk-profile gate values,
-        behavior-veto env). Sixteen hex chars; the frame cache key.
+        affects frame contents: spread-table bytes, risk-profile gate values,
+        behavior-veto env, every registered family's (name, version), and the
+        resolved STATE of any extra generator (constructor args included —
+        two instances of one class with different args hash differently, and
+        a generator whose state is not JSON-serializable raises rather than
+        degrading to a class-name-only hash). Sixteen hex chars; the frame
+        cache key. model_family is deliberately EXCLUDED — it changes the
+        estimator, not the frame (it belongs to run provenance).
+    family_versions -- the (name, version) pairs hashed into content_hash,
+        resolved through the registry; an unregistered family raises.
+    generator_state -- an extra generator's resolved __dict__, JSON-serialized
+        deterministically for hashing; raises on a non-serializable value.
     asset_class -- "forex" selects the 2.0x/4.0x profile and the class's Angel
         multiple; only forex is exercised by the seeds today.
     htf_timeframe -- the higher-timeframe context bar size, which MUST match
@@ -46,7 +56,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from dataclasses import asdict, dataclass, field, is_dataclass
+from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -64,7 +74,13 @@ DEFAULT_TRADEABLE_6: Tuple[str, ...] = (
     "GBP_NZD",
 )
 
-_SPEC_SCHEMA_VERSION = 1
+_SPEC_SCHEMA_VERSION = 2
+
+# Spec fields that are RUN PROVENANCE, not frame content: model_family
+# selects the estimator and n_folds shapes the walk-forward, but neither
+# changes a single row of the built frame. Excluded so W4's estimator A/B
+# reuses the same cached frame by construction.
+_HASH_EXCLUDED_FIELDS = frozenset({"gate"})
 
 # Frame contents that come from the environment rather than the spec. Hashed
 # explicitly so a veto toggle invalidates cached frames.
@@ -118,7 +134,15 @@ class GateConfig:
 
 @dataclass(frozen=True)
 class FeatureSpec:
-    """One feature-lab experiment. Frozen: build a new one to change anything."""
+    """One feature-lab experiment. Frozen: build a new one to change anything.
+
+    Frame-cache contract (W1, 2026-09-22): ``content_hash`` covers the
+    registered families' (name, version) pairs and every extra generator's
+    RESOLVED state — editing a lookback constant inside a registered generator
+    requires bumping that family's registration version (registration without
+    a version raises), and a configured extra generator hashes its constructor
+    args. ``gate`` is excluded: it is run provenance, not frame content.
+    """
 
     name: str = "v3_base_control"
     symbols: Tuple[str, ...] = DEFAULT_TRADEABLE_6
@@ -165,7 +189,14 @@ class FeatureSpec:
         return _load_spread_table(self.spread_table_path)["alphas"]
 
     def content_hash(self) -> str:
-        """Cache key for a built frame: the resolved spec + frame-affecting env."""
+        """Cache key for a built frame: the resolved spec + frame-affecting env.
+
+        Covers generator state explicitly: every registered family hashes as
+        (name, version), and every extra generator hashes its resolved
+        __dict__ alongside its class id. A generator whose state cannot be
+        JSON-serialized RAISES here — a class-name-only fallback would silently
+        reuse a frame built by a different configuration.
+        """
         table_sha = None
         if self.use_spread_table:
             path = Path(self.spread_table_path)
@@ -176,7 +207,15 @@ class FeatureSpec:
             )
         payload = {
             "schema": _SPEC_SCHEMA_VERSION,
-            "spec": _jsonable(self),
+            "spec": {
+                f.name: (
+                    _family_version_entry(getattr(self, f.name))
+                    if f.name == "feature_sets"
+                    else _jsonable(getattr(self, f.name))
+                )
+                for f in fields(self)
+                if f.name not in _HASH_EXCLUDED_FIELDS
+            },
             "spread_table_sha256": table_sha,
             "risk_profile": _risk_profile_fingerprint(self.asset_class),
             "frame_env": {k: os.getenv(k, "") for k in _FRAME_ENV_KEYS},
@@ -184,18 +223,51 @@ class FeatureSpec:
         blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
         return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
+    def family_versions(self) -> Tuple[Tuple[str, int], ...]:
+        """(name, version) for every family in feature_sets, registry-resolved."""
+        from lab.registry import family_version
+
+        return tuple(
+            (name, family_version(name)) for name in self.feature_sets
+        )
+
 
 def _generator_id(gen: BaseFeatureGenerator) -> str:
     cls = type(gen)
     return f"{cls.__module__}.{cls.__qualname__}"
 
 
+def _generator_state(gen: BaseFeatureGenerator) -> dict:
+    """An extra generator's resolved state, JSON-ready and deterministically
+    ordered. Raises on anything not JSON-serializable — the frame cache key
+    must never degrade to a class-name-only hash for a configured generator."""
+    if is_dataclass(gen) and not isinstance(gen, type):
+        raw: Dict[str, Any] = {f.name: getattr(gen, f.name) for f in fields(gen)}
+    else:
+        raw = dict(vars(gen))
+    try:
+        return json.loads(
+            json.dumps({"class": _generator_id(gen), "state": raw}, sort_keys=True)
+        )
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            f"extra generator {_generator_id(gen)} holds state that cannot be "
+            f"JSON-serialized ({exc}); FeatureSpec.content_hash refuses to hash "
+            "it by class name alone — make the state serializable or register "
+            "the family with a bumped version instead."
+        ) from exc
+
+
 def _jsonable(obj: Any) -> Any:
-    """Dataclasses/tuples/generators -> plain JSON-serializable structures."""
+    """Dataclasses/tuples/generators -> plain JSON-serializable structures.
+
+    Registered families resolve to (name, version) pairs through the registry;
+    extra generators resolve to their full resolved state (class id + __dict__).
+    """
     if isinstance(obj, BaseFeatureGenerator):
-        return _generator_id(obj)
+        return _generator_state(obj)
     if is_dataclass(obj) and not isinstance(obj, type):
-        return {k: _jsonable(v) for k, v in asdict(obj).items()}
+        return {f.name: _jsonable(getattr(obj, f.name)) for f in fields(obj)}
     if isinstance(obj, (tuple, list)):
         return [_jsonable(v) for v in obj]
     if isinstance(obj, dict):
@@ -203,6 +275,17 @@ def _jsonable(obj: Any) -> Any:
     if hasattr(obj, "isoformat"):
         return obj.isoformat()
     return obj
+
+
+def _family_version_entry(feature_sets: Tuple[str, ...]) -> List[Any]:
+    """Hash form of feature_sets: plain names, plus each registered family's
+    version folded alongside so a bumped family version invalidates frames."""
+    from lab.registry import family_version
+
+    return [
+        {"family": name, "version": family_version(name)}
+        for name in feature_sets
+    ]
 
 
 def _risk_profile_fingerprint(asset_class: str) -> dict:
