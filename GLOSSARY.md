@@ -496,6 +496,40 @@ PASS/FAIL. The report splits the frame at the artifact's recorded holdout window
 backtest both consume (`FrameResult.df`). Building it and scoring it must use
 the same rows; the parity test pins that `feature_sets=("v3_base",)` reproduces
 `engineer_features_and_labels` row for row, plus the production tail purge.
+**crypto trend mom tv** — Lane 1 of the post-forex research pipeline, built
+2026-09-24 on branch `lane/crypto-trend-mom-tv`: a daily, long-only,
+two-asset (BTC/USD, ETH/USD) time-series-momentum overlay with volatility
+targeting — a median-of-four momentum sign ensemble (21/63/126/252-day log
+returns) driving inverse-vol raw weights against a σ_target in [0.20, 0.30],
+traded through a 0.05 rebalance buffer, executed close→next-open, and charged
+33 bps amortized half-spread + 25 bps taker per unit of weight turnover.
+Offline only (`src/lab/momentum_crypto.py`); bars come from Alpaca through
+`AlpacaProvider.get_historical_bars(symbol, 1440, …)` and are cached at
+`analysis_cache/lab_frames/crypto_daily_bars.parquet`. Its gate — Calmar above
+BTC buy-and-hold, MaxDD < 30%, DSR > 0.95, PBO < 0.50, HLZ t > 3.0 —
+**failed on PBO (0.93)** over the full realized window 2021-01-01 →
+2026-09-24: profitable, but the arm selection does not transfer
+out-of-sample. See `llm_reports/recons/2026-09-24_lab-crypto-trend-mom-tv.md`.
+
+**DSR (deflated Sharpe ratio)** — Bailey & Lopez de Prado (2014): the
+probability that a measured Sharpe exceeds the expected maximum of `n_trials`
+independent null draws, after correcting the sampling distribution for the
+series' skew/kurtosis. The multiplicity input is the count of parametrizations
+actually *evaluated*, not the grid imagined. *(`src/lab/stats.py`)*
+
+**PBO (probability of backtest overfitting)** — Bailey, Borwein, Lopez de
+Prado, Zhu (2014), computed by combinatorially symmetric cross-validation:
+split the T×N return matrix into 8 contiguous blocks, try all 70 four-block
+train halves, and count the fraction where the in-sample best strategy ranks
+at or below the test-half median. High = the selection procedure is
+regime-luck. *(`src/lab/stats.py`)*
+
+**HLZ haircut Sharpe** — Harvey, Liu, Zhu (2016): the measured Sharpe minus
+the expected-max-null haircut at quantile z_{1−1/(2·n_trials)}, reported as an
+adjusted Sharpe number (plus a helper expressing it as a t-stat). One of the
+three multiple-testing contracts all research lanes share.
+*(`src/lab/stats.py`)*
+
 ## Scoring
 
 **Brier score** — mean squared error between predicted probabilities and what

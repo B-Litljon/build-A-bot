@@ -243,6 +243,39 @@ The three seed experiments: `v3_base_control` (calibration),
 `microstructure` (the candidate family, cost table off so the feature set is the
 only changed variable).
 
+### `stats.py`
+The multiple-testing falsification statistics shared by every research lane:
+`deflated_sharpe_ratio` (Bailey & Lopez de Prado 2014, a probability),
+`cscv_pbo` (CSCV probability of backtest overfitting over 70 eight-block
+splits, a scalar), and `hlz_haircut_sharpe` (Harvey-Liu-Zhu, an adjusted
+Sharpe number) plus the `hlz_t_stat` helper. The three signatures are a
+cross-lane contract, pinned verbatim by
+`llm_reports/handoffs/2026-09-24_lane1-crypto-trend-mom-tv.md` §6.2 and by
+`tests/test_lab_stats.py`; later lanes import them, so they do not change.
+
+- **Imports from repo:** nothing (numpy + scipy.stats only).
+- **Imported by:** `lab.momentum_crypto`, `lab.__init__` (lazy), tests.
+- **Reads/writes:** nothing.
+
+### `momentum_crypto.py`
+Lane 1: the daily crypto time-series-momentum + volatility-targeting harness
+(research artifact only — no orders, nothing live). Median-of-four momentum
+sign ensemble (21/63/126/252) on BTC/USD + ETH/USD, inverse-vol sizing at a
+σ_target in [0.20, 0.30], a 0.05 rebalance buffer, and a 33+25 bps per-turnover
+cost model, executed close→next-open; bars come through
+`AlpacaProvider.get_historical_bars(symbol, 1440, …)` only and are cached
+atomically at `analysis_cache/lab_frames/crypto_daily_bars.parquet`
+(7 bar columns + `fetched_at_utc`). The CLI (`python -m lab.momentum_crypto
+--json`) probes the 2021 window, degrades on failure per the brief, evaluates
+the 6-arm sweep, and prints the gate verdict (Calmar > BTC B&H, MaxDD < 30%,
+DSR > 0.95, PBO < 0.50, HLZ t > 3.0). First run's verdict: **GATE FAIL on PBO**
+(`llm_reports/recons/2026-09-24_lab-crypto-trend-mom-tv.md`).
+
+- **Imports from repo:** `data.alpaca_provider` (lazily), `lab.stats` (lazily).
+- **Imported by:** nothing in the lab or the live tree; CLI + tests only.
+- **Reads/writes:** reads Alpaca through the provider and the bar cache;
+  writes the bar cache (atomic) and its `.fetched.json` sidecar.
+
 ### `cli.py`
 `list`, `run`, `replay` and `ablate`; loads user spec files and sets
 `MODEL_FAMILY` from the flag, the environment, or the spec — in that precedence
