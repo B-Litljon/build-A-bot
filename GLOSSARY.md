@@ -142,6 +142,36 @@ repo. A 5-minute bar stamped 12:00 is not *finished* until 12:05, so using it at
 full timeframe before joining. Get this wrong and backtests look brilliant while
 live trading fails. *(`V3HTFFeatures`)*
 
+**WM/R fix** — the WM/Reuters 4:00 PM London FX benchmark. A daily instant,
+DST-correct via `Europe/London` zoneinfo (16:00 BST = 15:00 UTC in summer,
+16:00 UTC in winter GMT). The standard institutional liquidity event the
+fix-flow audit (Lane 5) measures. *(`src/lab/fix_audit.py:london_fix_utc`)*
+
+**Tokyo Nakane fix** — the 9:55 AM JST Tokyo benchmark (00:55 UTC; JST has no
+DST). Carries real corporate flow on Gotobi days. *(`src/lab/
+fix_audit.py:tokyo_fix_utc`)*
+
+**Gotobi day** — the 5th, 10th, 15th, 20th, 25th, or last day of the month
+(JST calendar), when Japanese corporate settlement concentrates Tokyo-fix flow.
+The Tokyo fix's reference cohort on non-Gotobi days is the natural comparison
+group. *(`src/lab/fix_audit.py:is_gotobi_day`)*
+
+**cross-sectional momentum** — ranking a basket of assets against each OTHER
+on trailing returns, buying the top quintile, rather than each asset against
+its own history. The anomaly Audit A tries (and whose data layer fails at the
+liquidity floor on this venue). *(`src/lab/altcoin_topquint.py`)*
+
+**VWAP reversion** — the hypothesis that price deviations from a session-anchored
+volume-weighted average price mean-revert within the session. Audit C measures
+it at the 08:00–09:00 UTC London open; falsified (net EV −0.047R to −0.140R
+across the k sweep). *(`src/lab/vwap_reversion.py`)*
+
+**inventory imbalance exit** — exiting a trade when the session's running
+signed volume imbalance (Σ sign(r)·V) crosses zero, rather than at a fixed
+price target. The intuition that the fade should close when the session's net
+inventory is neutralised, not at an arbitrary multiple. *(`src/lab/
+vwap_reversion.py:simulate_session`)*
+
 **lookahead / leakage** — any way information from the future reaches a
 decision that could not have known it. The repo guards against it in at least
 four separate places: `available_at`, the 45-day fundamentals lag, the 60-day

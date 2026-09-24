@@ -243,6 +243,68 @@ The three seed experiments: `v3_base_control` (calibration),
 `microstructure` (the candidate family, cost table off so the feature set is the
 only changed variable).
 
+### `stats.py`
+Shared multiple-comparison statistics for the quant research lanes (Lane 5,
+2026-09-24): `deflated_sharpe_ratio` (Bailey & López de Prado 2014, a
+probability), `cscv_pbo` (Bailey et al. 2014, S=8 blocks / 70 combos),
+`hlz_haircut_sharpe` (Harvey–Liu–Zhu 2016, adjusted Sharpe), and
+`clopper_pearson_lower` (one-sided CP binomial bound). Built against the
+signatures pinned in the lane briefs; before this file there was NO
+DSR/CSCV/HLZ code anywhere in the repo.
+
+- **Imports from repo:** nothing (numpy, scipy only).
+- **Imported by:** `altcoin_topquint`, `vwap_reversion`; the other 2026-09-24
+  lanes were told to build the same file if absent.
+- **Reads/writes:** nothing.
+
+### `altcoin_topquint.py`
+Audit A — weekly LightGBM `lambdarank` top-quintile cross-sectional momentum
+over a liquidity-floored Alpaca altcoin basket, with the dual equal-weight +
+BTC-hold benchmark, a 31.6 bps/side friction, and the DSR/PBO/CP gate.
+Research-only; the realized run is falsified at the data layer (the $250k
+floor admits < 5 assets on Alpaca's free-tier crypto volume).
+
+- **Imports from repo:** `lab.stats`. Data from Alpaca's
+  `CryptoHistoricalDataClient` (fetched by the run script, not imported here).
+- **Imported by:** `tests/test_lab_altcoin.py`.
+- **Reads/writes:** nothing; the loader/walk-forward engine consumes
+  caller-supplied daily-close arrays.
+
+### `fix_audit.py`
+Audit B — DST-correct London WM/R (16:00 Europe/London) and Tokyo Nakane
+(9:55 JST) fix identification (zoneinfo), the Gotobi-day calendar, and the
+coarse M15 fix-bar study across the six fiat M15 caches. Carries the
+first-class data-resolution limitation: no tick/bid-ask data exists anywhere,
+so a fix bar indistinguishable at M15 is NOT a falsification of tick-level
+widening.
+
+- **Imports from repo:** nothing (stdlib zoneinfo + numpy).
+- **Imported by:** `fix_collector`'s window helper, `tests/test_lab_fix_audit.py`.
+- **Reads/writes:** nothing; consumes caller-supplied M15 frames.
+
+### `fix_collector.py`
+The atomic tick-parquet writer for Audit B's collector —
+`FixTickBuffer` + `write_ticks_atomic` (temp file + fsync + `os.replace`,
+the same convention as `core/events.py` and `lab/frames.py`). The six-column
+schema (`timestamp_utc, symbol, bid, ask, mid, source_latency_ms`) is the
+contract `scripts/fix_tick_collector.py` writes.
+
+- **Imports from repo:** nothing (pyarrow only at write time).
+- **Imported by:** `scripts/fix_tick_collector.py`, `tests/test_lab_fix_audit.py`.
+- **Reads/writes:** writes `data/ticks/fix_ticks_YYYY-MM-DD.parquet`
+  atomically; nothing reads it yet (the collector is uninstalled and unrun).
+
+### `vwap_reversion.py`
+Audit C — session-scale VWAP reversion at the 08:00–09:00 UTC London open,
+k·σ fade entry, inventory-imbalance / re-extension-stop / hard-session-close
+exits, 1% NAV risk sizing, k swept over {1.5, 2.0, 2.5, 3.0} with the
+positive-expectancy-independent-of-k gate. Research-only; measured net EV is
+−0.047R to −0.140R per trade — falsified independent of k.
+
+- **Imports from repo:** `lab.stats`.
+- **Imported by:** `tests/test_lab_vwap_reversion.py`.
+- **Reads/writes:** nothing; consumes caller-supplied M15 frames.
+
 ### `cli.py`
 `list`, `run`, `replay` and `ablate`; loads user spec files and sets
 `MODEL_FAMILY` from the flag, the environment, or the spec — in that precedence

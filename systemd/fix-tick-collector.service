@@ -1,0 +1,47 @@
+# fix-tick-collector.service — systemd USER unit template for Audit B's tick
+# collector. **UNINSTALLED TEMPLATE:** this file is shipped in the repo only.
+#
+# Install (symlink so edits take effect after daemon-reload) ONLY after the
+# coarse M15 study (llm_reports/recons/2026-09-24_lab-fix-flow-audit.md) has
+# been reviewed and Brandon has opted in:
+#
+#     systemctl --user link /mnt/storage/mystuf/development/build-a-bot-lanes/falsification-audits/systemd/fix-tick-collector.service
+#     systemctl --user daemon-reload
+#     systemctl --user start fix-tick-collector.service
+#
+# Lingering must stay ON for the collector to survive logout:
+#     loginctl enable-linger tha_magick_man
+#
+# Modelled on soak.service's conventions (KillMode=mixed + SIGTERM +
+# TimeoutStopSec=90 + Restart=on-failure) but with Restart=on-failure here
+# (unlike the soak, this is a data collector, not a position-holder — a dead
+# collector loses data, not money, so an auto-restart is safe).
+
+[Unit]
+Description=Fix-window tick collector (Audit B) — London WM/R + Tokyo Nakane quote capture
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The collector reads OANDA_API_KEY / OANDA_ACCOUNT_ID from the environment
+# (export them in ~/.config/environment.d/ or via a drop-in); never commit them.
+WorkingDirectory=/mnt/storage/mystuf/development/build-a-bot-lanes/falsification-audits
+Environment=PYTHONPATH=src:.
+Environment=OANDA_ENV=practice
+Environment=FIX_TICKS_DIR=data/ticks
+Environment=FIX_WINDOW_SECONDS=300
+
+ExecStart=/home/tha_magick_man/.local/share/virtualenvs/build-A-bot-A3hTUWzK/bin/python scripts/fix_tick_collector.py
+
+# SIGTERM flushes the day's buffer and exits; give the parquet flush room to
+# finish before escalating to SIGKILL.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=90
+
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target
