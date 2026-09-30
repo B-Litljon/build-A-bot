@@ -238,6 +238,38 @@ orchestrator with a fixed `units_per_trade = 1000`
 and the notional floor applied to the deleted Alpaca/Factory paths (2026-09-16)
 only; git history has them.
 
+### Lane 4 research terms (index-option variance premium, 2026-09-24)
+
+**variance premium** — the empirical tendency of an index option's *implied*
+volatility (what the premium prices in) to exceed the *realised* volatility the
+underlying later delivers. Selling richly-implied volatility and hedging (or
+defining the risk away) harvests that structural risk-transfer spread. The
+canonical short-volatility edge; unlike bracket trading it profits from a
+premium, not from predicting direction. *(Lane 4 brief §2)*
+
+**IVR (implied-volatility rank)** — the percentile rank of today's ATM implied
+volatility within its own trailing 252-trading-day history, 0–100. A short premium
+entry trigger wants IVR elevated (sold when vol is rich). Computed as the IV of
+the option whose |delta| is closest to 0.50 at 30–45 DTE, per day. *(Lane 4 brief §5.1)*
+
+**iron condor** — sell one out-of-the-money put spread *and* one OTM call spread,
+same expiry. The short wings sit at Δ∈[0.20, 0.30] in this lane. Wins when the
+underlying pins the range between the wings; defined-risk by construction.
+
+**credit spread** — sell one option, buy a further-out same-type option to cap the
+loss; you collect (credit) more premium than you spend on the hedge. A *put credit
+spread* is the long-vol-directional-free expression this lane was to use on the low side.
+
+**defined-risk** — the maximum loss is fixed at entry (spread width − credit) rather
+than open-ended, so sizing is exact and no stop-out surprise exists. Required for any
+short-vol structure this repo would run.
+
+**inverted chop veto** — the repo-integration mandate reusing
+`_compute_chop_veto_mask` (`src/core/retrainer/_labels.py:163`) *backwards*: a
+rangebound bar that the **directional** strategy vetoes is exactly the bar a **short-vol**
+strategy wants, so `chop_friendly = chop_veto_mask` becomes a positive entry requirement
+(IVR ∈ [25, 30]). Not a new filter — the same mask, read as "favourable" instead of "drop".
+
 ## The gates (the "chop filter")
 
 Applied *after* a strategy already wants to trade. A model can be perfectly
@@ -474,6 +506,18 @@ and closed 2026-09-23: CatBoost scored worse than random on the same frame.
 **feature family** — a registered name -> generators + model-facing columns. A
 new candidate feature is one `BaseFeatureGenerator` class plus a registration;
 nothing else in the repo changes.
+
+**DSR / CSCV PBO / HLZ (deflated Sharpe, probability of backtest overfitting,
+haircut Sharpe)** — the multiple-testing statistics in `src/lab/stats.py`,
+shared across the 2026-09-24 quant-lane dispatches (Lanes 1–5) under one pinned
+signature set so every lane reports them identically. `deflated_sharpe_ratio`
+is the probability the observed Sharpe beats the expected max of N null trials
+(Bailey & Lopez de Prado 2014, with the skew/kurt variance correction that
+tightens it under negative-skew strategies like short-vol); `cscv_pbo` is the
+combinatorially-symmetric CV PBO (Bailey et al. 2014; zero-skill matrix → 0.5
+exactly, via a degenerate-tie branch); `hlz_haircut_sharpe` is the HLZ 2016
+multiple-testing haircut, and `hlz_se` is the skew/kurt standard error behind
+the "HLZ t > 3.0" gate. *(`src/lab/stats.py`)*
 
 **edge over random** — the gate's telemetry: pooled fold win rate minus the
 macro bracket's **base rate** (what a random long entry won on the same

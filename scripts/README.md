@@ -207,8 +207,33 @@ Report: [`llm_reports/recons/2026-09-20_reprice-wide-geometry-band-analysis.md`]
 
 - **Imports from repo:** `data.oanda_provider`.
 - **Reads:** `logs/graded_decisions.parquet`, OANDA M15 bars (cached under
-  `analysis_cache/2026-09-20_reprice_band_geometry/`).
+    `analysis_cache/2026-09-20_reprice_band_geometry/`).
 - **Writes:** `reprice_trades.parquet` in the same cache dir; stdout tables.
+
+### `option_capability_probe.py` — "can this account run multi-leg options?"
+**Read-only.** Lane 4 (index option variance-premium harvester, 2026-09-24) is
+capability-gated, and this is its Stage 0: ask the API what the account can do,
+refuse to proceed if the answer is not "Level 3 + data available". It never
+submits any order — `TradingClient` is used for `get_account()` only.
+
+It prints a JSON report with three verdicts and exits `0` only if both mandatory
+legs hold: (1) `options_approved_level >= 3` (the attribute name is discovered
+by `dir(account)` introspection, not assumed — Alpaca has exposed it under more
+than one spelling); (2) `OptionHistoricalDataClient.get_option_chain(...)` for
+SPY over a narrow window returns rows carrying `implied_volatility` and
+`delta`. Greeks are reported as a third advisory leg. Anything missing exits
+`2` with a one-line blocker.
+
+The live SPY run (2026-09-24) passed Stage 0 but surfaced the deeper blocker —
+the paper account holds **no historical option-chain/greeks depth** (bars exist
+only for days a contract was liquid; `get_option_snapshot` is current-book-only),
+so Stage 1's no-simulation 2022→2026 backtest is unservable from this account.
+Outcome: [`llm_reports/stops/2026-09-24_option-capability-blocked.md`](../llm_reports/stops/2026-09-24_option-capability-blocked.md).
+
+- **Imports from repo:** none (Alpaca SDK + `.env` credentials only; `dotenv`).
+- **Reads:** Alpaca account + option chain endpoints. **Writes:** nothing
+  (stdout JSON only).
+
 
 ### `bake_spread_alphas.py`
 Turns observation into configuration: parses `SPREAD_CALIB` lines out of a soak
