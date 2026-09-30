@@ -73,7 +73,13 @@ the model is RIGHT about direction and the bracket loses anyway, stopping out
 
 Two rules it keeps: decisions too recent for the 45-bar walk are **dropped, not
 guessed**, and simulated fills flatter reality by roughly the spread toll, so
-read it as a relative measure.
+read it as a relative measure. The first rule is enforced in code, not hope:
+`grade_decisions` purges each symbol's last `LOOKAHEAD_BARS` rows from the
+answer key before joining (`purge_unresolvable_tail`) — the dense labeler
+defaults those censored bars to `won=0`, so without the purge recent decisions
+were silently graded as losses (fixed 2026-09-30). Runners must still walk the
+brackets over the full contiguous frame; the purge happens at the join, after
+labeling.
 
 - **Imports from repo:** none at module level (the caller supplies graded bars).
 - **Imported by:** `tests/test_decision_grader.py`, `run_decision_grader.sh`.

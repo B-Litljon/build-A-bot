@@ -400,7 +400,11 @@ whose bracket walk runs off the end of the frame and resolves "timeout →
 loss" no matter what the price actually did. Those labels are systematically
 wrong, so the engineered remainder and holdout each drop them after
 engineering (the **boundary purge**); the cutoffs are derived from the raw
-series because the walk needs the contiguous pre-veto path. *(`src/core/retrainer/`)*
+series because the walk needs the contiguous pre-veto path. The live-decision
+grader enforces the same rule on its answer key via
+`decision_grader.purge_unresolvable_tail`, applied before it joins decisions —
+since 2026-09-30, before which recent live decisions were silently graded as
+losses. *(`src/core/retrainer/`, `src/analysis/decision_grader.py`)*
 
 **lift over random vs lift over benchmark** — two different questions, and for a
 long time the investor only asked the first. "Better than guessing" is measured

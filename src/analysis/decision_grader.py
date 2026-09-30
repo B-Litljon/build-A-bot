@@ -45,6 +45,8 @@ Glossary:
         decisions rather than a backtest.
     LOOKAHEAD_BARS -- 45, matching MAX_HOLD_BARS. A decision within this many
         bars of the data end cannot be graded and is dropped, never guessed.
+        Enforced in grade_decisions itself (so no runner can forget it) and in
+        run_decision_report.py (so an unresolved bar is never joined at all).
 """
 
 from __future__ import annotations
@@ -61,6 +63,62 @@ import polars as pl
 logger = logging.getLogger(__name__)
 
 LOOKAHEAD_BARS = 45
+
+
+def purge_unresolvable_tail(
+    graded_bars: pl.DataFrame,
+    lookahead: int = LOOKAHEAD_BARS,
+) -> pl.DataFrame:
+    """
+    Drop each symbol's last ``lookahead`` bars from a bracket-walk answer key.
+
+    ``_compute_devil_targets_atr`` returns a dense int8: bars whose forward walk
+    truncated at the frame's right edge default to 0, indistinguishable from a
+    real loss. Those rows are censored, not evidence, so they must leave the
+    key before any join grades against them — this is the same boundary-purge
+    rule the retrainer applies in ``_purge_boundary_tail``, expressed as one
+    rank-over-symbol window filter so it stays a single O(n) pass. ``won`` is
+    unchanged in type (Int8-compatible).
+
+    Symbols with at most ``lookahead`` rows are kept untouched: every one of
+    their rows is unresolvable and dropping them would empty the key entirely —
+    the same defensive call ``_tail_cutoff_by_symbol`` makes.
+
+    Requires a ``timestamp`` column ordered within each symbol (the runners'
+    frames are time-ordered; the walk they feed is too). Frames without
+    symbol or timestamp pass through unchanged.
+    """
+    if (
+        graded_bars.height == 0
+        or "timestamp" not in graded_bars.columns
+        or "symbol" not in graded_bars.columns
+    ):
+        return graded_bars
+    counts = graded_bars.group_by("symbol").len()
+    long_symbols = counts.filter(pl.col("len") > lookahead)["symbol"].to_list()
+    if not long_symbols:
+        return graded_bars  # every symbol degenerate: nothing resolvable anywhere
+    if len(long_symbols) == counts.height:
+        # Every symbol is long enough: pure window filter, one pass.
+        return graded_bars.filter(
+            pl.col("timestamp").rank(method="ordinal", descending=True).over("symbol")
+            > lookahead
+        )
+    # Degenerate symbols present: keep them whole, purge only the long ones.
+    return pl.concat(
+        [
+            graded_bars.filter(
+                pl.col("symbol").is_in(long_symbols)
+                & (
+                    pl.col("timestamp").rank(method="ordinal", descending=True)
+                    .over("symbol")
+                    > lookahead
+                )
+            ),
+            graded_bars.filter(~pl.col("symbol").is_in(long_symbols)),
+        ],
+        how="vertical",
+    )
 
 
 @dataclass(frozen=True)
@@ -145,19 +203,26 @@ def grade_decisions(
     Attach realized outcomes to live decisions.
 
     ``graded_bars`` must carry symbol, timestamp, ``won`` (1/0 from the bracket
-    walk) and optionally ``behavior_label``. Decisions with no matching graded
-    bar are dropped: those are bars too close to the end of history for the
-    45-bar walk to have resolved, and inventing an outcome for them would be
-    the same self-deception this module exists to remove.
+    walk) and optionally ``behavior_label``. The answer key's unresolvable
+    tail — each symbol's last LOOKAHEAD_BARS rows, whose truncated walk the
+    dense labeler defaulted to 0 — is purged before the join, so a decision
+    graded there is a loss the labeler never earned. Decisions with no
+    matching bar at all are dropped too: inventing an outcome would be the
+    same self-deception this module exists to remove.
     """
     if decisions.height == 0 or graded_bars.height == 0:
         return decisions.head(0).with_columns(pl.lit(None, pl.Int8).alias("won"))
 
     d = _normalise_ts(decisions, "bar_ts")
-    keep = ["symbol", "_key", "won"] + (
-        ["behavior_label"] if "behavior_label" in graded_bars.columns else []
+    # Purge BEFORE selecting `keep`: `timestamp` is the purge's rank column
+    # and `keep` intentionally drops it (only `_key` survives for the join).
+    normed = purge_unresolvable_tail(
+        _normalise_ts(graded_bars, "timestamp"), LOOKAHEAD_BARS
     )
-    g = _normalise_ts(graded_bars, "timestamp").select(keep)
+    keep = ["symbol", "_key", "won"] + (
+        ["behavior_label"] if "behavior_label" in normed.columns else []
+    )
+    g = normed.select(keep)
 
     joined = d.join(g, on=["symbol", "_key"], how="inner").drop("_key")
     if joined.height < decisions.height:

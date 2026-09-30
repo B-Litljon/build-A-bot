@@ -12,12 +12,16 @@ Glossary:
         non-"bar" lines the real logs contain, so parsing is tested against
         what the writer actually produces rather than an idealised sample.
     _bars -- a graded-bar frame standing in for the answer key.
+    _basket_with_censored_tail -- a dense answer key in the runner's shape
+        (last LOOKAHEAD_BARS bars per symbol defaulted to won=0), standing in
+        for what _compute_devil_targets_atr hands grade_decisions.
 """
 
 import json
 import sys
 import tempfile
 import unittest
+import datetime
 from pathlib import Path
 
 import polars as pl
@@ -25,10 +29,12 @@ import polars as pl
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from analysis.decision_grader import (  # noqa: E402
+    LOOKAHEAD_BARS,
     behavior_breakdown,
     calibration_table,
     grade_decisions,
     load_decisions,
+    purge_unresolvable_tail,
     threshold_sweep,
 )
 
@@ -148,6 +154,11 @@ class TestGrading(unittest.TestCase):
         """
         A decision too recent for the 45-bar walk has NO outcome. Inventing one
         is the exact self-deception this module exists to remove.
+
+        The answer key here is long enough to be resolvable, so the only
+        unmatched decision is genuinely outside the key entirely — the
+        censored-tail case is pinned separately in TestUnresolvableTail, where
+        the bar IS in the key but its walk truncated.
         """
         dec = self._dec(
             [
@@ -160,6 +171,15 @@ class TestGrading(unittest.TestCase):
         self.assertEqual(g.height, 1)
         self.assertEqual(g["angel"][0], 0.31)
 
+    def test_degenerate_answer_key_still_grades(self):
+        """
+        A key shorter than the walk horizon is kept whole (the retrainer's
+        defensive call), so its bars still join — here the one bar resolves.
+        """
+        dec = self._dec([("GBP_JPY", "2026-08-20 10:00:00+00:00", 0.31)])
+        bars = _bars([("GBP_JPY", "2026-08-20 10:00:00", 1)])
+        self.assertEqual(grade_decisions(dec, bars).height, 1)
+
     def test_iso_t_separator_and_space_both_join(self):
         """Telemetry and the bar frame format timestamps differently."""
         dec = self._dec([("GBP_JPY", "2026-08-20T10:00:00+00:00", 0.31)])
@@ -169,6 +189,113 @@ class TestGrading(unittest.TestCase):
     def test_empty_inputs_are_safe(self):
         dec = self._dec([])
         self.assertEqual(grade_decisions(dec, _bars([])).height, 0)
+
+
+class TestUnresolvableTail(unittest.TestCase):
+    """
+    _compute_devil_targets_atr returns a dense int8 with no nulls: bars whose
+    forward walk truncated at the frame's right edge default to won=0, exactly
+    like a real loss. Decisions on those bars must be DROPPED, not graded 0 —
+    the drop path the docstring always promised (2026-09-30 recon, item 3).
+    """
+
+    @staticmethod
+    def _basket_with_censored_tail(rows_per_symbol: int = 90, symbols=("GBP_JPY",)):
+        """
+        A dense answer key in the runner's shape (symbol-major blocks, one per
+        symbol): the last LOOKAHEAD_BARS rows of each block carry won=0 that
+        the walk never earned. Requires rows_per_symbol > LOOKAHEAD_BARS (a
+        shorter key has no censored tail).
+        """
+        n = rows_per_symbol
+        if n <= LOOKAHEAD_BARS:
+            raise ValueError("use more than LOOKAHEAD_BARS rows for a censored tail")
+        start = datetime.datetime(2026, 8, 20)
+
+        def _block(sym: str) -> pl.DataFrame:
+            ts = pl.datetime_range(
+                start, start + datetime.timedelta(minutes=15 * (n - 1)),
+                interval="15m", eager=True,
+            )
+            return pl.DataFrame(
+                {
+                    "symbol": pl.Series([sym] * n, dtype=pl.Utf8),
+                    "timestamp": ts,
+                    "won": pl.Series(
+                        [1] * (n - LOOKAHEAD_BARS) + [0] * LOOKAHEAD_BARS,
+                        dtype=pl.Int8,
+                    ),
+                    "behavior_label": ["mixed_normal"] * n,
+                }
+            )
+
+        return pl.concat([_block(sym) for sym in symbols], how="vertical")
+
+    def test_decision_in_last_lookahead_bars_is_dropped_not_graded_zero(self):
+        bars = self._basket_with_censored_tail()
+        tail_ts = bars["timestamp"][-1]  # a bar INSIDE the key, censored to 0
+        dec = pl.DataFrame(
+            {
+                "symbol": ["GBP_JPY"],
+                "bar_ts": [str(tail_ts)],
+                "live_close": [100.0],
+                "angel": [0.9],
+                "devil": [None],
+                "verdict": ["angel_reject"],
+            }
+        )
+        graded = grade_decisions(dec, bars)
+        self.assertEqual(
+            graded.height, 0,
+            "a censored-tail decision was graded instead of dropped",
+        )
+
+    def test_resolvable_loss_on_the_same_bar_is_kept(self):
+        """A genuine 0 from RESOLVABLE history must survive the purge."""
+        bars = self._basket_with_censored_tail()
+        resolvable_ts = bars["timestamp"][10]
+        bars = bars.with_columns(
+            pl.when(pl.col("timestamp") == resolvable_ts)
+            .then(pl.lit(0, dtype=pl.Int8))
+            .otherwise(pl.col("won"))
+            .alias("won")
+        )
+        dec = pl.DataFrame(
+            {
+                "symbol": ["GBP_JPY"],
+                "bar_ts": [str(resolvable_ts)],
+                "live_close": [100.0],
+                "angel": [0.3],
+                "devil": [None],
+                "verdict": ["angel_reject"],
+            }
+        )
+        graded = grade_decisions(dec, bars)
+        self.assertEqual(graded.height, 1)
+        self.assertEqual(graded["won"][0], 0)
+
+    def test_purge_drops_exactly_lookahead_bars_per_symbol(self):
+        bars = self._basket_with_censored_tail(
+            rows_per_symbol=90, symbols=("GBP_JPY", "EUR_JPY")
+        )
+        purged = purge_unresolvable_tail(bars, LOOKAHEAD_BARS)
+        self.assertEqual(bars.height - purged.height, LOOKAHEAD_BARS * 2)
+        self.assertEqual(purged["won"].min(), 1)  # every censored 0 is gone
+        # type contract: won stays Int8-compatible
+        self.assertIn(purged["won"].dtype, (pl.Int8, pl.UInt8))
+
+    def test_purge_degenerate_symbol_is_kept_untouched(self):
+        """
+        A key shorter than the walk horizon is kept whole — the retrainer's
+        defensive call (dropping it would empty the key entirely).
+        """
+        bars = _bars(
+            [
+                ("GBP_JPY", "2026-08-20 10:00:00", 0),
+                ("GBP_JPY", "2026-08-20 10:15:00", 1),
+            ]
+        )
+        self.assertEqual(purge_unresolvable_tail(bars, LOOKAHEAD_BARS).height, 2)
 
 
 class TestReports(unittest.TestCase):

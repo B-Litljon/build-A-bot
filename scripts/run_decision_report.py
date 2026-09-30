@@ -21,7 +21,10 @@ larger change to the grader itself.
 Glossary:
     decisions -- every bar evaluation the soak recorded, from telemetry.
     answer_key -- per-bar won/lost frame from the bracket walk over cached
-        bars; the ground truth the decisions are graded against.
+        bars; the ground truth the decisions are graded against. The walk runs
+        over the full frame (it needs the contiguous price path); the last
+        LOOKAHEAD_BARS bars per symbol come out censored (dense-labeler
+        default 0), and the grader purges them before joining.
     graded -- decisions joined to the answer key; rows the 45-bar walk could
         not resolve (too close to the end of history) are dropped, never
         invented.
@@ -80,6 +83,10 @@ def main() -> int:
         [prepare_tagged_frame(df, sym) for sym, df in frames.items()],
         how="vertical_relaxed",
     )
+    # The walk runs over the FULL frame (the bracket path must stay
+    # contiguous or resolvable bars would newly truncate); grade_decisions
+    # purges the censored tail (last LOOKAHEAD_BARS per symbol, which the
+    # dense labeler defaulted to 0) before it joins.
     tagged = tagged.with_columns(
         pl.Series("won", _compute_devil_targets_atr(tagged, SL_MULT, TP_MULT, MAX_HOLD))
     )
