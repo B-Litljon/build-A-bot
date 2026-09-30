@@ -73,8 +73,12 @@ Glossary:
     V3HTFFeatures -- higher-timeframe context: what the slower chart says,
         joined onto each fast bar.
     timeframe -- the slower bar size, default "5m".
-    htf_rsi_14 / htf_vol_rel / htf_bb_pct_b -- the same measures as above but
-        computed on the slower bars.
+    htf_rsi_14 / htf_bb_pct_b -- the same measures as above but computed on
+        the slower bars.
+    htf_vol_rel -- the same measure as vol_rel but on the slower bars, and
+        partitioned .over("symbol") when the frame is pooled: the HTF blocks
+        are concatenated per symbol, so an unpartitioned rolling mean would
+        bleed the previous symbol's volume into the next symbol's warm-up.
     htf_trend_agreement -- +1 if price is above the slow 50-bar average, -1 if
         below, 0 if unknown. The cheap "am I trading with or against the bigger
         move" signal.
@@ -442,11 +446,18 @@ class V3HTFFeatures(BaseFeatureGenerator):
             htf_bars = _apply_htf_talib(htf_bars)
 
         # ── 3. Derived HTF features ──────────────────────────────────────────
+        # htf_bars above is a vertical concat of per-symbol blocks, so the
+        # rolling mean MUST be partitioned per symbol: unpartitioned, symbol
+        # B's first ~19 HTF bars would divide by a mean containing symbol A's
+        # trailing volumes (verified 2026-09-30). The same guard pattern is
+        # used by V3CostFeatures and the retrainer's angel target.
+        vol_rel = (
+            pl.col("htf_volume") / pl.col("htf_volume").rolling_mean(window_size=20)
+        )
+        if has_symbol:
+            vol_rel = vol_rel.over("symbol")
         htf_bars = htf_bars.with_columns(
-            (pl.col("htf_volume") / pl.col("htf_volume").rolling_mean(window_size=20))
-            .fill_nan(1.0)
-            .fill_null(1.0)
-            .alias("htf_vol_rel")
+            vol_rel.fill_nan(1.0).fill_null(1.0).alias("htf_vol_rel")
         )
 
         htf_bars = htf_bars.with_columns(

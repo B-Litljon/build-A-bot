@@ -1,10 +1,10 @@
 """
 A simple fixed-percentage training label.
 
-STATUS: used only by ``feature_pipeline.main()``. The LIVE training path
+STATUS: legacy, kept for ``feature_pipeline.main()`` only (verified 2026-09-30
+by grep: no importer under src/core/). The LIVE training path
 (``src/core/retrainer.py``) builds its own labels from volatility-scaled
-brackets and does not use this. Kept because the older pipeline entry point
-still references it.
+brackets and does not use this.
 
 Glossary:
     V3DirectionalTarget -- labels each bar 1 if price rises by at least
@@ -37,7 +37,17 @@ class V3DirectionalTarget(BaseTargetGenerator):
         self.min_gain = min_gain
 
     def generate(self, df: pl.DataFrame) -> pl.DataFrame:
-        future_close = pl.col("close").shift(-self.lookahead)
+        # Legacy note (2026-09-30): used only by feature_pipeline.main(); the
+        # production retrainer labels its own brackets (core/retrainer/_labels.py)
+        # and does not import this class. The shift(-lookahead) must still be
+        # partitioned per symbol, or a pooled multi-symbol frame would copy the
+        # NEXT symbol's opening close onto this symbol's final rows — same
+        # cross-symbol bleed class as the htf_vol_rel bug fixed the same day
+        # in features/v3_features.py.
+        if "symbol" in df.columns:
+            future_close = pl.col("close").shift(-self.lookahead).over("symbol")
+        else:
+            future_close = pl.col("close").shift(-self.lookahead)
         df = df.with_columns(
             pl.when(future_close.is_null())
             .then(pl.lit(None, dtype=pl.Int8))
