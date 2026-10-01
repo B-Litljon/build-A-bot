@@ -91,7 +91,10 @@ pair, and the resolved state of any extra generator (constructor args
 included; non-serializable state raises rather than degrading to a
 class-name-only hash). It deliberately EXCLUDES `gate.model_family`/`n_folds` —
 run provenance, not frame content — which is what lets the estimator A/B reuse
-one cached frame.
+one cached frame. `_SPEC_SCHEMA_VERSION` (currently **3**, bumped 2026-09-27
+when the Devil labels started pricing spread under an active cost table —
+cached table-on frames from schema 2 are stale by construction) is folded
+into the hash so a label-semantics change invalidates old frames wholesale.
 
 - **Imports from repo:** `ml.core.interfaces`; the registry (lazily, for
   family versions).

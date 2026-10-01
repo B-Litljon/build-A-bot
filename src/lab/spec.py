@@ -44,7 +44,9 @@ Glossary:
         The M15 pairing is "1h"; a mismatch is train/serve skew in the htf_*
         columns.
     use_spread_table / spread_table_path -- whether the per-instrument cost
-        table is active (adds cost_ratio, applies measured alphas to the veto).
+        table is active (adds cost_ratio, applies measured alphas to the veto,
+        and — since 2026-09-27, spec-schema 3 — prices the round-trip spread
+        into the Devil label brackets themselves).
     extra_generators -- escape hatch for one-off generators that are not
         registered; each must expose a ``feature_cols`` attribute naming the
         columns it adds.
@@ -74,7 +76,7 @@ DEFAULT_TRADEABLE_6: Tuple[str, ...] = (
     "GBP_NZD",
 )
 
-_SPEC_SCHEMA_VERSION = 2
+_SPEC_SCHEMA_VERSION = 3  # v3: Devil labels now price spread when a table is set
 
 # Spec fields that are RUN PROVENANCE, not frame content: model_family
 # selects the estimator and n_folds shapes the walk-forward, but neither

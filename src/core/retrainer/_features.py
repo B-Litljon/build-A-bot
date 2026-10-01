@@ -2,6 +2,20 @@
 apply_labels_and_veto (labels + vetoes on an already-featured frame; the shared
 half the feature lab reuses), and generate_time_decay_weights. Split out of
 core/retrainer.py on 2026-09-16; apply_labels_and_veto extracted 2026-09-21.
+
+Glossary:
+    engineer_features_and_labels -- the production bars -> training-frame path:
+        pipeline features (V3 base/HTF/session/cost), both Devil labels, the
+        excursion targets, then the chop veto and cleanup. ``alpha_table``
+        feeds three things: the cost_ratio feature, the chop-veto Gate A, and
+        (2026-09-27) the spread-adjusted Devil label brackets.
+    apply_labels_and_veto -- the shared labelling half on an already-featured
+        frame; order is load-bearing (targets before any row-dropping veto so
+        the bracket walks see the contiguous price path).
+    alpha_table -- per-symbol spread cost table ({symbol: alpha}), threaded
+        into cost_ratio, Gate A, and the Devil label brackets. None/empty =
+        frictionless labels and no cost_ratio column. See GLOSSARY.md
+        ("alpha").
 """
 from __future__ import annotations
 
@@ -229,7 +243,10 @@ def apply_labels_and_veto(
         f"(SL={sl_mult}×ATR, TP={tp_mult}×ATR, "
         f"max_hold={max_hold} bars)..."
     )
-    devil_targets_macro = _compute_devil_targets_atr(df, sl_mult=sl_mult, tp_mult=tp_mult, max_hold=max_hold)
+    devil_targets_macro = _compute_devil_targets_atr(
+        df, sl_mult=sl_mult, tp_mult=tp_mult, max_hold=max_hold,
+        alpha_table=alpha_table,
+    )
     df = df.with_columns(pl.Series("devil_target_macro", devil_targets_macro))
     logger.info(
         f"Generated devil_target_macro ({max_hold}-bar bracket): "
@@ -242,7 +259,10 @@ def apply_labels_and_veto(
         f"Computing devil_target via {survival_bars}-bar SL survival "
         f"(SL={sl_mult}×ATR)..."
     )
-    devil_targets_survival = _compute_devil_survival_target(df, sl_mult=sl_mult, survival_bars=survival_bars)
+    devil_targets_survival = _compute_devil_survival_target(
+        df, sl_mult=sl_mult, survival_bars=survival_bars,
+        alpha_table=alpha_table,
+    )
     df = df.with_columns(pl.Series("devil_target", devil_targets_survival))
     logger.info(
         f"Generated devil_target ({survival_bars}-bar survival): "

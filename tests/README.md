@@ -42,6 +42,7 @@ See the root [GLOSSARY.md](../GLOSSARY.md) for domain terms.
 | `test_entry_guards.py` | 15 | Post-exit cooldown + the correlated-exposure cap |
 | `test_events.py` | 11 | The telemetry sink: never raises, never blocks, never on the tick path |
 | `test_cost_feature.py` | 9 | The per-instrument cost feature and veto alphas |
+| `test_spread_labels.py` | 14 | The spread-adjusted Devil label brackets — toll-pays-win/survival boundaries, None-table byte-identity, default-alpha fallback |
 | `test_trading_mcp.py` | 9 | The MCP two-step confirm-token safety flow |
 | `test_oanda_entry.py` | 5 | Net-position arithmetic |
 | `test_oanda_tick_hook.py` | 5 | The raw tick callback contract |

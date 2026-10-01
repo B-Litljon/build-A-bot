@@ -425,6 +425,15 @@ TP_ATR_MULTIPLIER = 3.0
 MAX_HOLD_BARS = 45
 SURVIVAL_BARS = 5  # Phase 5.5: Devil survival window (bars)
 
+# Round-trip spread applied inside the Devil label walks (spread-adjusted
+# brackets, 2026-09-27). Units match RiskManager's Gate A proxy
+# (alpha * baseline_atr_abs, a fraction of ATR) and V3CostFeatures'
+# cost_ratio (alpha * baseline_natr / natr_14) — alpha is dimensionless in
+# NATR units of ATR, so spread_price = alpha * atr_abs. Both Devil target
+# generators shift both bracket edges up by it; None-table runs stay
+# bit-identical to the historical frictionless labels.
+DEFAULT_SPREAD_ALPHA = 0.15
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # INFERENCE THRESHOLDS (must match MLStrategy)
 # ═══════════════════════════════════════════════════════════════════════════════

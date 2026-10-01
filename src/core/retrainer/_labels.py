@@ -1,10 +1,37 @@
 """Devil target construction (bar-by-bar bracket simulation + survival variant) and
 _compute_chop_veto_mask, the training-side mirror of the live RiskManager gates.
 Split out of core/retrainer.py on 2026-09-16.
+
+Since 2026-09-27 the two Devil target generators optionally price the
+round-trip spread into their simulated brackets (keyword-only ``alpha_table``),
+so the label says "would this have won after paying the toll". Without a table
+they stay frictionless Mid-price labels, byte-identical to the pre-fix path.
+
+Glossary:
+    _compute_devil_targets_atr -- the MACRO label: replay each bar forward up
+        to max_hold bars and record whether TP (tp_mult x ATR) hit before SL
+        (sl_mult x ATR). SL is checked first each bar (a bar touching both is
+        a loss, conservative), timeout is a loss. With ``alpha_table`` the
+        simulated long pays round-trip spread (both bracket edges shifted up
+        by alpha*ATR through Mid); see the docstring for the equations.
+    _compute_devil_survival_target -- the survival label the Devil trains on
+        by default: did Mid low avoid the stop for survival_bars bars. With
+        ``alpha_table`` the effective stop rises by alpha*ATR (toll paid).
+    _compute_chop_veto_mask -- vectorised copy of the live pre-trade veto:
+        Gate A cost (sl_dist < k_eff x spread), Gate B regime percentile,
+        Gate C NY-rollover blackout (DST-correct). Runs AFTER target
+        generation so the walks see the contiguous price path.
+    alpha_table -- per-symbol spread cost table ({symbol: alpha}), alpha in
+        NATR units of ATR (dimensionless, matching the Gate A proxy and
+        cost_ratio). None/empty = frictionless labels; unlisted symbols take
+        DEFAULT_SPREAD_ALPHA. See GLOSSARY.md ("alpha").
+    DEFAULT_SPREAD_ALPHA -- 0.15, the fallback alpha for symbols missing from
+        the table; the same placeholder as RiskProfile.spread_atr_alpha.
 """
 from __future__ import annotations
 
 from ._common import (
+    DEFAULT_SPREAD_ALPHA,
     MAX_HOLD_BARS,
     Optional,
     RiskProfile,
@@ -29,6 +56,8 @@ def _compute_devil_targets_atr(
     sl_mult: float = SL_ATR_MULTIPLIER,
     tp_mult: float = TP_ATR_MULTIPLIER,
     max_hold: int = MAX_HOLD_BARS,
+    *,
+    alpha_table: Optional[dict] = None,
 ) -> np.ndarray:
     """
     Compute Devil targets using dynamic ATR brackets with bar-by-bar resolution.
@@ -36,6 +65,22 @@ def _compute_devil_targets_atr(
     For each bar i, simulates a bracket order:
         SL = close[i] - sl_mult * ATR_abs[i]
         TP = close[i] + tp_mult * ATR_abs[i]
+
+    ``alpha_table`` (spread-adjusted brackets, 2026-09-27): when provided,
+    each simulated LONG pays the round-trip spread. Historical bars are Mid,
+    but a live entry is at Ask and exits at Bid, so the bracket edges move UP
+    through Mid by ``spread = alpha[symbol] * ATR_abs``:
+
+        SL_hit requires Mid low[j]  <= close[i] - sl_mult*ATR_abs + spread
+        TP_hit requires Mid high[j] >= close[i] + tp_mult*ATR_abs + spread
+
+    Both shifts make the trade harder — exactly the point. Alpha units match
+    RiskManager's Gate A proxy (``alpha * baseline_atr_abs``, a dimensionless
+    fraction of ATR) and V3CostFeatures' ``cost_ratio``. Symbols missing from
+    the table (including the placeholder empty symbol used by frames without
+    a symbol column) take ``DEFAULT_SPREAD_ALPHA``. When ``alpha_table`` is
+    None or empty the brackets stay frictionless and the output is
+    byte-identical to the pre-2026-09-27 labels.
 
     Then walks forward up to max_hold bars checking:
         - If low[j] <= SL → loss (0)
@@ -53,6 +98,9 @@ def _compute_devil_targets_atr(
         sl_mult: ATR multiplier for stop-loss (default: SL_ATR_MULTIPLIER).
         tp_mult: ATR multiplier for take-profit (default: TP_ATR_MULTIPLIER).
         max_hold: Maximum bars to hold before timeout (default: MAX_HOLD_BARS).
+        alpha_table: Optional per-symbol spread alphas. None or empty =
+            frictionless Mid labels (legacy behavior, byte-identical); when
+            provided, missing symbols use DEFAULT_SPREAD_ALPHA.
 
     Returns:
         NumPy array of int8 (0 = loss/timeout, 1 = win), same length as df.
@@ -65,14 +113,22 @@ def _compute_devil_targets_atr(
     symbol = df["symbol"].to_numpy() if "symbol" in df.columns else np.array([""] * len(close))
     n = len(close)
     targets = np.zeros(n, dtype=np.int8)
+    # Truthiness convention, matching V3CostFeatures: None or {} → frictionless
+    # Mid labels (byte-identical to the pre-spread-toll path); a non-empty
+    # table prices every row, with unlisted symbols on DEFAULT_SPREAD_ALPHA.
+    table = alpha_table or None
 
     for i in range(n - 1):
         atr_abs = close[i] * natr[i] / 100.0
         if np.isnan(atr_abs) or atr_abs <= 0:
             continue
 
-        sl_price = close[i] - sl_mult * atr_abs
-        tp_price = close[i] + tp_mult * atr_abs
+        spread = (
+            table.get(str(symbol[i]), DEFAULT_SPREAD_ALPHA) * atr_abs
+            if table else 0.0
+        )
+        sl_price = close[i] - sl_mult * atr_abs + spread
+        tp_price = close[i] + tp_mult * atr_abs + spread
 
         for j in range(i + 1, min(i + max_hold + 1, n)):
             if symbol[j] != symbol[i]:
@@ -93,6 +149,8 @@ def _compute_devil_survival_target(
     df: pl.DataFrame,
     sl_mult: float = SL_ATR_MULTIPLIER,
     survival_bars: int = SURVIVAL_BARS,
+    *,
+    alpha_table: Optional[dict] = None,
 ) -> np.ndarray:
     """
     Compute Devil survival targets: whether price survives the SL for the
@@ -109,6 +167,16 @@ def _compute_devil_survival_target(
         target[i] = 1  if  low[j] > SL_price  for ALL j in [i+1, i+SURVIVAL_BARS]
         target[i] = 0  if  low[j] <= SL_price  for ANY j in that window
 
+    ``alpha_table`` (spread-adjusted brackets, 2026-09-27): when provided,
+    the simulated LONG pays the round-trip spread and the SL-breach test
+    becomes ``low[j] <= close[i] - sl_mult*ATR_abs + spread``, with
+    ``spread = alpha[symbol] * atr_abs`` — the effective stop rises through
+    Mid, so survival is measured after paying the toll. Alpha units match
+    RiskManager's Gate A proxy (``alpha * baseline_atr_abs``); symbols the
+    table doesn't list (including the placeholder symbol of frames without a
+    symbol column) use ``DEFAULT_SPREAD_ALPHA``. A None or empty table keeps
+    the legacy frictionless labels, byte-identical.
+
     SL price is computed identically to the live bracket:
         SL = close[i] - sl_mult * ATR_abs[i]
         ATR_abs = close[i] * natr_14[i] / 100.0
@@ -117,6 +185,9 @@ def _compute_devil_survival_target(
         df:             DataFrame with 'close', 'low', 'natr_14' columns.
         sl_mult:        ATR multiplier for stop-loss (default: SL_ATR_MULTIPLIER).
         survival_bars:  Number of bars to check for SL breach (default: SURVIVAL_BARS).
+        alpha_table:    Optional per-symbol spread alphas. None or empty =
+            frictionless Mid labels (legacy behavior, byte-identical); missing
+            symbols use DEFAULT_SPREAD_ALPHA.
 
     Returns:
         NumPy int8 array of length len(df).
@@ -129,6 +200,10 @@ def _compute_devil_survival_target(
     symbol = df["symbol"].to_numpy() if "symbol" in df.columns else np.array([""] * len(close))
     n = len(close)
     targets = np.zeros(n, dtype=np.int8)
+    # Truthiness convention, matching V3CostFeatures: None or {} → frictionless
+    # Mid labels (byte-identical to the pre-spread-toll path); a non-empty
+    # table prices every row, with unlisted symbols on DEFAULT_SPREAD_ALPHA.
+    table = alpha_table or None
 
     for i in range(n - 1):
         # Insufficient lookahead safety: check if symbol changes before survival window completes
@@ -139,7 +214,11 @@ def _compute_devil_survival_target(
         if np.isnan(atr_abs) or atr_abs <= 0:
             continue
 
-        sl_price = close[i] - sl_mult * atr_abs
+        spread = (
+            table.get(str(symbol[i]), DEFAULT_SPREAD_ALPHA) * atr_abs
+            if table else 0.0
+        )
+        sl_price = close[i] - sl_mult * atr_abs + spread
         survived = True
 
         for j in range(i + 1, min(i + survival_bars + 1, n)):

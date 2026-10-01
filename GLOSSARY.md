@@ -222,6 +222,19 @@ typical move. Dimensionless: 0.07 means the toll is 7% of a normal move (cheap);
 per-instrument values are measured live and baked by
 `scripts/bake_spread_alphas.py`.
 
+**spread-adjusted Devil labels (2026-09-27)** — the training target's answer
+to "but you pay the spread". Historical bars are Mid; a live long enters at
+Ask and exits at Bid, so the Devil target generators
+(`core/retrainer/_labels.py`) shift BOTH simulated bracket edges UP through
+Mid by `spread = alpha[symbol] × ATR` when an `alpha_table` is passed: TP hit
+needs Mid `high ≥ close + tp_mult·ATR + spread`, SL hit needs Mid
+`low ≤ close − sl_mult·ATR + spread`. Both shifts make the trade harder —
+the label now says "won after paying the toll", not "won on paper". No table
+(None/empty) keeps the frictionless Mid labels byte-identical to the
+pre-2026-09-27 history. Symbols missing from the table are charged
+`DEFAULT_SPREAD_ALPHA` (0.15). Same alpha units as the Gate A proxy and
+`cost_ratio`.
+
 **`cost_ratio`** — that same cost inequality turned into a model *feature*, so
 the model can see cost rather than having expensive setups silently filtered out
 behind it. *(`V3CostFeatures`)*

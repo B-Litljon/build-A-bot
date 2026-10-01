@@ -220,9 +220,14 @@ Glossary:
     _SPREAD_TABLE_PATH / SPREAD_TABLE -- optional per-instrument trading-cost
         table (RETRAIN_SPREAD_TABLE). When set, the cost gate uses each
         instrument's measured cost instead of one flat assumption, a
-        ``cost_ratio`` feature is added so the model can see cost directly, and
-        the table is copied next to the model on promotion. Unset, runs are
-        bit-identical to before that experiment.
+        ``cost_ratio`` feature is added so the model can see cost directly,
+        the table is copied next to the model on promotion, and (since
+        2026-09-27) the Devil labels' simulated brackets pay the same toll.
+        Unset, runs are bit-identical to before that experiment.
+    DEFAULT_SPREAD_ALPHA -- 0.15; the alpha charged to symbols missing from
+        the spread table inside the Devil label walks. Mirrors
+        RiskProfile.spread_atr_alpha's placeholder; units are NATR of ATR
+        (dimensionless), same convention as the Gate A proxy and cost_ratio.
 
     BASE_FEATURE_COLS -- the 17 always-on model inputs (5 dead/memorized
         features dropped 2026-08-29 to prevent overfit): 10 single-bar
@@ -249,8 +254,13 @@ Glossary:
     _compute_devil_targets_atr -- the MACRO label: replay each bar forward up
         to max_hold and record whether target or stop came first. Stop is
         checked first each bar, so a bar touching both is scored a loss.
+        Keyword-only ``alpha_table`` (2026-09-27) prices the round-trip spread
+        into the simulated long — both bracket edges shift up through Mid by
+        alpha*ATR — so a win must clear the toll; None/empty stays frictionless.
     _compute_devil_survival_target -- the label actually trained on: did price
-        avoid the stop for the next 5 bars. Introduced because the Devil's
+        avoid the stop for the next 5 bars. Same ``alpha_table`` kwarg: the
+        effective stop rises by alpha*ATR when the table is provided.
+        Introduced because the Devil's
         inputs describe a 1-5 minute horizon, so asking it about a 45-bar
         outcome was an unlearnable mismatch.
     _compute_chop_veto_mask -- vectorised copy of the live pre-trade veto, so
@@ -321,6 +331,7 @@ from ._common import (  # noqa: F401
     DAYS_BACK,
     DEFAULT_HORIZON,
     DEFAULT_RR_FLOOR,
+    DEFAULT_SPREAD_ALPHA,
     DEFAULT_TAU_MAE,
     DEFAULT_TAU_MFE,
     DEVIL_LABEL_DEFAULT,

@@ -34,6 +34,21 @@ wiring). `__init__.py` re-exports every historical name — importers
 unchanged. Patch discipline: tests monkeypatch at the *owning* submodule
 (`core.retrainer._common` etc.), not the facade.
 
+**Devil labels price the spread when a cost table is active (2026-09-27).**
+Both target generators in `_labels` (`_compute_devil_targets_atr`,
+`_compute_devil_survival_target`) take a keyword-only `alpha_table`; a
+non-empty table shifts both simulated bracket edges up through Mid by
+`alpha[symbol] × ATR` (TP needs `tp_mult·ATR + spread`, SL breach needs
+`sl_mult·ATR − spread` from the other side — both harder), so the label
+tracks what a live long actually pays (entry Ask, exit Bid, bars Mid).
+`engineer_features_and_labels`/`apply_labels_and_veto` thread the same
+`alpha_table` the cost feature and Gate A already receive. No table — which
+is every current default path, since `RETRAIN_SPREAD_TABLE` is unset in
+production — is byte-identical to the historical frictionless labels.
+Unlisted symbols are charged `DEFAULT_SPREAD_ALPHA` (0.15). Note for lab
+users: with the table on, cached lab frames built before this change are
+stale — the spec content-hash schema was bumped to 3 for exactly that.
+
 The training pipeline and the promotion gate. Fetches history, carves a
 chronologically last holdout slice **before** any feature engineering, engineers
 features on the remainder, purges the remainder's unresolvable tail (the last
