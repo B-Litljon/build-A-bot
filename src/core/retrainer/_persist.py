@@ -21,6 +21,7 @@ from ._common import (
     Optional,
     PROFIT_FACTOR_THRESHOLD,
     Path,
+    RETRAIN_EXCLUDE_ROLLOVER_BARS,
     SPREAD_TABLE,
     _SPREAD_TABLE_PATH,
     datetime,
@@ -429,6 +430,12 @@ def save_models(
         # Declares the live gate this artifact requires. A non-empty
         # list served without a matching veto is train/serve skew.
         "behavior_veto": sorted(BEHAVIOR_VETO_LABELS),
+        # (2026-10-01) Whether the training window excluded NY-rollover bars
+        # BEFORE feature generation. Served models that trained with this must
+        # eventually be fed matching (rounded) live prices — recorded here so
+        # the serving-side OANDA_ROUND_MID_TO_PIPETTE rollout can be checked
+        # against the artifact, not guessed.
+        "rollover_bar_exclusion": RETRAIN_EXCLUDE_ROLLOVER_BARS,
         # Holdout record: what the served artifact earned on data it never saw.
         # If the holdout was disabled or empty, "used" is false and the reason
         # is recorded so the artifact cannot be mistaken for one that passed a

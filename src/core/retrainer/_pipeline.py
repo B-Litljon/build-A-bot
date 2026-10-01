@@ -1,7 +1,24 @@
 """main() — end-to-end wiring: config -> fetch -> holdout carve -> features ->
 validate -> promote. Split out of core/retrainer.py on 2026-09-16.
+
+Glossary:
+    _rollover_exclusion_mask -- boolean mask (True = drop) of the bars whose
+        America/New_York local time falls inside the Gate C rollover window
+        (execution.risk_manager.get_blackout_window_et: RISK_BLACKOUT_ET, then
+        _DEFAULT_BLACKOUT_ET = 16:55-17:30 ET). Runs on the pre-featurization
+        RAW frame. RETRAIN_EXCLUDE_ROLLOVER_BARS=1 (default) enables it.
+    _exclude_rollover_bars -- applies that mask to the raw remainder/holdout
+        and reports the dropped count. Complements, does not replace, the
+        post-labeling chop veto: the veto decides ENTRIES after targets are
+        built (so the bracket walk keeps the contiguous path), this exclusion
+        keeps the transition bars OUT of the indicators entirely so they cannot
+        poison neighboring rows' rolling features. Both default on; toggles are
+        independent (RETRAIN_EXCLUDE_ROLLOVER_BARS vs RISK_TIME_GATE_ENABLED).
+    ROLLOVER_WINDOW_DESC -- "16:55-17:30" (America/New_York), shown in the log.
 """
 from __future__ import annotations
+
+import polars as pl
 
 from . import _common as common
 from . import _data as data
@@ -10,9 +27,11 @@ from ._common import (
     FEATURE_COLS,
     HOLDOUT_PF_CONFIDENCE,
     Optional,
+    RETRAIN_EXCLUDE_ROLLOVER_BARS,
     RETRAIN_LEARN_BARRIERS,
     RiskProfile,
     SPREAD_TABLE,
+    Tuple,
     _SPREAD_TABLE_PATH,
     compute_feature_stats,
     fit_regime_models,
@@ -24,9 +43,122 @@ from ._common import (
 )
 from ._types import (HoldoutMetrics,)
 from ._gate import (_holdout_pf_lower_bound, _holdout_verdict, _purge_boundary_tail, _score_artifact_holdout, _tail_cutoff_by_symbol, validate_candidate,)
-from ._data import (_split_holdout,)
-from ._features import (engineer_features_and_labels,)
+from ._data import (_split_holdout, fetch_training_data,)
+from ._features import (apply_labels_and_veto, engineer_features_and_labels,)
 from ._persist import (fit_and_save_barriers,)
+
+ROLLOVER_WINDOW_DESC = "16:55-17:30"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# NY-ROLLOVER BAR EXCLUSION (training-side, pre-featurization)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _rollover_exclusion_mask(raw_df: pl.DataFrame) -> pl.Series:
+    """
+    Boolean mask (True = drop) for the NY rollover window, pre-featurization.
+
+    WHY a second exclusion exists alongside Gate C's entry veto: the chop veto
+    (_compute_chop_veto_mask, post-labeling) drops rollover rows only as trade
+    ENTRIES, deliberately after target generation so the bracket walk keeps the
+    contiguous price path. Their bars still feed the rolling features of
+    NEIGHBORING rows (group_by_dynamic / rolling windows do not know the veto
+    exists), and the 16:55–17:30 ET transition bars' extreme hour_of_day /
+    bb_pct_b / vol_rel excursions are exactly what the trees keyed on — every
+    Angel proposal the live soak has ever seen was on an illiquid rollover bar
+    (soak evidence, 2026-09). Dropping the bars BEFORE feature generation keeps
+    that poison out of the indicators; the post-labeling veto keeps the entry
+    discipline. Two mechanisms, two layers, both needed.
+
+    The window is THE Gate C definition, not a copy: times come from
+    ``execution.risk_manager.get_blackout_window_et`` (RISK_BLACKOUT_ET /
+    _DEFAULT_BLACKOUT_ET), imported lazily and both-spelled (``src.execution`` /
+    ``execution``) exactly as _common.py imports the retrainer's execution-side
+    dependencies — no copy of the window lives here (the 2026-09-15 lesson).
+    Converted per-row to America/New_York so it tracks DST like the live gate.
+    Naive timestamps are assumed UTC (the same assumption everywhere in the
+    retrainer).
+
+    Gated by RETRAIN_EXCLUDE_ROLLOVER_BARS (default on); returns an all-False
+    mask when disabled.
+    """
+    n_total = raw_df.height
+    if not RETRAIN_EXCLUDE_ROLLOVER_BARS or n_total == 0:
+        return pl.Series(values=[False] * n_total, dtype=pl.Boolean)
+
+    # Execution-side import, lazily and both-spelled like _common.py does:
+    # this pulls the Gate C window from risk_manager WITHOUT re-deriving it
+    # here (the 2026-09-15 lesson: one DST-anchored definition, not three).
+    try:
+        from src.execution.risk_manager import (
+            ENV_BLACKOUT_ET,
+            get_blackout_window_et,
+        )
+    except ImportError:
+        from execution.risk_manager import (
+            ENV_BLACKOUT_ET,
+            get_blackout_window_et,
+        )
+
+    window = get_blackout_window_et()
+    if window is None:
+        logger.warning(
+            "Rollover exclusion ON but RISK_BLACKOUT_ET=%r does not parse — "
+            "no bars excluded",
+            os.getenv(ENV_BLACKOUT_ET, ""),
+        )
+        return pl.Series(values=[False] * n_total, dtype=pl.Boolean)
+    start, end = window
+
+    if "timestamp" not in raw_df.columns:
+        logger.warning(
+            "Rollover exclusion ON but frame lacks a 'timestamp' column — "
+            "no bars excluded"
+        )
+        return pl.Series(values=[False] * n_total, dtype=pl.Boolean)
+
+    ts = raw_df["timestamp"]
+    if getattr(ts.dtype, "time_zone", None) is None:
+        ts = ts.dt.replace_time_zone("UTC")
+    ny = ts.dt.convert_time_zone("America/New_York")
+    # .dt.hour() is Int8 — cast before multiplying or 22*3600 overflows.
+    secs = (
+        ny.dt.hour().cast(pl.Int64) * 3600
+        + ny.dt.minute().cast(pl.Int64) * 60
+        + ny.dt.second().cast(pl.Int64)
+    )
+    start_s = start.hour * 3600 + start.minute * 60
+    end_s = end.hour * 3600 + end.minute * 60
+    if start_s <= end_s:
+        inside = (secs >= start_s) & (secs < end_s)
+    else:
+        inside = (secs >= start_s) | (secs < end_s)  # window wraps midnight
+    return inside
+
+
+def _exclude_rollover_bars(raw_df: pl.DataFrame) -> Tuple[pl.DataFrame, int]:
+    """
+    Drop pre-featurization rows inside the Gate C NY-rollover window.
+
+    Applies the mask from _rollover_exclusion_mask and logs how many bars went
+    (0 with an explanation when the exclusion is disabled / unparseable / the
+    frame carries no timestamp column).
+    """
+    mask = _rollover_exclusion_mask(raw_df)
+    n_drop = int(mask.sum()) if raw_df.height else 0
+    if n_drop == 0:
+        return raw_df, 0
+    filtered = raw_df.filter(~mask)
+    logger.info(
+        "ROLLOVER BAR EXCLUSION: dropped %d of %d pre-featurization bars inside "
+        "the %s ET Gate C window (poisons rolling features of neighboring rows; "
+        "the post-labeling chop veto still applies separately)",
+        n_drop,
+        raw_df.height,
+        ROLLOVER_WINDOW_DESC,
+    )
+    return filtered, n_drop
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -117,6 +249,32 @@ def main() -> int:
                     holdout_range[0].isoformat(),
                     holdout_range[1].isoformat(),
                 )
+
+        # ─── Phase 2b: Rollover bar exclusion (pre-featurization) ───────────
+        # Applied to each slice AFTER the carve so the boundary timestamp still
+        # splits the same bars. Feature/label engineering never looks forward
+        # across rows by calendar, so an identical fraction of removed bars in
+        # both slices preserves every property the carve guarantees — and each
+        # slice's indicators must not see the rollover bars, whichever slice
+        # they landed in.
+        remainder_raw, n_rollover_remainder = _exclude_rollover_bars(remainder_raw)
+        holdout_raw, n_rollover_holdout = _exclude_rollover_bars(holdout_raw)
+        if RETRAIN_EXCLUDE_ROLLOVER_BARS and remainder_raw.is_empty():
+            raise ValueError(
+                "Rollover bar exclusion emptied the training remainder — "
+                "check RISK_BLACKOUT_ET and the data window"
+            )
+        if RETRAIN_EXCLUDE_ROLLOVER_BARS and holdout_raw.is_empty() and n_rollover_holdout:
+            raise ValueError(
+                "Rollover bar exclusion emptied the holdout slice — "
+                "check RISK_BLACKOUT_ET and the data window"
+            )
+        if n_rollover_remainder or n_rollover_holdout:
+            logger.info(
+                "Rollover exclusion totals: remainder %d bars, holdout %d bars",
+                n_rollover_remainder,
+                n_rollover_holdout,
+            )
 
         # ─── Phase 2.5: Per-instrument spread-cost table (optional) ────────
         spread_alphas: Optional[dict] = None

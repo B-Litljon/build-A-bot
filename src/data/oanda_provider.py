@@ -59,6 +59,22 @@ Glossary:
     get_tradeable_instruments -- the full set of instrument names this ACCOUNT
         may trade, for membership tests. Returns an empty set on API failure,
         which callers must read as "unknown", never as "nothing tradeable".
+    PIPETTE_DECIMALS -- per-instrument decimal places of the pipette: JPY
+        crosses 3, everything else OANDA_PIPETTE_DECIMALS_DEFAULT = 5. OANDA's
+        price convention, encoded explicitly because no instrument metadata in
+        this repo publishes pipLocation/displayPrecision.
+    pipette_decimals(symbol) -- returns that instrument's entry from the table.
+    _round_mid / _mid_rounding_enabled -- the serving-side quantization: rounds
+        emitted bar prices to pipette precision to match the REST candles the
+        training data is built from (~79% of GBP_JPY live closes used to
+        diverge from the REST candle at the same timestamp: (bid+ask)/2 of two
+        5-decimal quotes carries a half-pipette digit the candle cannot print).
+        OFF by default (OANDA_ROUND_MID_TO_PIPETTE): the live soak reads this
+        tree, so live price handling may only change by explicit env choice.
+        The raw tick_callback and internal tick math are never rounded — only
+        the values _flush_bar emits are, and the cached self._round_mids
+        snapshot means a restart (not a mid-stream env flip) is the switch
+        point.
 """
 
 import asyncio
@@ -67,6 +83,7 @@ import os
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Callable, Dict, List, Optional
 
 import oandapyV20
@@ -100,6 +117,70 @@ _GRANULARITY: Dict[int, str] = {
 }
 
 _MAX_CANDLES = 5000
+
+# ── Instrument price precision ────────────────────────────────────────────
+# Decimal places per OANDA's display precision: 3 for JPY crosses
+# (pipette = 0.001), 5 for everything else (pipette = 0.0001). Metals
+# (XAU_USD etc.) fall back to the 5-decimal default; their REST candles
+# quote "1585.025"-style mids, and any residual mismatch there is harmless
+# because this account cannot trade metals anyway (UNTRADEABLE_SYMBOLS).
+# This table exists because live mids were emitted UNROUNDED — (bid+ask)/2
+# of two 5-decimal quotes lands on a half-pipette (…5 at one digit past the
+# pipette), which the pipette-quantized REST candles that build the training
+# data can never print: ~79% of GBP_JPY live closes diverged from the REST
+# candle at the same timestamp (2026-09 audit). OANDA never publishes
+# pipLocation/displayPrecision in this repo, so the convention is encoded
+# HERE, explicitly, instead of being guessed per tick.
+OANDA_PIPETTE_DECIMALS_DEFAULT = 5
+PIPETTE_DECIMALS: Dict[str, int] = {
+    "AUD_JPY": 3,
+    "CAD_JPY": 3,
+    "CHF_JPY": 3,
+    "EUR_JPY": 3,
+    "GBP_JPY": 3,
+    "NZD_JPY": 3,
+    "SGD_JPY": 3,
+    "USD_JPY": 3,
+}
+
+# Serving-side fix toggle. DEFAULT OFF, deliberately: the soak reads this
+# working tree, so any unconditional change to emitted bar prices would land
+# on the live process at the next watchdog restart un-validated. Set
+# OANDA_ROUND_MID_TO_PIPETTE=1 (after verifying the next promoted artifact
+# was trained with matching prices) to align live bar prices with the
+# pipette-quantized REST candles the training data is built from.
+OANDA_ROUND_MID_TO_PIPETTE = "OANDA_ROUND_MID_TO_PIPETTE"
+
+
+def _mid_rounding_enabled() -> bool:
+    """OANDA_ROUND_MID_TO_PIPETTE toggles live-mid quantization. Default off."""
+    raw = os.getenv(OANDA_ROUND_MID_TO_PIPETTE, "0").strip().lower()
+    return raw not in ("", "0", "false", "no", "off")
+
+
+def pipette_decimals(symbol: str) -> int:
+    """Decimal places of the instrument's pipette (JPY crosses 3, else 5)."""
+    return PIPETTE_DECIMALS.get(_to_oanda_symbol(symbol), OANDA_PIPETTE_DECIMALS_DEFAULT)
+
+
+def _round_mid(symbol: str, mid: float) -> float:
+    """Quantize a live mid to the instrument's pipette precision.
+
+    REST candles (training data) are pipette-quantized floats; the streamed
+    mid = (bid + ask) / 2 can carry an extra half-pipette digit (adjacent-
+    pipette quotes make exact .5 ties COMMON, which is why this cannot use
+    builtin round(): it rounds half-to-even and its answer on a tie is decided
+    by the value's binary representation, not by the convention a market data
+    vendor applies). Half-up on the decimal string is the honest convention.
+    Gated by OANDA_ROUND_MID_TO_PIPETTE (default off — an un-configured tree
+    must behave exactly as before). Unknown instruments get the 5-decimal
+    default.
+    """
+    if not _mid_rounding_enabled():
+        return mid
+    d = pipette_decimals(symbol)
+    q = Decimal(1).scaleb(-d)
+    return float(Decimal(repr(mid)).quantize(q, rounding=ROUND_HALF_UP))
 
 
 def _to_oanda_symbol(symbol: str) -> str:
@@ -178,6 +259,11 @@ class OandaMarketProvider(MarketDataProvider):
         self._tick_callback: Optional[Callable] = None
         self._symbols: List[str] = []
         self._stop_event = threading.Event()
+        # Cached at construction: whether emitted bar prices are quantized to
+        # the instrument's pipette (OANDA_ROUND_MID_TO_PIPETTE=1). Read once —
+        # flipping the env var mid-stream must NOT change price handling; a
+        # restart is the well-defined switch point.
+        self._round_mids = _mid_rounding_enabled()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
         # Liveness state (C3 hardening)
@@ -275,15 +361,33 @@ class OandaMarketProvider(MarketDataProvider):
 
     def _flush_bar(self, instrument: str, state: dict) -> None:
         """Fire the callback with the completed bar dict."""
-        bar = {
-            "symbol": instrument,
-            "timestamp": state["bar_start"],
-            "open": state["open"],
-            "high": state["high"],
-            "low": state["low"],
-            "close": state["close"],
-            "volume": float(state["volume"]),
-        }
+        if self._round_mids:
+            d = pipette_decimals(instrument)
+
+            def q(v: float) -> float:
+                return float(
+                    Decimal(repr(v)).quantize(Decimal(1).scaleb(-d), rounding=ROUND_HALF_UP)
+                )
+
+            bar = {
+                "symbol": instrument,
+                "timestamp": state["bar_start"],
+                "open": q(state["open"]),
+                "high": q(state["high"]),
+                "low": q(state["low"]),
+                "close": q(state["close"]),
+                "volume": float(state["volume"]),
+            }
+        else:
+            bar = {
+                "symbol": instrument,
+                "timestamp": state["bar_start"],
+                "open": state["open"],
+                "high": state["high"],
+                "low": state["low"],
+                "close": state["close"],
+                "volume": float(state["volume"]),
+            }
         if self._loop is not None and self._loop.is_running():
             asyncio.run_coroutine_threadsafe(self._callback(bar), self._loop)
         else:

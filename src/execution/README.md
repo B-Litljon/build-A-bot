@@ -53,7 +53,13 @@ trade?" with a specific constraint.
 > **Symmetry contract:** `coupled_keff` and the gate logic are mirrored by
 > `retrainer._compute_chop_veto_mask`, so the model only ever trains on bars the
 > live bot would actually take. Change a gate here without changing the training
-> side and the model learns from setups it will never be offered.
+> side and the model learns from setups it will never be offered. The same
+> contract now covers the window itself: `get_blackout_window_et()` is the
+> single parsing seam for the Gate C window (RISK_BLACKOUT_ET, then the
+> 16:55–17:30 ET default) — the retrainer's pre-featurization rollover bar
+> exclusion (`_pipeline._exclude_rollover_bars`, 2026-10-01) reads THIS
+> function rather than keeping its own copy, so retuning RISK_BLACKOUT_ET
+> retunes the live gate, the training entry veto AND the exclusion together.
 
 Note the forex profile overrides the bracket multipliers to **2.0× / 4.0×**
 (2:1) — not the 0.5/3.0 defaults, and not the 1.0/2.0 it ran until 2026-08-08.

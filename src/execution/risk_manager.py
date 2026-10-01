@@ -74,6 +74,12 @@ Glossary:
         toxic then regardless of conditions. Anchored to New York local time,
         not UTC, so it tracks daylight saving instead of drifting an hour
         twice a year.
+    get_blackout_window_et -- the window itself, parsed, for code OUTSIDE this
+        module: ((start, end) times, or None when the spec does not parse).
+        Resolution order RISK_BLACKOUT_ET then _DEFAULT_BLACKOUT_ET — the
+        same order the gates use, so one retune moves every consumer. The
+        retrainer's pre-featurization rollover exclusion reads this (added
+        2026-10-01); do not re-parse "HH:MM-HH:MM" anywhere else.
 
     spread_k_base -- 3.0 for forex; the base safety multiple on cost in Gate A.
         Algebraically a TOLL CAP: the gate is sl_dist >= k * spread, i.e. it
@@ -303,6 +309,26 @@ def _parse_blackout_et(spec: str) -> "Optional[Tuple[dtime, dtime]]":
     except Exception:
         logger.warning("Invalid RISK_BLACKOUT_ET=%r; Gate C disabled", spec)
         return None
+
+
+def get_blackout_window_et(
+    spec: "Optional[str]" = None,
+) -> "Optional[Tuple[dtime, dtime]]":
+    """
+    The Gate C rollover window (America/New_York) as ``(start, end)``, or None.
+
+    Resolution order matches the gates: explicit ``spec``, then RISK_BLACKOUT_ET,
+    then _DEFAULT_BLACKOUT_ET. This is the single parsing seam for code OUTSIDE
+    RiskManager that needs the same window — today the retrainer's bar-level
+    rollover exclusion (_rollover_exclusion_mask), which must match Gate C
+    exactly or it would drop bars the live bot trades / spare ones it vetoes.
+    Reuse this instead of re-parsing "HH:MM-HH:MM" anywhere else (2026-09-15
+    lesson: one DST-anchored definition, not three).
+    """
+    resolved = (
+        spec if spec is not None else os.getenv(ENV_BLACKOUT_ET, _DEFAULT_BLACKOUT_ET)
+    )
+    return _parse_blackout_et(resolved)
 
 
 # Metals quoted like forex pairs (XAU_USD etc.) where a 0.0001 "pip" is

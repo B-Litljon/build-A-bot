@@ -1,6 +1,14 @@
 """Env configuration, classifier factory, feature columns, spread-cost table, and the shared
 import machinery that every other retrainer submodule inherits via re-export.
 Everything below was split out of the monolithic core/retrainer.py on 2026-09-16.
+
+Glossary:
+    RETRAIN_EXCLUDE_ROLLOVER_BARS -- env flag (2026-10-01), default ON: drops
+        bars inside the Gate C NY-rollover window from the raw frame BEFORE
+        feature generation (applied by _pipeline._exclude_rollover_bars).
+        Training-data hygiene only — no live process reads training code, so
+        unlike the serving-side OANDA_ROUND_MID_TO_PIPETTE this can default on
+        safely. Set to 0/false/no/off to restore the pre-fix behaviour.
 """
 from __future__ import annotations
 
@@ -113,6 +121,17 @@ DAYS_BACK = int(os.getenv("RETRAIN_DAYS_BACK", "60"))
 # persists BarrierEstimator (barriers_mae.pkl, barriers_mfe.pkl,
 # barriers_meta.json) alongside the Angel and Devil classifiers.
 RETRAIN_LEARN_BARRIERS = os.getenv("RETRAIN_LEARN_BARRIERS", "1").strip() == "1"
+
+# (2026-10-01) Pre-featurization NY-rollover bar exclusion — default ON:
+# training-data hygiene only (models change when a retrain runs and passes
+# the gate; no live process reads training code, unlike the serving side),
+# it drops bars only inside the window live Gate C already vetoes for
+# entries, and it is one env var away from the old behaviour. Applied by
+# _pipeline._exclude_rollover_bars; see that module for the mechanism.
+RETRAIN_EXCLUDE_ROLLOVER_BARS = (
+    os.getenv("RETRAIN_EXCLUDE_ROLLOVER_BARS", "1").strip().lower()
+    not in ("0", "false", "no", "off")
+)
 
 # Which label the Devil is trained AND scored on.
 ENV_DEVIL_LABEL = "RETRAIN_DEVIL_LABEL"

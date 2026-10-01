@@ -1,7 +1,9 @@
 # `tests/`
 
-**588 tests + 17 subtests, all passing** (2026-09-21, after the served-artifact
-replay landed). Run with:
+**642 tests + 17 subtests, all passing** (2026-10-01, after the rollover-bar
+exclusion and the pipette-quantization serving toggle landed; 2 environmental
+errors in `TestStaleFeatureGuard` when run inside a lane worktree — untracked
+model pkls exist only in the main checkout). Run with:
 
 ```bash
 PYTHONPATH=src:. python -m pytest -q
@@ -42,6 +44,8 @@ See the root [GLOSSARY.md](../GLOSSARY.md) for domain terms.
 | `test_entry_guards.py` | 15 | Post-exit cooldown + the correlated-exposure cap |
 | `test_events.py` | 11 | The telemetry sink: never raises, never blocks, never on the tick path |
 | `test_cost_feature.py` | 9 | The per-instrument cost feature and veto alphas |
+| `test_rollover_bar_exclusion.py` | 13 | The pre-featurization NY-rollover bar exclusion: DST contract (July/January), end-exclusive boundary, the flag off restores the old rows, the window comes from `get_blackout_window_et` (no third copy), missing-timestamp/unparseable-window safe no-ops, and the feature-contamination observable (neighbor features change once the bars are dropped) |
+| `test_oanda_pipette_rounding.py` | 15 | The `OANDA_ROUND_MID_TO_PIPETTE` emission quantizer: default-OFF inertness (emitted bar bit-identical, internal state untouched), JPY 3dp / GBP_AUD 5dp, half-up ties, the construction-time flag snapshot (no mid-stream env flip), and the full `_handle_tick` → `_flush_bar` pipeline both ways |
 | `test_trading_mcp.py` | 9 | The MCP two-step confirm-token safety flow |
 | `test_oanda_entry.py` | 5 | Net-position arithmetic |
 | `test_oanda_tick_hook.py` | 5 | The raw tick callback contract |

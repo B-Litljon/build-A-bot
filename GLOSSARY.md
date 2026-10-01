@@ -257,6 +257,23 @@ before the hold limit expires.
 (default 16:55–17:30 **New York time**, so it tracks daylight saving instead of
 drifting an hour twice a year), when spreads briefly blow out roughly tenfold.
 
+**rollover bar exclusion** — the training-side companion to Gate C (added
+2026-10-01): bars INSIDE the same window are dropped from the retrainer's raw
+frame BEFORE feature generation (`RETRAIN_EXCLUDE_ROLLOVER_BARS`, default on;
+`core/retrainer/_pipeline.py` `_exclude_rollover_bars`, window from
+`risk_manager.get_blackout_window_et`). The chop veto removes rollover bars as
+trade *entries* after labels are built (so the bracket walk keeps the
+contiguous path); this removes them from the *indicators* entirely, because —
+per soak evidence — they were the only bars whose extreme excursions ever
+produced live Angel proposals. Both layers stay; toggles are independent.
+
+**pipette quantization (live mids)** — the serving-side counterpart (added
+2026-10-01): when `OANDA_ROUND_MID_TO_PIPETTE=1`, `oanda_provider._flush_bar`
+rounds EMITTED bar prices to the instrument's pipette precision
+(`PIPETTE_DECIMALS`: JPY crosses 3 decimals, other pairs 5), matching the
+pipette-quantized REST candles the training data is built from. Default OFF so
+no live process changes behaviour until explicitly enabled.
+
 **k_eff / coupling** — the effective safety multiple on cost. Scales with
 volatility above the median, in either direction ("tighten" = more cost
 discipline as volatility rises, "loosen" = less), and is clipped at ≥ 1.0 so a

@@ -88,6 +88,21 @@ that hook runs inline on the stream thread and must not block. And
 forex bot uses at boot to drop symbols it would only get rejected on; it returns
 an empty set on failure, meaning "unknown", never "nothing tradeable".
 
+> **Live-price quantization (2026-10-01, OFF by default).** `OANDA_ROUND_MID_TO_PIPETTE=1`
+> rounds the prices `_flush_bar` EMITS to the instrument's pipette precision
+> (`PIPETTE_DECIMALS`: JPY crosses 3, everything else 5
+> (`OANDA_PIPETTE_DECIMALS_DEFAULT`); `pipette_decimals()` reads it), because the
+> training data's REST candles are pipette-quantized while the streamed
+> `(bid + ask) / 2` carries a half-pipette digit the candles cannot print (~79%
+> of GBP_JPY live closes diverged from the REST candle at the same timestamp).
+> The flag is read ONCE at provider construction (`self._round_mids`), so mid-
+> stream env flips change nothing — a restart is the switch point. The raw
+> tick callback, the internal bar state and `volume` are never rounded. DEFAULT
+> OFF deliberately: the soak reads this tree, so live price handling may change
+> only by explicit env choice. Ties round HALF-UP on the decimal string
+> (builtin `round()` is half-to-even and float-representation-dependent, and
+> exact .5 ties are common on adjacent-pipette quotes).
+
 > ⚠️ `volume` from this provider is **tick count, not traded size** — OANDA
 > doesn't report real volume. Training data uses the same proxy, so the two
 > agree, but don't read it as money changing hands.

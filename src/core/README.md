@@ -104,13 +104,31 @@ nothing). Unset or unreadable → no verdict is recorded, never a claim.
   silently ignored `RETRAIN_DAYS_BACK`. ⚠️ `BRIER_THRESHOLD`'s rationale is
   label-specific (it was raised for the survival base rate), so re-derive it if
   this is flipped.
+- **`RETRAIN_EXCLUDE_ROLLOVER_BARS`** (2026-10-01, default ON) — drops bars
+  inside the Gate C NY-rollover window (16:55–17:30 America/New_York, read from
+  `execution.risk_manager.get_blackout_window_et`) from the raw frame BEFORE
+  feature generation, in `main()` Phase 2b on both the remainder and the holdout.
+  Set `RETRAIN_EXCLUDE_ROLLOVER_BARS=0` to restore the pre-fix behavior. Why it
+  exists: soak evidence showed the ONLY bars ever clearing the live Angel bar
+  were illiquid rollover/transition bars the entry veto alone leaves in the
+  rolling-feature inputs (their extreme `hour_of_day`/`bb_pct_b`/`vol_rel`
+  excursions are what the trees keyed on); the exclusion kills the contamination
+  layer while the chop veto keeps the entry discipline. The exclusion re-uses the
+  Gate C window definition (no third copy). Note: the feature lab
+  (`src/lab/frames.py`) composes `apply_labels_and_veto` directly and does NOT
+  apply this exclusion — lab frames built after this change deliberately remain
+  comparable to lab frames built before it; a lab spec that wants the exclusion
+  must drop the window bars from its loaded bars first.
 - **Writes** (into `model_dir`, default `models/<asset_class>/`, all atomically):
   `angel_latest.pkl`, `devil_latest.pkl`, `metadata.json`, `threshold.json`,
   `feature_stats.json`, `barriers_mae.pkl` + `barriers_mfe.pkl` +
   `barriers_meta.json` (barriers, when enabled), and `spread_alphas.json` when
   the cost experiment is on.
   `metadata.json` records the holdout fraction, date range, and metrics (or the
-  bypass reason when the holdout is disabled/empty).
+  bypass reason when the holdout is disabled/empty), plus
+  `rollover_bar_exclusion` (whether the training window excluded the Gate C
+  rollover bars pre-featurization — the serving-side price-rounding rollout is
+  checked against this, see `src/data/README.md`).
 
 ### `feedback_loop.py`
 `DriftEvaluator` — scores an already-graded ledger and decides whether the

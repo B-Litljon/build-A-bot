@@ -265,6 +265,18 @@ Glossary:
         vetoes on an already-featured frame, then cleans. The feature lab
         (src/lab) reuses it with candidate generator lists so its labels and
         vetoes are byte-for-byte the production path.
+    _rollover_exclusion_mask / _exclude_rollover_bars -- (2026-10-01) the
+        PRE-featurization half of the rollover defense: drops bars inside the
+        Gate C NY-rollover window (16:55-17:30 America/New_York, from
+        execution.risk_manager.get_blackout_window_et) from the raw frame
+        BEFORE any indicator runs, because those illiquid transition bars'
+        extreme hour_of_day / bb_pct_b / vol_rel excursions were leaking into
+        neighboring rows' rolling features (the soak's only live Angel
+        proposals were all on such bars). The post-labeling chop veto stays:
+        it decides ENTRIES after targets are built so the bracket walk keeps
+        the contiguous path — two mechanisms, two layers. Toggled by
+        RETRAIN_EXCLUDE_ROLLOVER_BARS (default on; no live process re-reads
+        training code, unlike the serving side).
     generate_time_decay_weights -- weights recent rows more heavily
         (decay_factor 0.95) so the model leans toward current market behaviour.
     refit_models -- trains the Angel then the Devil on one window.
@@ -446,6 +458,9 @@ from ._persist import (  # noqa: F401
 )
 
 from ._pipeline import (  # noqa: F401
+    RETRAIN_EXCLUDE_ROLLOVER_BARS,
+    _exclude_rollover_bars,
+    _rollover_exclusion_mask,
     main,
 )
 

@@ -141,6 +141,15 @@ alpha table, content hash). The parity contract lives here: for
 `feature_sets=("v3_base",)` the result equals `engineer_features_and_labels`
 plus the production tail purge, row for row.
 
+> ⚠️ Deliberate non-parity since 2026-10-01: production `main()` drops the
+> NY-rollover bars BEFORE feature generation
+> (`core/retrainer/_pipeline.py:_exclude_rollover_bars`,
+> `RETRAIN_EXCLUDE_ROLLOVER_BARS`, default on) on top of the shared
+> `apply_labels_and_veto`. `build_frame` does NOT — it composes the shared
+> half directly, so a lab frame stays comparable to other lab frames across
+> that production toggle. A spec that wants the exclusion must drop the
+> window bars (16:55–17:30 America/New_York) from its loaded bars itself.
+
 - **Imports from repo:** `core.retrainer._features`, `core.retrainer._gate`
   (purge helpers), `execution.risk_manager` — all lazily.
 - **Imported by:** `experiments`, `__init__`, tests.
