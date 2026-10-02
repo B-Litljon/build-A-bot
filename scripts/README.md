@@ -11,6 +11,8 @@ Three unrelated groups share this folder:
    model or turning live measurements into config.
 3. **Factory launchers** (2 files) — paper-trading runners for the Alpaca
    Factory path.
+4. **Experiment harnesses** — pinned, single-variable retrain runs you can
+   compare one against another (`retrain_arm.sh`).
 
 See the root [GLOSSARY.md](../GLOSSARY.md) for domain terms.
 
@@ -291,3 +293,40 @@ one-off.
 - **Imports from repo:** none (shell).
 - **Reads:** `.env`, OANDA REST. **Writes:** `logs/stability_*.log`, side
   model dirs `models/forex_m15_stability_*` (only on promotion).
+
+### `retrain_arm.sh`
+Runs ONE retrain experiment arm with every drifting setting pinned, so arms
+differ by exactly one merged lane and nothing else. `baseline` is untouched
+`main`; every other arm is `main` plus one lane branch, run in that tree. Each
+arm writes its own log (`logs/arm-<arm>.log`) plus its own summary and
+provenance (`models/candidates/<arm>/`), and no arm can touch
+`models/forex_m15_wide`. Exit 0 = promoted **into the candidate dir**, 2 =
+rejected, which is a *result* rather than a failure — and note a rejected arm
+writes no model at all, so the numbers in the summary are the evidence.
+
+The pin list is load-bearing, not ceremony: 730 days,
+`RETRAIN_END_DATE=2026-10-01` (without a pinned end date the retrain reads "up
+to now", so two arms run an hour apart see different data and stop being
+comparable — same reasoning as `run_stability_batch.sh` above), 18% holdout,
+`DATA_SOURCE=oanda`, and **`RETRAIN_TIMEFRAME_MINUTES=15` +
+`RETRAIN_HTF_TIMEFRAME=1h`**. That last pair is the trap: `get_asset_config()`
+defaults `timeframe = 1` for *both* asset classes, so a bare `python -m
+src.core.retrainer` silently retrains a one-minute model — 15× the fetch, and
+nothing like the served M15 artifact (measured 2026-10-02, after a six-minute
+aborted run; the comment above `_HTF_FOR_TIMEFRAME` names the same trap for the
+HTF pairing). A preflight resolves the real config and refuses to fetch unless
+it comes out forex / 15min / 1h / 730 days / 0.18.
+
+It also refuses a `--spread-table` arm in a tree whose
+`core/retrainer/_labels.py` has no `alpha_table` (the flag would then move
+`cost_ratio` and the veto but not the labels), refuses a candidate dir that
+already exists (`save_models` merges into an existing `metadata.json`, so a
+reused dir would carry stale keys from an earlier arm), and unsets
+`DISCORD_WEBHOOK_URL` so N arms do not post N embed reports.
+
+**Run arms one at a time, never two at once** — the same 6-core reason as
+`run_stability_batch.sh`: overlapping retrainer runs collapse fit speed.
+
+- **Imports from repo:** none (shell); invokes `python -m src.core.retrainer`.
+- **Reads:** `.env`, OANDA REST. **Writes:** `logs/arm-<arm>.log`,
+  `models/candidates/<arm>/` (provenance + summary; a model only on promotion).
