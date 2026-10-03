@@ -309,8 +309,10 @@ The pin list is load-bearing, not ceremony: 730 days,
 to now", so two arms run an hour apart see different data and stop being
 comparable — same reasoning as `run_stability_batch.sh` above), 18% holdout,
 `DATA_SOURCE=oanda`, and **`RETRAIN_TIMEFRAME_MINUTES=15` +
-`RETRAIN_HTF_TIMEFRAME=1h`**. `--end=YYYY-MM-DD` re-pins a single run, which is
-how an arm gets checked across several windows rather than trusted from one:
+`RETRAIN_HTF_TIMEFRAME=1h`**. `--end=YYYY-MM-DD` and `--days=NNNN` re-pin a single
+run, which is how an arm gets checked across several windows rather than trusted
+from one — and a longer window is the only way to buy more trades at the gate,
+which is where the binding constraint now sits:
 the same unchanged code scored a pooled fold bound of 0.61 and 1.04 on two
 different 730-day windows (2026-09-09 vs 2026-10-02), so a single window is not
 a measurement of an arm. That last pair is the trap: `get_asset_config()`
