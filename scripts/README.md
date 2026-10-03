@@ -309,7 +309,11 @@ The pin list is load-bearing, not ceremony: 730 days,
 to now", so two arms run an hour apart see different data and stop being
 comparable — same reasoning as `run_stability_batch.sh` above), 18% holdout,
 `DATA_SOURCE=oanda`, and **`RETRAIN_TIMEFRAME_MINUTES=15` +
-`RETRAIN_HTF_TIMEFRAME=1h`**. That last pair is the trap: `get_asset_config()`
+`RETRAIN_HTF_TIMEFRAME=1h`**. `--end=YYYY-MM-DD` re-pins a single run, which is
+how an arm gets checked across several windows rather than trusted from one:
+the same unchanged code scored a pooled fold bound of 0.61 and 1.04 on two
+different 730-day windows (2026-09-09 vs 2026-10-02), so a single window is not
+a measurement of an arm. That last pair is the trap: `get_asset_config()`
 defaults `timeframe = 1` for *both* asset classes, so a bare `python -m
 src.core.retrainer` silently retrains a one-minute model — 15× the fetch, and
 nothing like the served M15 artifact (measured 2026-10-02, after a six-minute
